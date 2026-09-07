@@ -6,6 +6,14 @@
 // wires up the request-side support") -- so this phase needs no schema
 // migration, only the application code that uses the constraint already
 // sitting there.
+//
+// Phase 6 extends InsertIdempotent (not a separate method -- scheduling a
+// job is still just an INSERT, per docs/scheduling.md's "Scheduling Is a
+// Column, Not a Service") to accept an optional p.ScheduledAt, durably
+// recorded as both scheduled_at (audit) and the row's initial eligible_at
+// (the live gating timestamp) in the same INSERT statement -- no new
+// schema, no new migration: scheduled_at and eligible_at have existed
+// since migration 0001, per that migration's comment.
 package store
 
 import (
@@ -89,12 +97,25 @@ func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job
 	if p.IdempotencyKey != nil {
 		idemKey = sql.NullString{String: *p.IdempotencyKey, Valid: true}
 	}
+	var scheduledAt sql.NullTime
+	if p.ScheduledAt != nil {
+		scheduledAt = sql.NullTime{Time: *p.ScheduledAt, Valid: true}
+	}
 
+	// eligible_at is COALESCE'd to now() (both evaluated by PostgreSQL's
+	// own clock, per docs/failure-model.md's Clock Model) rather than left
+	// at the schema's now()-default column, so a caller-supplied
+	// scheduled_at is what actually gates claim eligibility -- per
+	// docs/scheduling.md: "scheduled_at ... Set to now() (or scheduled_at)
+	// at submission time." scheduled_at itself is stored unmodified
+	// (NULL when not supplied) as the immutable audit record of the
+	// caller's original request, per that same document's field
+	// separation from the live, retry-advanced eligible_at.
 	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key)
-		VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6)
+		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key, scheduled_at, eligible_at)
+		VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, $7, COALESCE($7, now()))
 		RETURNING `+jobColumns,
-		id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey,
+		id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey, scheduledAt,
 	)
 	j, err := scanJob(row)
 	if err == nil {

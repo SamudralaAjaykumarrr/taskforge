@@ -218,8 +218,7 @@ under `-race` (`go test -race -p 1 -count=3 -run TestStress ./internal/store/...
 during this phase's development, per "What 'Proving an Invariant' Means
 Here" below.
 
-**Still not implemented**: fuzz tests, the cancellation race test SF-012
-(Phase 6), the scheduling test SF-013 (Phase 6), and sustained multi-hour
+**Still not implemented**: fuzz tests, and sustained multi-hour
 load/chaos tests (Phase 9 — Phase 5's stress tests use large but bounded,
 deterministic worker/job counts and repeated fixed seeds to prove
 correctness under contention, not open-ended sustained/randomized load,
@@ -238,6 +237,79 @@ briefly serialize under heavy simultaneous-exhaustion load rather than
 error or double-dead-letter — a latency consideration, not a correctness
 gap, and out of this phase's scope to change (docs/roadmap.md's Phase 5
 non-goal: "not adding capability").
+
+As of Phase 6 ("Scheduling, Cancellation, Timeouts"), the following
+additional categories now have real, passing, executable tests, in
+`internal/store/scheduling_test.go`, `internal/store/cancellation_test.go`,
+`internal/store/timeout_test.go`, `internal/store/phase6_stress_test.go`,
+`internal/worker/cancellation_test.go`, `internal/worker/timeout_test.go`,
+and `internal/api/handlers_phase6_test.go` unless noted:
+
+- **Scheduling tests** (TF-INV-011, SF-013): future-scheduled jobs
+  durably excluded from claim, claimable the instant `eligible_at`
+  arrives (via a new `forceSetScheduledEligibility` DB-time helper,
+  mirroring `forceSetEligibleAt` — never a sleep), survival across a
+  simulated full process restart, ordering against an ordinary
+  immediately-eligible job, and 20 real goroutines racing the instant a
+  scheduled job becomes eligible.
+- **Scheduling-vs-retry-eligibility separation**: a `RETRY_WAIT` job's
+  backoff-computed `eligible_at` is proven independent of `scheduled_at`
+  (which stays `NULL` for a non-scheduled job even after it retries),
+  satisfying this task's explicit requirement that user scheduling never
+  bypass retry backoff and vice versa.
+- **Race tests** (TF-INV-010, SF-012), both forced interleavings,
+  deterministically (each Store completion call is a single,
+  immediately-committed transaction, so calling one then the other in a
+  fixed order directly forces the documented interleaving — no
+  transaction-hold trick or sleep needed):
+  `TestSF012_CancelCommitsFirst_CompletionRejected`,
+  `TestSF012_CompletionCommitsFirst_CancellationRejected`, and the
+  extended cases this task's adversarial-audit list requires (cancel vs.
+  retryable failure, cancel vs. dead-letter, timeout vs. cancellation).
+- **Cancellation tests** (SF-011, TF-INV-005, TF-INV-003/014): direct
+  `QUEUED`/`RETRY_WAIT` → `CANCELLED` cancellation, `RUNNING`-job
+  cancellation request without lease fencing (a caller-facing action, not
+  a worker one) and its idempotency, the worker's own fenced
+  `CompleteCancelled` acknowledgement (including its
+  `AND cancel_requested = true` guard, and rejection of a stale
+  generation), cancellation racing reclaim, duplicate cancellation, and
+  cancellation of an already-terminal job.
+- **Timeout tests**: `CompleteTimeout`'s shared retry/dead-letter decision
+  (identical to `CompleteRetryableFailure`'s, proven via the same
+  exhaustion-boundary and stale-generation-rejection shape), and, at the
+  worker-loop level, execution-timeout firing while the lease itself
+  remains valid throughout (proving the two mechanisms are genuinely
+  independent, not the same check performed twice), a cooperative handler
+  stopping via `ctx.Done()`, and an uncooperative handler that ignores
+  `ctx` still being correctly classified once it returns.
+- **Fault-injection tests, extended to the two new completion paths**
+  (TF-INV-013): a forced mid-transaction failure (an already-cancelled
+  `context.Context`) leaves the row byte-for-byte unchanged for both
+  `CompleteCancelled` and `CompleteTimeout`.
+- **Concurrency-hardening tests extended to Phase 6's new machinery**:
+  20 jobs driven through 3 stale generations each, cancelled under the
+  current generation, then 260 concurrent completion attempts fired from
+  every stale generation at once (all rejected); 40 eligible scheduled
+  jobs and 40 cancelled scheduled jobs claimed under 15-worker pressure
+  (exactly the eligible ones claimed, exactly once each).
+- **HTTP-boundary tests** (`internal/api/handlers_phase6_test.go`):
+  `scheduled_at` on `POST /jobs` (durable recording, malformed-timestamp
+  rejection, default immediate-eligibility behavior unchanged) and the
+  full `POST /jobs/{id}/cancel` contract (`QUEUED`/`RETRY_WAIT` direct
+  cancellation, `RUNNING` request-without-confirmation, idempotent
+  terminal no-op, missing-job 404, malformed-id 400), plus the
+  idempotency-after-cancellation HTTP-boundary companion to the
+  store-level test.
+- **Idempotency tests, extended to the newly-reachable `CANCELLED`
+  terminal state** (Phase 4's own tests predated `CANCELLED` being
+  reachable): a duplicate submission after cancellation returns the same,
+  still-cancelled job, at both the store and HTTP boundary.
+
+Every race-sensitive test above was run repeatedly (3+ consecutive local
+runs, plus `-race`) without a single flake during this phase's
+implementation, satisfying [docs/roadmap.md](roadmap.md)'s Phase 6 quality
+gate ("Deterministic race test (SF-012) passes under both forced
+interleavings, repeatably").
 
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1

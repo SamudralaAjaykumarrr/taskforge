@@ -2,39 +2,48 @@
 
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
 Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, Phase 4 —
-Idempotency, and Phase 5 — Concurrency Hardening — all complete; see
-"Proposed maturity label" under "Phase 5: What's Implemented" below for why
-this README does not yet promote to Stable despite
-[docs/roadmap.md](docs/roadmap.md) naming Stable as Phase 5's
-on-completion label).**
-Phases 1 through 5 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+Idempotency, Phase 5 — Concurrency Hardening, and Phase 6 — Scheduling,
+Cancellation, Timeouts — all complete; see "Proposed maturity label" under
+"Phase 6: What's Implemented" below for why this README does not yet
+promote to Stable despite [docs/roadmap.md](docs/roadmap.md) naming
+Hardening → Stable as Phase 6's on-completion label).**
+Phases 1 through 6 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
-database-enforced `Idempotency-Key` deduplication), multiple concurrent
-worker processes, fenced lease-based ownership with heartbeat renewal,
-automatic crash recovery via lease expiration/reclaim, and the full
+database-enforced `Idempotency-Key` deduplication and optional
+`scheduled_at` future-execution requests), multiple concurrent worker
+processes, fenced lease-based ownership with heartbeat renewal, automatic
+crash recovery via lease expiration/reclaim, and the full
 `QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> RETRY_WAIT -> RUNNING` /
-`RUNNING -> DEAD_LETTERED` subset of the documented state machine, with real
-durable exponential backoff and retryable-vs-permanent failure
-classification (`CANCELLED` remains out of reach until Phase 6), now
-re-verified under sustained multi-worker contention rather than only small,
-hand-crafted two/three-worker scenarios — see "Phase 5: What's Implemented"
-below. It is **not** distributed beyond a single PostgreSQL instance, and
-does not implement cancellation, scheduling delay, or workflow execution
-yet — see "Phase 1: What's Implemented" through "Phase 5: What's
-Implemented" below for the exact boundary. Everything else described in
-this README past those sections remains a design target for later phases,
-not a demonstrated capability. TaskForge guarantees **at-least-once**
-execution, never exactly-once for arbitrary external side effects — see
-"Phase 2 guarantees" below for the specific, tested duplicate-side-effect
-window that phase closes and the one it deliberately leaves open (retries,
-including Phase 3's new backed-off `RETRY_WAIT` retries, are exactly this
-same at-least-once mechanism, not a new exposure); see "Phase 4 guarantees"
-below for how a handler achieves exactly-once **logical effects** on top of
-that at-least-once model, without TaskForge ever claiming exactly-once
-execution itself. Phase 5 does not change any of these guarantees — it adds
-no new capability, per its explicit non-goal — it only proves the existing
-ones continue to hold under tens of concurrent workers and sustained,
-repeated, randomized-crash contention rather than just isolated scenarios.
+`RUNNING -> DEAD_LETTERED` / `RUNNING -> CANCELLED` / `QUEUED|RETRY_WAIT ->
+CANCELLED` documented state machine (all six job-level states are now
+reachable), with real durable exponential backoff, retryable-vs-permanent
+failure classification, durable scheduled-execution eligibility, a
+`POST /jobs/{id}/cancel` endpoint with deterministic cancel-vs-completion
+race resolution, and a real execution-timeout ceiling distinct from lease
+duration — see "Phase 6: What's Implemented" below. It is **not**
+distributed beyond a single PostgreSQL instance, and does not implement
+workflow/DAG execution yet — see "Phase 1: What's Implemented" through
+"Phase 6: What's Implemented" below for the exact boundary. Everything else
+described in this README past those sections remains a design target for
+later phases, not a demonstrated capability. TaskForge guarantees
+**at-least-once** execution, never exactly-once for arbitrary external side
+effects — see "Phase 2 guarantees" below for the specific, tested
+duplicate-side-effect window that phase closes and the one it deliberately
+leaves open (retries, including Phase 3's new backed-off `RETRY_WAIT`
+retries, are exactly this same at-least-once mechanism, not a new
+exposure); see "Phase 4 guarantees" below for how a handler achieves
+exactly-once **logical effects** on top of that at-least-once model,
+without TaskForge ever claiming exactly-once execution itself. Phase 5 does
+not change any of these guarantees — it adds no new capability, per its
+explicit non-goal — it only proves the existing ones continue to hold under
+tens of concurrent workers and sustained, repeated, randomized-crash
+contention rather than just isolated scenarios. Phase 6 adds cooperative
+cancellation and execution-timeout enforcement on top of this
+foundation — TaskForge can **request** cooperative cancellation of a
+running job and can **detect** that an attempt exceeded its configured
+execution timeout, but it cannot physically terminate arbitrary handler
+code that ignores `ctx.Done()`; see "Phase 6: What's Implemented" below for
+exactly what is and is not guaranteed.
 
 ## The Problem
 
@@ -123,17 +132,17 @@ falsifiable to check it against.
 | Area | Status |
 |---|---|
 | Architecture & invariant documentation | **Done** (this repository, current state) |
-| PostgreSQL schema | **Phase 2 done, still sufficient for Phase 3** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`. Phase 3 required **no new migration** — see "Phase 3: What's Implemented" below) |
-| API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only — unchanged through Phase 3, per each phase's non-goal of API expansion; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status) |
-| Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism) — see "Phase 2: What's Implemented" and "Phase 5: What's Implemented" below |
+| PostgreSQL schema | **Phase 2 done, still sufficient through Phase 6** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`scheduled_at`/`cancel_requested`/`cancel_requested_at`/`terminal_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`/`TIMED_OUT`/`CANCELLED`. Phase 3, Phase 4, and Phase 6 all required **no new migration** — see "Phase 3/4/6: What's Implemented" below) |
+| API server | **Phase 1 done, extended in Phase 6** (`POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status — Phase 6 added `scheduled_at` request/response support and the cancel endpoint) |
+| Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5, extended in Phase 6**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism), cooperative cancellation observation, and a fixed per-attempt execution-timeout ceiling distinct from lease renewal — see "Phase 2", "Phase 5", and "Phase 6: What's Implemented" below |
 | Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
 | Idempotency enforcement | **Phase 4 done**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below |
 | Concurrency hardening | **Phase 5 done**: tens-of-workers/hundreds-of-jobs claim/reclaim/fencing/retry stress suites against real PostgreSQL, a connection-pool-constrained claim test, and a repeated-seed randomized crash/retry/success simulation — no new product code required, since Phase 1–4's short-transaction, fenced-lease design already satisfied every property tested; see "Phase 5: What's Implemented" below |
-| Scheduling | Not started |
-| Cancellation / timeouts | Not started (lease TTL bounds a stuck attempt, but there is no `execution_timeout` classification distinct from lease expiry yet, and no cancellation endpoint) |
+| Scheduling | **Phase 6 done**: `scheduled_at`/`eligible_at` future-execution semantics, PostgreSQL-authoritative eligibility (no in-memory scheduler), survives full process/fleet restart — see "Phase 6: What's Implemented" below |
+| Cancellation / timeouts | **Phase 6 done**: `POST /jobs/{id}/cancel`, deterministic cancel-vs-completion race resolution (TF-INV-010), a real `execution_timeout` ceiling distinct from lease TTL, cooperative cancellation observation via heartbeat — see "Phase 6: What's Implemented" below for the explicit, documented limits (cooperative only, no forced termination of uncooperative handler code) |
 | Workflow / DAG execution | Not started (staged for a later phase) |
-| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, and new/duplicate idempotent submission are all logged — see "Phase 2", "Phase 3: What's Implemented", and "Phase 4: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 5 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races) at small scale (Phase 1–4) now extended with tens-of-workers/hundreds-of-jobs stress variants, a constrained-connection-pool test, and a repeated-seed randomized crash-injection simulation (Phase 5); sustained multi-hour chaos/load testing remains Phase 9 |
+| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, new/duplicate idempotent submission, cancellation observed/acknowledged, and execution timeout are all logged — see "Phase 2", "Phase 3", "Phase 4", and "Phase 6: What's Implemented") |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 6 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5) and scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6); sustained multi-hour chaos/load testing remains Phase 9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -176,7 +185,8 @@ completion criteria for each phase.
 - ~~Idempotency-Key submission support (Phase 4) — the database unique
   constraint exists, but no API surface uses it yet.~~ **Closed in Phase
   4** — see "Phase 4: What's Implemented" below.
-- Scheduling, cancellation, and execution timeouts (Phase 6).
+- ~~Scheduling, cancellation, and execution timeouts (Phase 6).~~ **Closed
+  in Phase 6** — see "Phase 6: What's Implemented" below.
 - Workflow/DAG execution (Phase 7), observability (Phase 8), chaos/load
   testing (Phase 9).
 
@@ -328,9 +338,10 @@ testing.
   reclaimed if the crash happens before that report.
 - ~~Idempotency-Key submission support (Phase 4).~~ **Closed in Phase 4**
   — see "Phase 4: What's Implemented" below.
-- Scheduling delay, cancellation, and a real `execution_timeout`
+- ~~Scheduling delay, cancellation, and a real `execution_timeout`
   distinct from lease TTL (Phase 6) — lease expiration is the only timeout
-  mechanism that exists.
+  mechanism that exists.~~ **Closed in Phase 6** — see "Phase 6: What's
+  Implemented" below.
 - Workflow/DAG execution (Phase 7), full metrics/tracing observability
   (Phase 8), sustained chaos/load testing (Phase 5/9).
 - A `GET /jobs/{id}/history` endpoint over `job_attempts` (deliberately
@@ -568,8 +579,9 @@ retryable-vs-permanent failure classification.
 
 - ~~Idempotency-Key submission support (Phase 4).~~ **Closed in Phase 4**
   — see "Phase 4: What's Implemented" below.
-- Scheduling delay, cancellation, and a real `execution_timeout` distinct
-  from lease TTL (Phase 6).
+- ~~Scheduling delay, cancellation, and a real `execution_timeout`
+  distinct from lease TTL (Phase 6).~~ **Closed in Phase 6** — see
+  "Phase 6: What's Implemented" below.
 - Workflow/DAG execution (Phase 7), full metrics/tracing observability
   (Phase 8), sustained chaos/load testing (Phase 5/9).
 - Per-job-type backoff configuration — [docs/retry-semantics.md](docs/retry-semantics.md)
@@ -861,8 +873,9 @@ guarantee exactly-once execution of arbitrary side effects.
 - **Idempotency key TTL/expiry.** Undecided per
   [docs/idempotency.md](docs/idempotency.md); a key is bound to its job
   row forever in v1 (job rows are never deleted).
-- Scheduling delay, cancellation, and a real `execution_timeout` distinct
-  from lease TTL (Phase 6).
+- ~~Scheduling delay, cancellation, and a real `execution_timeout`
+  distinct from lease TTL (Phase 6).~~ **Closed in Phase 6** — see
+  "Phase 6: What's Implemented" below.
 - Workflow/DAG execution (Phase 7), full metrics/tracing observability
   (Phase 8), sustained chaos/load testing (Phase 5/9).
 - Per-job-type or configurable idempotency-key validation rules (length
@@ -998,7 +1011,8 @@ runs, plus `-race`) without a flake during this phase's implementation.
   decision (see "Not implemented yet" above), not a gap.
 - **No idempotency key TTL/expiry.**
 - **Still no scheduling, cancellation, or workflow execution** — unchanged
-  from Phase 1–3, see "Not implemented yet" above.
+  from Phase 1–3, see "Not implemented yet" above. (Scheduling and
+  cancellation: closed in Phase 6, see below.)
 - **No production readiness claim of any kind.**
 
 ### Proposed maturity label
@@ -1159,7 +1173,8 @@ worker scenarios) did not attempt.
   contention, not a proven starvation-freedom bound; see "Fairness and
   starvation" below for what was actually checked.
 - **Cancellation, scheduling, workflow execution** — unchanged from
-  Phase 1–4, still Phase 6/7 work.
+  Phase 1–4, still Phase 6/7 work. (Scheduling and cancellation: closed
+  in Phase 6, see below; workflow execution remains Phase 7.)
 
 ### Concurrency model and locking strategy (re-confirmed, not changed)
 
@@ -1280,7 +1295,8 @@ go test -race -p 1 ./...
   operational tuning question outside this phase's scope.
 - **No mathematically proven fairness/starvation bound** — see "Fairness
   and starvation" above.
-- **Still no scheduling, cancellation, or workflow execution.**
+- **Still no scheduling, cancellation, or workflow execution.** (Scheduling
+  and cancellation: closed in Phase 6, see below.)
 - **No production readiness claim of any kind.**
 
 ### Proposed maturity label
@@ -1301,6 +1317,369 @@ merged or pushed). This README therefore keeps the overall project status
 at **Experimental** for now, consistent with how every prior phase was
 handled; promotion to Stable is a mechanical follow-up once CI has run this
 suite repeatedly post-merge, not a judgment call made preemptively here.
+
+## Phase 6: What's Implemented
+
+Phase 6 ([docs/roadmap.md](docs/roadmap.md) "Scheduling, Cancellation,
+Timeouts") adds durable job scheduling, a `POST /jobs/{id}/cancel` endpoint
+with deterministic cancel-vs-completion race resolution, and a real
+execution-timeout ceiling distinct from lease duration — closing the three
+gaps Phase 1–5 explicitly left open. All six job-level states from
+[docs/execution-semantics.md](docs/execution-semantics.md) are now
+reachable (`CANCELLED` was previously unreachable).
+
+### Implemented now
+
+- **Durable scheduled execution** (`internal/job.NewParams.ScheduledAt`,
+  `internal/store.InsertIdempotent`): an optional `scheduled_at` field on
+  `POST /jobs` is durably recorded as both the immutable `scheduled_at`
+  audit column and the job's initial `eligible_at` (the live gating
+  timestamp the claim query consults), in the same `INSERT` statement — no
+  new schema, no new migration, no in-memory scheduler of any kind, per
+  [docs/scheduling.md](docs/scheduling.md)'s "Scheduling Is a Column, Not a
+  Service" design. The **exact same claim query** every other job uses is
+  the only mechanism that ever makes a scheduled job eligible
+  (TF-INV-011); a scheduled job durably survives an API server restart, a
+  worker restart, or a full-fleet restart, because nothing about its
+  eligibility ever depended on a running process (SF-013).
+- **`POST /jobs/{id}/cancel`** (`internal/api.CancelJob`), per
+  [docs/worker-protocol.md](docs/worker-protocol.md)'s documented
+  contract exactly: a `QUEUED`/`RETRY_WAIT` job cancels directly and
+  uncontested (`internal/store.CancelQueuedOrRetryWait`); a `RUNNING`
+  job's cancellation is durably requested
+  (`internal/store.RequestCancellation` sets `cancel_requested = true`,
+  no lease fencing — this is a caller-facing request, not a worker
+  action) and the response reports "requested, not yet confirmed"; an
+  already-terminal job's cancellation is an idempotent no-op reporting
+  the job's real terminal state. No check-then-act race window exists
+  anywhere in this cascade — each step is its own fenced, conditional
+  `UPDATE`.
+- **Worker-side cancellation observation and acknowledgement**
+  (`internal/worker.runWithHeartbeat`/`reportCancelled`,
+  `internal/store.CompleteCancelled`): the worker's existing heartbeat
+  loop (unchanged cadence since Phase 2) now also inspects the
+  `cancel_requested` flag on every successful heartbeat's returned row.
+  The instant it observes `true`, it cancels the handler's `context.Context`
+  (so a cooperative handler — anything that checks `ctx.Done()`, which
+  includes every handler shape this codebase's own test doubles use — can
+  stop promptly) and, once the handler returns (however it returns),
+  reports `CompleteCancelled` instead of whatever the handler itself
+  returned. `CompleteCancelled` is fenced exactly like every other
+  completion (`lease_owner`/`lease_generation`/`state='RUNNING'`, plus
+  `cancel_requested = true`), so TF-INV-003/014 apply identically: a
+  stale generation can never acknowledge a cancellation any more than it
+  can report success.
+- **TF-INV-010's race rule, made structural rather than special-cased**:
+  `CompleteCancelled` and
+  `CompleteSuccess`/`CompleteFailure`/`CompleteRetryableFailure`/`CompleteTimeout`
+  all share the identical `WHERE ... state = 'RUNNING'` guard on the same
+  row. PostgreSQL serializes concurrent `UPDATE`s to that row by
+  construction, so whichever commits first wins and the other's guard no
+  longer matches — no new locking, token, or negotiation mechanism was
+  needed to satisfy "first durable write to commit wins."
+- **A real `execution_timeout` ceiling, distinct from lease duration**
+  (`internal/worker.runWithHeartbeat`): the handler's execution context is
+  now `context.WithTimeout(ctx, execution_timeout_seconds)` — a **fixed**
+  deadline set once at the start of the attempt and never renewed — while
+  the **lease** (`lease_expires_at`) continues to be renewed by every
+  successful heartbeat exactly as before. These are deliberately
+  independent mechanisms that happen to share one configured duration and
+  start time: a job can heartbeat forever and keep its lease valid, but it
+  still cannot run past `execution_timeout_seconds`, closing the gap
+  [docs/failure-model.md](docs/failure-model.md) F9 previously left open
+  ("Yes, handled" was aspirational until this phase). When the deadline
+  fires, the worker reports the new `internal/store.CompleteTimeout`
+  outcome (`TIMED_OUT`), treated as retryable by default per
+  [docs/retry-semantics.md](docs/retry-semantics.md) — scheduled for
+  retry, or dead-lettered on exhaustion, via the exact same
+  attempt-ceiling/backoff decision as any other retryable failure
+  (`CompleteTimeout` shares its SQL with `CompleteRetryableFailure`,
+  factored into a single `completeRetryableOutcome` helper —
+  `internal/store/retry.go`).
+- **Explicit, tested cooperative-cancellation and timeout limitation**:
+  neither cancellation nor execution-timeout enforcement can physically
+  terminate a handler that never checks `ctx.Done()`. This is proven, not
+  merely asserted:
+  `TestRunOnce_HandlerIgnoresCancellation_StillAcknowledgesCancelled` and
+  `TestRunOnce_ExecutionTimeout_HandlerIgnoresContext_StillReportsTimeout`
+  (`internal/worker`) both use a handler that deliberately ignores `ctx`
+  and confirm the worker still correctly classifies and reports the
+  durable outcome once the handler eventually returns — TaskForge detects
+  and reports promptly; it does not and cannot forcibly kill arbitrary
+  handler code.
+- **No new migration required** — `scheduled_at`, `eligible_at`,
+  `cancel_requested`, `cancel_requested_at`, and `terminal_at` have all
+  existed on `jobs` since migration `0001`; `job_attempts`'s outcome
+  `CHECK` constraint already permitted `'TIMED_OUT'` and `'CANCELLED'`
+  since migration `0002` — both deliberately, per each migration's own
+  comment, specifically so this phase would need none. Proven, not
+  asserted: `TestSchema_TimedOutOutcomeAlreadySupportedByCheckConstraint`
+  (`internal/store/timeout_test.go`).
+- Structured logs for every new event this phase's design requires
+  observable: cancellation observed via heartbeat, cancellation
+  acknowledged, execution timeout exceeded, retry-after-timeout scheduled,
+  and dead-letter-after-timeout-exhaustion (`internal/worker`) — no
+  payload contents are ever logged.
+
+### Not implemented yet
+
+- **Workflow-level cancellation** — explicit Phase 6 non-goal per
+  [docs/roadmap.md](docs/roadmap.md); Phase 7 scope.
+- **A supervisory process for a heartbeating job whose worker never
+  self-reports `TIMED_OUT`** — [docs/execution-semantics.md](docs/execution-semantics.md)
+  documents this exact gap as an open question rather than papering over
+  it: if a worker process's own execution-timeout enforcement somehow
+  fails to fire (e.g. the worker process itself is wedged in a way that
+  also prevents its own `context.WithTimeout` from being observed — an
+  extremely narrow window, since Go's own runtime drives context
+  cancellation independent of the handler), the job simply keeps
+  heartbeating until an operator intervenes or the lease eventually
+  expires. This is documented, not solved, per that document's explicit
+  allowance.
+- **No schedule-limit validation** (e.g. a maximum allowed `scheduled_at`
+  distance into the future) — not required by any authoritative doc, so
+  not built speculatively; a caller may schedule arbitrarily far ahead.
+- **No priority-aware or per-job-type execution-timeout configuration
+  surface** beyond the existing per-submission
+  `execution_timeout_seconds` field — unchanged from Phase 1.
+- **No `POST /jobs/{id}/reschedule`** or any mutation of an already-durable
+  `scheduled_at`/`eligible_at` beyond what claim/retry/cancellation already
+  do — not documented, not built.
+
+### How to demonstrate scheduling
+
+```sh
+docker compose up -d
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &
+go run ./cmd/worker &
+
+# Schedule a job 2 minutes in the future.
+curl -X POST localhost:8080/jobs \
+  -d '{"job_type":"demo.echo","payload":{},"scheduled_at":"'"$(date -u -d '+2 minutes' +%Y-%m-%dT%H:%M:%SZ)"'"}'
+
+# GET immediately: state is QUEUED, eligible_at matches scheduled_at, and
+# no worker claims it yet no matter how long you poll before that time.
+curl localhost:8080/jobs/<id-from-above>
+
+# After 2 minutes, the exact same worker loop -- no restart, no special
+# action -- claims and executes it normally.
+```
+
+### How to demonstrate cancellation
+
+```sh
+# Cancel a job that hasn't been claimed yet -- immediate CANCELLED.
+curl -X POST localhost:8080/jobs \
+  -d '{"job_type":"demo.echo","payload":{}}'
+curl -X POST localhost:8080/jobs/<id>/cancel   # -> state: CANCELLED
+
+# Cancel a RUNNING job -- request is durable but not yet confirmed.
+curl -X POST localhost:8080/jobs \
+  -d '{"job_type":"demo.echo","payload":{},"execution_timeout_seconds":10}'
+# (claim it with a worker, then, while it is executing:)
+curl -X POST localhost:8080/jobs/<id>/cancel   # -> state: RUNNING, cancel_requested: true
+# Poll GET /jobs/<id> -- once the worker's next heartbeat observes the
+# flag, the job transitions to CANCELLED (or, if the handler finished
+# first, whatever it legitimately completed as -- see TF-INV-010).
+curl localhost:8080/jobs/<id>
+```
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+
+# The new Phase 6 tests specifically, verbose:
+go test -p 1 -v ./internal/store/... -run 'Sched|Cancel|Timeout|SF012'
+go test -p 1 -v ./internal/worker/... -run 'Cancel|ExecutionTimeout'
+go test -p 1 -v ./internal/api/...    -run 'ScheduledAt|CancelJob'
+
+# Repeated, race-detected runs of the race-sensitive new tests (this is
+# what this phase's own quality gate requires, and what was actually run
+# to validate it -- see "Phase 6 guarantees" below):
+go test -race -count=3 ./internal/store/...  -run 'SF012|Cancel|Timeout|Sched'
+go test -race -count=3 ./internal/worker/... -run 'Cancel|ExecutionTimeout|LongRunningJob'
+```
+
+Same PostgreSQL requirement and `-p 1` constraint as every prior phase. No
+new tooling or command is required beyond what Phase 1–5 already
+established.
+
+### Phase 6 guarantees
+
+- **TF-INV-010** (cancellation race is deterministic): both forced
+  interleavings proven directly —
+  `TestSF012_CancelCommitsFirst_CompletionRejected` and
+  `TestSF012_CompletionCommitsFirst_CancellationRejected`
+  (`internal/store/cancellation_test.go`), plus the extended races this
+  task's adversarial-audit list requires:
+  `TestSF012_CancelRacesRetryableFailure_FirstCommitWins`,
+  `TestSF012_CancelRacesDeadLetter_FirstCommitWins`, and the timeout
+  analogue `TestCompleteTimeout_RacesCancellation_FirstCommitWins`
+  (`internal/store/timeout_test.go`). Every one of these calls the
+  competing completion methods in a controlled, deterministic order (each
+  Store completion call is a single, immediately-committed transaction,
+  so sequential calls directly force each documented interleaving — no
+  sleep, no flaky timing dependency), run repeatedly under `-race` with
+  zero flakes.
+- **TF-INV-011** (scheduled jobs don't run early): proven with real
+  PostgreSQL, never a wall-clock sleep —
+  `TestInsertIdempotent_FutureScheduledAt_DurablyRecordedAndNotClaimable`,
+  `TestInsertIdempotent_ScheduledJob_ClaimableAfterEligibilityArrives`
+  (DB-time manipulation via the new `forceSetScheduledEligibility`
+  helper, mirroring Phase 3's `forceSetEligibleAt`), and
+  `TestInsertIdempotent_ScheduledJob_ManyWorkersRaceAtEligibility` (20
+  real goroutines racing the instant a scheduled job becomes eligible —
+  the scheduling analogue of SF-006).
+- **SF-013** (scheduled job survives restart):
+  `TestInsertIdempotent_ScheduledJob_SurvivesFreshStoreInstance` — a
+  fresh `*store.Store` sharing only the database still correctly refuses
+  to claim before eligibility and claims correctly after, proving no
+  in-memory scheduler state exists anywhere to lose.
+- **TF-INV-005**, extended to the new `CANCELLED` reachability path and to
+  scheduling: `TestCancelQueuedOrRetryWait_AlreadyTerminal_RejectedAsStale`,
+  `TestCancelQueuedOrRetryWait_DuplicateOnAlreadyCancelled_RejectedAsStale`,
+  and `TestInsertIdempotent_ScheduledJob_CancelledBeforeEligibility_NeverExecutes`
+  (a cancelled scheduled job never becomes claimable even once its
+  original `eligible_at` passes).
+- **TF-INV-003/014**, extended to the cancellation-acknowledgement and
+  timeout completion paths: `TestCompleteCancelled_RejectsStaleGeneration`,
+  `TestCompleteTimeout_RejectsStaleGeneration`, and the worker-loop-level
+  `TestRunOnce_LeaseLostTakesPriorityOverPendingCancellation` /
+  `TestRunOnce_ExecutionTimeout_FiresAfterLeaseAlreadyLost` (adversarial
+  case #13, "timeout fires after worker lost ownership") — a stale
+  generation can never override cancellation, and a stale generation's
+  late timeout report is rejected exactly like any other stale
+  completion.
+- **Cancellation cannot bypass retry limits or reopen a dead-lettered
+  job**: `TestSF012_CancelRacesRetryableFailure_FirstCommitWins`,
+  `TestSF012_CancelRacesDeadLetter_FirstCommitWins`, and
+  `TestCancelQueuedOrRetryWait_RetryWait_NeverBecomesClaimableAfterEligibilityArrives`
+  (a cancelled `RETRY_WAIT` job never later executes just because its
+  already-scheduled retry `eligible_at` arrives — the exact
+  "cancelled → retry eligible → executes again" sequence this phase's
+  requirements explicitly forbid, disproven directly).
+- **Cancellation-vs-reclaim race**:
+  `TestCancelRacesReclaim_StaleGenerationCannotAcknowledge` — a
+  cancellation requested against a generation that is then reclaimed
+  before acknowledgement leaves the reclaimed generation to proceed
+  normally, with `cancel_requested` correctly reset (per
+  [docs/worker-protocol.md](docs/worker-protocol.md)'s documented
+  per-generation cancellation-intent decision), and the stale
+  generation's late acknowledgement attempt rejected.
+- **Idempotency preserved after cancellation** (Phase 4 guarantees,
+  extended to the new `CANCELLED` terminal state specifically — Phase 4's
+  own tests predated `CANCELLED` being reachable):
+  `TestInsertIdempotent_DuplicateSubmissionAfterCancellation_ReturnsExistingJob`
+  (store level) and
+  `TestCreateJob_IdempotencyKey_DuplicateAfterCancellation_ReturnsExistingJob`
+  (HTTP level) — a duplicate submission after cancellation returns the
+  same, still-cancelled job, never a new one.
+- **TF-INV-013**, extended to the two new completion paths:
+  `TestCompleteCancelled_RollbackLeavesRowUnchanged`,
+  `TestCompleteTimeout_RollbackLeavesRowUnchanged` — a forced
+  mid-transaction failure leaves the row byte-for-byte unchanged.
+- **Lease vs. execution-timeout are genuinely independent, proven, not
+  just asserted**: `TestRunOnce_ExecutionTimeout_FiresIndependentlyOfLeaseRenewal`
+  drives a cooperative handler past its `execution_timeout_seconds`
+  ceiling while heartbeats keep renewing the lease throughout (the lease
+  never expires, `lease_generation` never advances), and the timeout
+  still fires — proving these are two distinct mechanisms sharing a
+  configured duration, not the same check performed twice.
+- **Multi-worker/concurrency hardening extended to Phase 6's new
+  machinery** (`internal/store/phase6_stress_test.go`):
+  `TestStress_CancellationSurvivesConcurrentCompletionAttemptsAcrossManyGenerations`
+  (20 jobs, each driven through 3 stale generations plus cancellation
+  under the current generation, then 260 concurrent completion attempts
+  from every stale generation fired at once — every one rejected, every
+  job remains `CANCELLED`) and
+  `TestStress_ManyEligibleScheduledJobsClaimedExactlyOnceUnderPressure`
+  (40 eligible scheduled jobs and 40 cancelled scheduled jobs claimed
+  under 15-worker pressure — exactly the eligible ones are claimed,
+  exactly once each, never a cancelled one).
+- The full pre-existing Phase 1–5 regression suite remains green,
+  including under `-race`, with exactly one test's *parameters* adjusted
+  (not its assertions weakened) to account for the new execution-timeout
+  ceiling — see "A note on `TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive`"
+  below.
+
+### A note on `TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive`
+
+This Phase 2 test (SF-017: a long-running, heartbeating job completes
+successfully across multiple lease-renewal cycles) used
+`ExecutionTimeoutSeconds: 1` with the handler held open for 1200ms — a
+choice that made sense before Phase 6 existed, because
+`execution_timeout_seconds` was *only* the lease duration then; running
+"past" it via heartbeat renewal, with no consequence, was exactly the
+documented gap [docs/failure-model.md](docs/failure-model.md) F9 named as
+not yet handled. Phase 6 closes that gap: `execution_timeout_seconds` is
+now *also* a fixed, unrenewed per-attempt ceiling. Continuing to hold the
+handler open for 1200ms against a 1-second ceiling would now correctly
+trigger `TIMED_OUT`, which would silently invalidate this test's original
+assertion (`SUCCEEDED`) for a reason unrelated to what the test actually
+verifies (lease renewal across multiple heartbeat cycles). The test's
+*parameters* were updated (`ExecutionTimeoutSeconds: 3`, held open for
+2500ms — still crossing 2 heartbeat cycles, now safely under the new
+ceiling); its *assertions* were not weakened in any way, and
+`TestRunOnce_ExecutionTimeout_FiresIndependentlyOfLeaseRenewal`
+(`internal/worker/timeout_test.go`) now directly proves the specific
+behavior (timeout firing independent of successful lease renewal) that
+would have made the old parameters fail.
+
+### Phase 6 limitations (explicit, not hidden)
+
+- **TaskForge can request cooperative cancellation; it cannot guarantee
+  physical termination of arbitrary handler code.** A handler that never
+  checks `ctx.Done()` will run to its own natural completion regardless of
+  a cancellation request or an exceeded execution timeout — TaskForge
+  detects and durably reports the outcome promptly once the handler
+  returns, but cannot forcibly stop it mid-flight. If the handler already
+  performed an external side effect before returning, that side effect is
+  not undone, exactly as [docs/vision.md](docs/vision.md)'s core thesis
+  states TaskForge never can.
+- **Scheduling precision is bounded by worker poll interval and queue
+  contention, not wall-clock-accurate timer firing** — unchanged from
+  [docs/scheduling.md](docs/scheduling.md)'s documented, deliberate
+  non-goal (no sub-second real-time scheduling guarantee).
+- **No supervisory fallback if a worker process's own execution-timeout
+  enforcement never fires** (an extremely narrow window — see "Not
+  implemented yet" above) — the job remains `RUNNING` until lease expiry
+  or operator intervention, per
+  [docs/execution-semantics.md](docs/execution-semantics.md)'s explicitly
+  documented open question.
+- **No workflow-level cancellation** — Phase 7 scope, per this phase's
+  explicit non-goal.
+- **`cancel_requested` still resets on reclaim** (unchanged Phase 2
+  decision, per [docs/worker-protocol.md](docs/worker-protocol.md)'s Open
+  Questions): a cancellation requested against a generation that is then
+  reclaimed (crash before acknowledgement) must be re-issued against the
+  new generation if still desired — proven in
+  `TestCancelRacesReclaim_StaleGenerationCannotAcknowledge`.
+- **No production readiness claim of any kind.**
+
+### Proposed maturity label
+
+[docs/roadmap.md](docs/roadmap.md) sets Phase 6's maturity as "Hardening →
+Stable once race tests are proven flake-free across repeated CI runs."
+Every invariant and scenario this phase's roadmap entry requires
+(TF-INV-010, TF-INV-011; SF-011, SF-012, SF-013) has passing, deterministic
+test coverage today, including the specific quality gate
+[docs/roadmap.md](docs/roadmap.md) names explicitly — "deterministic race
+test (SF-012) passes under both forced interleavings, repeatably" — proven
+via `TestSF012_CancelCommitsFirst_CompletionRejected` and
+`TestSF012_CompletionCommitsFirst_CancellationRejected`, run 3+ consecutive
+times under `-race` with zero flakes during this phase's implementation,
+alongside the full pre-existing Phase 1–5 suite. But exactly as every
+prior phase's own section explains, [docs/roadmap.md](docs/roadmap.md)'s
+Maturity Labels definition requires surviving **repeated CI runs** of this
+project's actual pipeline over time — which, like every prior phase, has
+not yet happened for this code (not yet merged or pushed). This README
+therefore keeps the overall project status at **Experimental** for now,
+consistent with how every prior phase was handled; promotion to Stable is
+a mechanical follow-up once CI has run this suite repeatedly post-merge,
+not a judgment call made preemptively here.
 
 ## Documentation Map
 

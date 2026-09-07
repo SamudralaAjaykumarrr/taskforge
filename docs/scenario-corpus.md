@@ -86,9 +86,9 @@ The following scenarios are executable as of Phase 2, all in
   assertion side) completes successfully under the same `lease_generation`
   throughout.
 
-SF-004, SF-005, SF-011 through SF-013 are **not** executable yet — they
-require Phase 4+ functionality (idempotency keys, cancellation, scheduling)
-this codebase does not implement.
+SF-004 and SF-005 became executable as of Phase 4 (idempotency keys) — see
+below. SF-011 through SF-013 became executable as of Phase 6 (cancellation,
+scheduling) — see the Phase 6 status paragraph further below.
 
 The following scenarios are executable as of Phase 3
 ([roadmap.md](roadmap.md)):
@@ -205,6 +205,51 @@ adding capability). All variants below are in
 
 See [testing-strategy.md](testing-strategy.md)'s Phase 5 section for the
 full list with descriptions, and [README.md](../README.md)'s "Phase 5:
+What's Implemented" for how these map to invariants and what quality gate
+they satisfy.
+
+The following scenarios are executable as of Phase 6 ("Scheduling,
+Cancellation, Timeouts", [roadmap.md](roadmap.md)):
+
+- **SF-011** (Cancellation before claim) —
+  `TestCancelQueuedOrRetryWait_Queued_TransitionsDirectlyToCancelled`
+  (`internal/store/cancellation_test.go`) and the HTTP-boundary
+  `TestCancelJob_Queued_TransitionsDirectlyToCancelled`
+  (`internal/api/handlers_phase6_test.go`).
+- **SF-012** (Cancellation races with completion) — both forced
+  interleavings, deterministically: `TestSF012_CancelCommitsFirst_CompletionRejected`
+  and `TestSF012_CompletionCommitsFirst_CancellationRejected`
+  (`internal/store/cancellation_test.go`), extended to a retryable
+  failure, a permanent failure, and an execution timeout racing
+  cancellation: `TestSF012_CancelRacesRetryableFailure_FirstCommitWins`,
+  `TestSF012_CancelRacesDeadLetter_FirstCommitWins`,
+  `TestCompleteTimeout_RacesCancellation_FirstCommitWins`.
+- **SF-013** (Scheduled job survives restart) —
+  `TestInsertIdempotent_ScheduledJob_SurvivesFreshStoreInstance`
+  (`internal/store/scheduling_test.go`): a fresh `*store.Store` sharing
+  only the database still correctly refuses to claim before eligibility
+  and claims correctly once eligible, with no in-memory scheduler state
+  anywhere to lose or recover.
+
+Phase 6 also adds coverage beyond the three scenarios the roadmap names
+explicitly, against the same adversarial-audit list this document's format
+supports — see `internal/store/scheduling_test.go`,
+`internal/store/cancellation_test.go`, `internal/store/timeout_test.go`,
+`internal/store/phase6_stress_test.go`, `internal/worker/cancellation_test.go`,
+`internal/worker/timeout_test.go`, and `internal/api/handlers_phase6_test.go`
+for the full set: scheduling-vs-retry-eligibility separation, many workers
+racing a scheduled job's eligibility instant, cancellation of a
+`RETRY_WAIT` job (never later executing merely because its backoff window
+arrives), cancellation racing reclaim, cooperative and uncooperative
+handler behavior under both cancellation and execution-timeout, execution
+timeout firing independently of successful lease renewal, stale-generation
+fencing extended to the two new completion paths (`CompleteCancelled`,
+`CompleteTimeout`), fault-injection/rollback safety for both, and
+idempotency-after-cancellation (the `CANCELLED` terminal state was
+unreachable when Phase 4's own idempotency tests were written).
+
+See [testing-strategy.md](testing-strategy.md)'s Phase 6 section for the
+full list with descriptions, and [README.md](../README.md)'s "Phase 6:
 What's Implemented" for how these map to invariants and what quality gate
 they satisfy.
 

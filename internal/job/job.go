@@ -48,17 +48,24 @@ func (j *Job) IsTerminal() bool {
 }
 
 // NewParams holds the caller-supplied fields for submitting a new job.
-// Fields not listed here (priority, scheduled_at, cancellation) are Phase
-// 1 non-goals per docs/roadmap.md and are left at their schema defaults
-// (see internal/store.Insert). IdempotencyKey was added in Phase 4 (see
+// Fields not listed here (priority, cancellation) are non-goals per
+// docs/roadmap.md and are left at their schema defaults (see
+// internal/store.Insert). IdempotencyKey was added in Phase 4 (see
 // internal/store.InsertIdempotent, docs/idempotency.md) -- a nil value
 // means no key was supplied, and every such submission creates a new job.
+// ScheduledAt was added in Phase 6 (see internal/store.InsertIdempotent,
+// docs/scheduling.md) -- a nil value means "run as soon as possible"
+// (eligible_at defaults to the insert-time now(), unchanged from Phase
+// 1-5); a non-nil value is durably recorded as both scheduled_at (caller
+// intent, immutable, audit-only) and the job's initial eligible_at (the
+// live gating timestamp the claim query actually consults).
 type NewParams struct {
 	JobType                 string
 	Payload                 json.RawMessage
 	MaxAttempts             int
 	ExecutionTimeoutSeconds int
 	IdempotencyKey          *string
+	ScheduledAt             *time.Time
 }
 
 // Failure classes recorded in last_error_class, per docs/data-model.md.
