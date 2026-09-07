@@ -67,7 +67,7 @@ var transitions = map[State]map[State]bool{
 		Succeeded:    true, // worker reports success
 		RetryWait:    true, // worker reports retryable failure, attempts remain (Phase 3+)
 		DeadLettered: true, // worker reports permanent failure, or retries exhausted, or lease-expiry sweep
-		Running:      true, // lease-expiry reclaim: new generation, same state (Phase 2+)
+		Running:      true, // self-loop: covers both lease-expiry reclaim (new generation, Phase 2+) and heartbeat renewal (same generation, extended lease_expires_at, Phase 2+) — see internal/store.Claim and internal/store.Heartbeat
 		Cancelled:    true, // worker acknowledges a pending cancellation request (Phase 6+)
 	},
 	Succeeded:    {}, // terminal: no outbound transition

@@ -82,3 +82,39 @@ func (r *Recorder) Executions() []RecordedExecution {
 	copy(out, r.executed)
 	return out
 }
+
+// Gated is a Handler whose Execute blocks until either Proceed is closed
+// (in which case it returns Result/Err) or ctx is cancelled (in which
+// case it returns ctx.Err()), signalling on Started the instant it begins
+// running. It exists so Phase 2 worker tests can control precisely when a
+// "long-running" job's handler finishes — e.g. to force a lease-loss race
+// during execution, or to hold a job open across several heartbeat
+// cycles — without depending on a fixed sleep duration racing real
+// wall-clock timing (docs/testing-strategy.md: "use explicit
+// synchronization points ... rather than relying on repeated runs").
+type Gated struct {
+	// Started, if non-nil, receives a value the moment Execute begins.
+	// Buffer it (or don't send on it) if the caller doesn't need to
+	// synchronize on execution start.
+	Started chan<- struct{}
+	// Proceed unblocks Execute with (Result, Err) when closed or sent on.
+	Proceed <-chan struct{}
+	Result  handler.Result
+	Err     error
+}
+
+func (g Gated) Execute(ctx context.Context, _ *job.Job) (handler.Result, error) {
+	if g.Started != nil {
+		select {
+		case g.Started <- struct{}{}:
+		case <-ctx.Done():
+			return handler.Result{}, ctx.Err()
+		}
+	}
+	select {
+	case <-g.Proceed:
+		return g.Result, g.Err
+	case <-ctx.Done():
+		return handler.Result{}, ctx.Err()
+	}
+}

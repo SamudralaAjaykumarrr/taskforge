@@ -46,66 +46,84 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanJob(row rowScanner) (*job.Job, error) {
-	var (
-		j              job.Job
-		state          string
-		scheduledAt    sql.NullTime
-		leaseOwner     sql.NullString
-		leaseExpiresAt sql.NullTime
-		heartbeatAt    sql.NullTime
-		cancelReqAt    sql.NullTime
-		idempotencyKey sql.NullString
-		lastError      sql.NullString
-		lastErrorClass sql.NullString
-		resultMetadata []byte
-		terminalAt     sql.NullTime
-	)
+// queryRower is satisfied by both *sql.DB and *sql.Tx, letting transition
+// (and anything built on it) run against either a bare connection or an
+// already-open transaction without duplicating query logic.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
 
-	err := row.Scan(
-		&j.ID, &j.JobType, &j.Payload, &state, &j.Priority, &j.CreatedAt, &j.UpdatedAt, &j.EligibleAt,
-		&scheduledAt, &leaseOwner, &j.LeaseGeneration, &leaseExpiresAt, &heartbeatAt,
-		&j.AttemptCount, &j.MaxAttempts, &j.ExecutionTimeoutSeconds, &j.CancelRequested,
-		&cancelReqAt, &idempotencyKey, &lastError, &lastErrorClass,
-		&resultMetadata, &terminalAt, &j.Version,
-	)
-	if err != nil {
+// jobScanFields holds every scan destination for a jobColumns row. It is
+// factored out of scanJob so Claim's RETURNING clause (jobColumns plus two
+// extra "candidate" columns — see claim.go) can reuse the exact same
+// destination list instead of duplicating twenty-plus Scan arguments.
+type jobScanFields struct {
+	j              job.Job
+	state          string
+	scheduledAt    sql.NullTime
+	leaseOwner     sql.NullString
+	leaseExpiresAt sql.NullTime
+	heartbeatAt    sql.NullTime
+	cancelReqAt    sql.NullTime
+	idempotencyKey sql.NullString
+	lastError      sql.NullString
+	lastErrorClass sql.NullString
+	resultMetadata []byte
+	terminalAt     sql.NullTime
+}
+
+func (f *jobScanFields) dest() []any {
+	return []any{
+		&f.j.ID, &f.j.JobType, &f.j.Payload, &f.state, &f.j.Priority, &f.j.CreatedAt, &f.j.UpdatedAt, &f.j.EligibleAt,
+		&f.scheduledAt, &f.leaseOwner, &f.j.LeaseGeneration, &f.leaseExpiresAt, &f.heartbeatAt,
+		&f.j.AttemptCount, &f.j.MaxAttempts, &f.j.ExecutionTimeoutSeconds, &f.j.CancelRequested,
+		&f.cancelReqAt, &f.idempotencyKey, &f.lastError, &f.lastErrorClass,
+		&f.resultMetadata, &f.terminalAt, &f.j.Version,
+	}
+}
+
+func (f *jobScanFields) materialize() *job.Job {
+	j := f.j
+	j.State = jobstate.State(f.state)
+	if f.scheduledAt.Valid {
+		j.ScheduledAt = &f.scheduledAt.Time
+	}
+	if f.leaseOwner.Valid {
+		j.LeaseOwner = &f.leaseOwner.String
+	}
+	if f.leaseExpiresAt.Valid {
+		j.LeaseExpiresAt = &f.leaseExpiresAt.Time
+	}
+	if f.heartbeatAt.Valid {
+		j.HeartbeatAt = &f.heartbeatAt.Time
+	}
+	if f.cancelReqAt.Valid {
+		j.CancelRequestedAt = &f.cancelReqAt.Time
+	}
+	if f.idempotencyKey.Valid {
+		j.IdempotencyKey = &f.idempotencyKey.String
+	}
+	if f.lastError.Valid {
+		j.LastError = &f.lastError.String
+	}
+	if f.lastErrorClass.Valid {
+		j.LastErrorClass = &f.lastErrorClass.String
+	}
+	if f.resultMetadata != nil {
+		j.ResultMetadata = f.resultMetadata
+	}
+	if f.terminalAt.Valid {
+		j.TerminalAt = &f.terminalAt.Time
+	}
+	return &j
+}
+
+func scanJob(row rowScanner) (*job.Job, error) {
+	var f jobScanFields
+	if err := row.Scan(f.dest()...); err != nil {
 		return nil, err
 	}
-
-	j.State = jobstate.State(state)
-	if scheduledAt.Valid {
-		j.ScheduledAt = &scheduledAt.Time
-	}
-	if leaseOwner.Valid {
-		j.LeaseOwner = &leaseOwner.String
-	}
-	if leaseExpiresAt.Valid {
-		j.LeaseExpiresAt = &leaseExpiresAt.Time
-	}
-	if heartbeatAt.Valid {
-		j.HeartbeatAt = &heartbeatAt.Time
-	}
-	if cancelReqAt.Valid {
-		j.CancelRequestedAt = &cancelReqAt.Time
-	}
-	if idempotencyKey.Valid {
-		j.IdempotencyKey = &idempotencyKey.String
-	}
-	if lastError.Valid {
-		j.LastError = &lastError.String
-	}
-	if lastErrorClass.Valid {
-		j.LastErrorClass = &lastErrorClass.String
-	}
-	if resultMetadata != nil {
-		j.ResultMetadata = resultMetadata
-	}
-	if terminalAt.Valid {
-		j.TerminalAt = &terminalAt.Time
-	}
-
-	return &j, nil
+	return f.materialize(), nil
 }
 
 // Insert durably creates a new job in QUEUED state and returns the row
@@ -144,115 +162,6 @@ func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*job.Job, error) {
 	return j, nil
 }
 
-// Claim atomically finds and takes ownership of at most one eligible job
-// for workerID, transitioning it QUEUED -> RUNNING.
-//
-// This is deliberately the Phase 1 SUBSET of the general claim query in
-// docs/worker-protocol.md: it only considers state = 'QUEUED' rows.
-// docs/roadmap.md restricts Phase 1's state machine to
-// "QUEUED -> RUNNING -> SUCCEEDED and a simple RUNNING -> DEAD_LETTERED on
-// any failure (no retry machinery, no RETRY_WAIT yet)" — so there is never
-// a RETRY_WAIT row to reclaim, and Phase 1 has no lease-expiration/reclaim
-// mechanism at all (that is Phase 2 scope: "Do not implement yet: ...
-// lease expiration"). Extending the WHERE clause to also match expired-
-// lease RUNNING rows, as the full worker-protocol query does, would
-// silently implement Phase 2's reclaim behavior ahead of schedule. A
-// RUNNING job whose worker crashed before completing therefore stays
-// RUNNING until a human resubmits a new job — an explicitly accepted
-// Phase 1 limitation (see docs/roadmap.md Phase 1 completion criteria).
-//
-// The second return value is false (with a nil error) when there is
-// nothing eligible to claim right now — that is a normal, expected
-// outcome, not a failure.
-func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, error) {
-	if !jobstate.IsValidTransition(jobstate.Queued, jobstate.Running) {
-		return nil, false, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, jobstate.Queued, jobstate.Running)
-	}
-
-	row := s.db.QueryRowContext(ctx, `
-		WITH candidate AS (
-			SELECT id
-			FROM jobs
-			WHERE state = 'QUEUED' AND eligible_at <= now()
-			ORDER BY priority DESC, eligible_at ASC
-			FOR UPDATE SKIP LOCKED
-			LIMIT 1
-		)
-		UPDATE jobs
-		SET state = 'RUNNING',
-			lease_owner = $1,
-			lease_generation = jobs.lease_generation + 1,
-			lease_expires_at = now() + make_interval(secs => jobs.execution_timeout_seconds),
-			heartbeat_at = now(),
-			attempt_count = jobs.attempt_count + 1,
-			updated_at = now(),
-			cancel_requested = false,
-			cancel_requested_at = NULL,
-			version = jobs.version + 1
-		FROM candidate
-		WHERE jobs.id = candidate.id
-		RETURNING `+jobColumns,
-		workerID,
-	)
-
-	j, err := scanJob(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, fmt.Errorf("store: claim: %w", err)
-	}
-	return j, true, nil
-}
-
-// CompleteSuccess fences on (id, leaseOwner, leaseGeneration, state =
-// RUNNING) and transitions the job RUNNING -> SUCCEEDED, per
-// docs/worker-protocol.md "Completion / Success". If the guard does not
-// match — the job is not RUNNING, or is RUNNING under a different lease —
-// this returns ErrStaleTransition and leaves the row untouched
-// (TF-INV-003).
-func (s *Store) CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, resultMetadata []byte) (*job.Job, error) {
-	return s.transition(ctx, jobstate.Running, jobstate.Succeeded, `
-		UPDATE jobs
-		SET state = 'SUCCEEDED',
-			lease_owner = NULL,
-			lease_expires_at = NULL,
-			result_metadata = $4,
-			terminal_at = now(),
-			updated_at = now(),
-			version = version + 1
-		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'
-		RETURNING `+jobColumns,
-		id, leaseOwner, leaseGeneration, resultMetadata,
-	)
-}
-
-// CompleteFailure fences the same way as CompleteSuccess and transitions
-// RUNNING -> DEAD_LETTERED unconditionally.
-//
-// This is Phase 1's documented simplification of
-// docs/worker-protocol.md's "Retryable Failure" / "Permanent Failure"
-// queries: docs/roadmap.md states Phase 1 has "no retry machinery, no
-// RETRY_WAIT yet — a failure goes straight to DEAD_LETTERED", regardless
-// of attempt_count or error classification. Phase 3 introduces the real
-// RETRY_WAIT branch and attempt-budget check.
-func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage, errClass string) (*job.Job, error) {
-	return s.transition(ctx, jobstate.Running, jobstate.DeadLettered, `
-		UPDATE jobs
-		SET state = 'DEAD_LETTERED',
-			lease_owner = NULL,
-			lease_expires_at = NULL,
-			last_error = $4,
-			last_error_class = $5,
-			terminal_at = now(),
-			updated_at = now(),
-			version = version + 1
-		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'
-		RETURNING `+jobColumns,
-		id, leaseOwner, leaseGeneration, errMessage, errClass,
-	)
-}
-
 // transition is the single choke point every fenced state-changing UPDATE
 // in this package runs through: it (a) rejects, before issuing any SQL, a
 // (from, to) pair that internal/jobstate says is illegal per
@@ -261,13 +170,18 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 // sql.ErrNoRows, so callers cannot mistake a rejected transition for "job
 // not found". This is what docs/worker-protocol.md calls "The Fencing
 // Guarantee, Stated Precisely" — see also TF-INV-003, TF-INV-005,
-// TF-INV-014.
-func (s *Store) transition(ctx context.Context, from, to jobstate.State, query string, args ...any) (*job.Job, error) {
+// TF-INV-014, TF-INV-015.
+//
+// q is a queryRower so this can run against either the bare *sql.DB
+// (Heartbeat, a single-statement fenced update) or an open *sql.Tx
+// (CompleteSuccess/CompleteFailure, which also write job_attempts in the
+// same transaction — see complete.go).
+func (s *Store) transition(ctx context.Context, q queryRower, from, to jobstate.State, query string, args ...any) (*job.Job, error) {
 	if !jobstate.IsValidTransition(from, to) {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, from, to)
 	}
 
-	row := s.db.QueryRowContext(ctx, query, args...)
+	row := q.QueryRowContext(ctx, query, args...)
 	j, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrStaleTransition

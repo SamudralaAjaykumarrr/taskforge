@@ -120,8 +120,12 @@ func TestClaim_TransitionsQueuedToRunning(t *testing.T) {
 }
 
 // TestClaim_SkipsAlreadyClaimedJob proves a second claim attempt does not
-// re-claim a RUNNING job (a direct, cheap analogue of TF-INV-002 — full
-// concurrent-worker proof is Phase 2's SF-006).
+// re-claim a RUNNING job whose lease is still valid (a direct, cheap
+// analogue of TF-INV-002 — full concurrent-worker proof is
+// TestClaim_ConcurrentWorkersRaceForSameJob / SF-006). Phase 2 does add a
+// reclaim path (see TestClaim_ReclaimsExpiredLease), but it only fires
+// once lease_expires_at has passed; a job claimed moments ago with the
+// default (much longer) execution_timeout_seconds must not be touched.
 func TestClaim_SkipsAlreadyClaimedJob(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -135,7 +139,7 @@ func TestClaim_SkipsAlreadyClaimedJob(t *testing.T) {
 
 	_, ok, err = s.Claim(ctx, "worker-2")
 	require.NoError(t, err)
-	require.False(t, ok, "a RUNNING job must not be claimable again in Phase 1 (no reclaim mechanism exists yet)")
+	require.False(t, ok, "a RUNNING job with an unexpired lease must not be claimable again")
 }
 
 // TestCompleteSuccess_TransitionsRunningToSucceeded is SF-001's completion
@@ -374,19 +378,22 @@ func TestFaultInjection_RollbackLeavesRowUnchanged(t *testing.T) {
 	require.Nil(t, after.LeaseOwner)
 }
 
-// TestRestart_RunningJobSurvivesFreshStoreInstance is Phase 1's minimal
-// version of SF-018 / the roadmap's restart quality gate: "no in-memory
-// state holds anything correctness-relevant (verifiable by restarting the
-// process mid-test and asserting state is unaffected)". A brand-new
-// *store.Store (standing in for a restarted process, since Store holds no
-// state of its own beyond a *sql.DB handle) must observe exactly the same
-// durable state a "pre-restart" instance left behind.
+// TestRestart_RunningJobSurvivesFreshStoreInstance is a minimal version of
+// SF-018 / the roadmap's restart quality gate: "no in-memory state holds
+// anything correctness-relevant (verifiable by restarting the process
+// mid-test and asserting state is unaffected)". A brand-new *store.Store
+// (standing in for a restarted process, since Store holds no state of its
+// own beyond a *sql.DB handle) must observe exactly the same durable state
+// a "pre-restart" instance left behind, and recovery must not depend on
+// any in-memory ownership state surviving the restart.
 //
-// This also demonstrates Phase 1's explicit, documented limitation: the
-// "restarted" instance's normal Claim() does NOT resume or reclaim the
-// still-RUNNING job (no lease-expiry/reclaim mechanism exists until Phase
-// 2) — it stays RUNNING until a human resubmits, exactly as
-// docs/roadmap.md's Phase 1 completion criteria describe.
+// The still-RUNNING job's lease has NOT expired here (default
+// execution_timeout_seconds), so the restarted instance's Claim() must
+// not touch it — same "unexpired lease is not claimable" property as
+// TestClaim_SkipsAlreadyClaimedJob, now proven across a simulated
+// restart. See TestReclaim_SurvivesFreshStoreInstance below for the
+// restart-with-an-EXPIRED-lease case (the actual crash-recovery path,
+// TF-INV-004).
 func TestRestart_RunningJobSurvivesFreshStoreInstance(t *testing.T) {
 	db := testutil.DB(t)
 	before := store.New(db)
@@ -408,16 +415,50 @@ func TestRestart_RunningJobSurvivesFreshStoreInstance(t *testing.T) {
 	require.Equal(t, claimed.LeaseGeneration, seen.LeaseGeneration)
 	require.Equal(t, *claimed.LeaseOwner, *seen.LeaseOwner)
 
-	// Documented Phase 1 limitation: the restarted instance does not
+	// The lease is still valid, so the restarted instance must not
 	// reclaim it.
 	_, ok, err = after.Claim(ctx, "worker-2")
 	require.NoError(t, err)
-	require.False(t, ok, "Phase 1 has no reclaim mechanism; a RUNNING job is not claimable after a restart")
+	require.False(t, ok, "a RUNNING job with an unexpired lease is not claimable after a restart")
 
 	// The restarted instance CAN still complete it, using the lease
 	// credentials read back from durable state (proving nothing
 	// correctness-relevant was lost by not being in worker-2's memory).
 	completed, err := after.CompleteSuccess(ctx, seen.ID, *seen.LeaseOwner, seen.LeaseGeneration, nil)
+	require.NoError(t, err)
+	require.Equal(t, jobstate.Succeeded, completed.State)
+}
+
+// TestReclaim_SurvivesFreshStoreInstance is SF-018's actual crash-recovery
+// case: a RUNNING job whose lease expired while no process was running at
+// all is reclaimed correctly by a store instance that never held any
+// in-memory reference to it, proving recovery does not depend on
+// in-memory ownership state surviving a restart (TF-INV-004).
+func TestReclaim_SurvivesFreshStoreInstance(t *testing.T) {
+	db := testutil.DB(t)
+	before := store.New(db)
+	ctx := context.Background()
+
+	created, err := before.Insert(ctx, newJobParams("test.restart.reclaim"))
+	require.NoError(t, err)
+	_, ok, err := before.Claim(ctx, "worker-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	forceExpireLease(t, db, created.ID)
+
+	// A fresh Store, standing in for a fully restarted fleet (API +
+	// workers), with no in-memory knowledge of worker-1's claim.
+	after := store.New(db)
+
+	reclaimed, ok, err := after.Claim(ctx, "worker-2")
+	require.NoError(t, err)
+	require.True(t, ok, "an expired lease must be reclaimable even by a process that never saw the original claim")
+	require.Equal(t, jobstate.Running, reclaimed.State)
+	require.Equal(t, int64(2), reclaimed.LeaseGeneration)
+	require.Equal(t, "worker-2", *reclaimed.LeaseOwner)
+
+	completed, err := after.CompleteSuccess(ctx, reclaimed.ID, "worker-2", reclaimed.LeaseGeneration, nil)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, completed.State)
 }

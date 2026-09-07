@@ -10,10 +10,13 @@ var (
 	// affects zero rows: the job is not in the expected source state,
 	// and/or the supplied lease_owner/lease_generation no longer match
 	// the current row. This is the mechanism behind TF-INV-003,
-	// TF-INV-005, and TF-INV-014 — see docs/worker-protocol.md "The
-	// Fencing Guarantee, Stated Precisely." It is never returned by
-	// silently succeeding; callers must treat it as an explicit
-	// rejection, not a network-style transient error.
+	// TF-INV-005, TF-INV-014, and (for Heartbeat) TF-INV-015 — see
+	// docs/worker-protocol.md "The Fencing Guarantee, Stated Precisely."
+	// It is never returned by silently succeeding; callers must treat it
+	// as an explicit rejection, not a network-style transient error. A
+	// worker that receives this from Heartbeat has lost its lease and
+	// must stop acting as the job's authoritative owner (see
+	// internal/worker).
 	ErrStaleTransition = errors.New("store: stale or invalid transition rejected")
 
 	// ErrInvalidTransition is returned when calling code asks for a

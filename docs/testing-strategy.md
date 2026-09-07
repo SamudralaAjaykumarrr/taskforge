@@ -4,7 +4,7 @@ Status: foundational. This is the verification plan for every invariant in
 [invariants.md](invariants.md). No invariant is considered credible without
 a corresponding entry here mapping to an executable test.
 
-## Phase 1 Implementation Status
+## Phase 1 & Phase 2 Implementation Status
 
 As of Phase 1 ([roadmap.md](roadmap.md)), the following test categories
 below have real, passing, executable tests — everything else in this
@@ -26,19 +26,58 @@ document remains the verification *plan* for later phases, not yet built:
   `TestRestart_RunningJobSurvivesFreshStoreInstance` in
   `internal/store/store_test.go`.
 
-**Not yet implemented**: property-based tests, fuzz tests, concurrency
-tests with real concurrent workers, lease-expiration tests, stale-worker
-fencing under genuine concurrency (only the single-worker fencing
-*mechanism* is tested — see the invariant-to-test matrix note below), retry
-tests, race tests, load tests, chaos tests. These require Phase 2+
-functionality (multiple workers, leases, retries) that does not exist yet.
+As of Phase 2, the following additional categories now have real, passing,
+executable tests, all in `internal/store/lease_test.go` and
+`internal/worker/lease_test.go` unless noted:
+
+- **Concurrency tests with real concurrent workers** (TF-INV-002, SF-006):
+  `TestClaim_ConcurrentWorkersRaceForSameJob` (N goroutines, real pooled
+  PostgreSQL connections, racing for a shared job pool) and
+  `TestClaim_ConcurrentReclaimRace` (the reclaim-branch analogue).
+- **Lease-expiration tests** (TF-INV-004, SF-007): `TestClaim_ReclaimsExpiredLease`,
+  `TestClaim_UnexpiredLeaseIsNeverReclaimed`, `TestClaim_TerminalJobNeverReclaimed`,
+  `TestClaim_SweepDeadLettersAttemptExhaustedExpiredLease` — all use
+  deterministic DB-time manipulation (`forceExpireLease` in
+  `internal/store/testhelpers_test.go`), never a sleep-based wait.
+- **Stale-worker fencing under genuine concurrency** (TF-INV-003,
+  TF-INV-014, SF-008): `TestFencing_StaleWorkerCompletionRejectedAfterReclaim`
+  (the canonical two-generation sequence), `TestFencing_ArbitrarilyLateArrivalAcrossManyGenerations`
+  (4+ generations), `TestFencing_StaleCompletionRejectedBeforeNewOwnerCompletes`.
+  This closes the gap Phase 1 explicitly left open (only the single-worker
+  stale-credential *mechanism* was tested then).
+- **Heartbeat-specific fencing tests** (TF-INV-015, SF-016/SF-017):
+  `TestHeartbeat_ExtendsValidLease`, `TestHeartbeat_MonotonicAcrossRapidRenewals`,
+  `TestHeartbeat_RejectsStaleGeneration`, `TestHeartbeat_RejectsWrongOwner`,
+  `TestHeartbeat_NeverResurrectsOrReopensTerminalJob`,
+  `TestHeartbeat_ThenReclaim_ValidLeaseIsNotStolen`,
+  `TestReclaim_ThenHeartbeat_StaleHeartbeatRejected`; the long-running-job
+  path (SF-017) at the worker-loop level:
+  `TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive` in
+  `internal/worker/lease_test.go`.
+- **Worker-crash tests at the worker-loop level** (TF-INV-004, SF-002/003):
+  `TestRunOnce_LeaseLostDuringExecution_SkipsCompletion` in
+  `internal/worker/lease_test.go` — the canonical Worker A/Worker B
+  scenario reproduced through the actual claim→heartbeat→execute loop, not
+  just direct store calls.
+- **Fault-injection tests, extended to the new multi-statement claim
+  transaction** (TF-INV-013): `TestClaim_RollbackOnAttemptConflictLeavesJobRowUnchanged`.
+- **Migration upgrade tests**: `TestUp_UpgradesPhase1SchemaToPhase2` in
+  `internal/migrate/migrate_test.go` — a database with only migration
+  `0001` applied is upgraded to Phase 2's schema without data loss.
+
+**Still not implemented**: property-based tests, fuzz tests, retry tests
+(no `RETRY_WAIT`/backoff exists yet — Phase 3), idempotency tests (Phase
+4), the cancellation race test SF-012 (Phase 6), the scheduling test
+SF-013 (Phase 6), sustained load tests and chaos tests (Phase 5/9 — Phase
+2's concurrency tests use small, fixed worker/job counts to prove
+correctness deterministically, not sustained/randomized load).
 
 The invariant-to-test matrix below is the full, multi-phase plan and is
-**not** rewritten for Phase 1 — see
-[docs/roadmap.md](roadmap.md)'s Phase 1 section for exactly which
-invariants (TF-INV-001, TF-INV-005 trivially, TF-INV-013) Phase 1 is
-responsible for proving, and README.md's "Phase 1 guarantees" section for
-which of this matrix's scenarios have a passing Phase 1 test today.
+**not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1
+and Phase 2 sections for exactly which invariants each phase is
+responsible for proving, and README.md's "Phase 1 guarantees" / "Phase 2
+guarantees" sections for which of this matrix's scenarios have a passing
+test today.
 
 ## Test Categories
 
