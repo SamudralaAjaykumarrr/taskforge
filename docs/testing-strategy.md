@@ -160,18 +160,84 @@ have real, passing, executable tests, in `internal/store/idempotency_test.go`,
   `job_id`-keyed dedup table (exactly one durable effect row despite two
   handler invocations).
 
+As of Phase 5 ("Concurrency Hardening"), the following additional
+categories now have real, passing, executable tests, in
+`internal/store/concurrency_stress_test.go` and
+`internal/worker/concurrency_stress_test.go`:
+
+- **Concurrency tests at higher scale** (TF-INV-002, TF-INV-014, extended
+  SF-006): 25 workers/300 jobs and 20 workers/1 job claim races, a
+  job-to-worker-ratio table test (fewer jobs than workers, more jobs than
+  workers, roughly equal), and 40 jobs × 4 generations of concurrent
+  completion attempts fired all at once — see
+  `TestStress_SF006_ManyWorkersManyJobs_NoDoubleClaimNoGenerationReuse`,
+  `TestStress_ManyWorkersRaceForOneJob`,
+  `TestStress_ClaimContention_JobToWorkerRatios`,
+  `TestStress_SF008_FencingHoldsUnderSustainedConcurrentCompletionAttempts`.
+- **Lease-expiration/reclaim tests at higher scale** (TF-INV-004, extended
+  SF-007): 120 simultaneously "crashed" jobs reclaimed concurrently by 20
+  workers (`TestStress_SF007_SustainedConcurrentReclaimOfManyExpiredLeases`),
+  and a concurrent sweep of 60 attempt-exhausted expired leases
+  (`TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter`).
+- **Stale-worker fencing tests at the worker-loop level, many-at-once**
+  (TF-INV-003, extended SF-008): 15 concurrent lease-loss races, all
+  released from a barrier so the stale first-wave completions and the
+  legitimate second-wave completions race directly:
+  `TestStress_ManyConcurrentLeaseLossRaces_NoStaleAuthoritativeCompletions`.
+- **Retry-eligibility concurrency at scale**: 60 simultaneously eligible
+  `RETRY_WAIT` jobs raced by 15 workers:
+  `TestStress_ConcurrentWorkersRaceForManyEligibleRetryWaitJobs`.
+- **Claim-pressure-with-terminal-jobs test**: 80 terminal jobs (with
+  adversarially stale lease timestamps) alongside 80 claimable jobs under
+  20-worker pressure, proving TF-INV-005 holds under contention, not just
+  in isolation: `TestStress_ConcurrentClaimPressureWithTerminalJobsPresent`.
+- **Connection-pool-constrained claim test**: 15 goroutines draining 60
+  jobs against a `*sql.DB` capped at 3 open connections, proving the
+  short-transaction claim design degrades to queueing, not deadlock, under
+  pool pressure smaller than the worker count:
+  `TestStress_ClaimProgressesUnderConstrainedConnectionPool`.
+- **Repeated-seed randomized crash-injection property test**: a
+  round-based, deterministically-synchronized simulation across 5 fixed
+  seeds (80 jobs, 12 workers/round) where each claim is randomly resolved
+  as success/retryable-failure/simulated-crash, checked after every seed
+  for full convergence to a terminal state and for TF-INV-006/007/009 to
+  hold across the whole run:
+  `TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold`.
+- **Worker-pool-level mixed-outcome and graceful-shutdown tests**: 20
+  workers against 200 jobs with a realistic success/retry/permanent-failure
+  mix (`TestStress_ManyWorkersProcessLargeMixedJobPool`), and a 10-worker
+  pool shut down mid-execution/mid-heartbeat with no goroutine leak and no
+  orphaned authoritative completion
+  (`TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`).
+
+Every test above uses explicit synchronization (start barriers,
+`sync.WaitGroup`, DB-time manipulation) per this document's determinism
+requirement below — never a sleep-based race — and was run repeatedly
+under `-race` (`go test -race -p 1 -count=3 -run TestStress ./internal/store/...
+./internal/worker/...`) with zero failures and zero detected data races
+during this phase's development, per "What 'Proving an Invariant' Means
+Here" below.
+
 **Still not implemented**: fuzz tests, the cancellation race test SF-012
-(Phase 6), the scheduling test SF-013 (Phase 6), sustained load tests and
-chaos tests (Phase 5/9 — Phase 2's concurrency tests use small, fixed
-worker/job counts to prove correctness deterministically, not
-sustained/randomized load). Phase 3's optional background sweeper
+(Phase 6), the scheduling test SF-013 (Phase 6), and sustained multi-hour
+load/chaos tests (Phase 9 — Phase 5's stress tests use large but bounded,
+deterministic worker/job counts and repeated fixed seeds to prove
+correctness under contention, not open-ended sustained/randomized load,
+per [docs/roadmap.md](roadmap.md)'s explicit Phase 5/Phase 9 boundary).
+Phase 3's optional background sweeper
 (docs/architecture.md: "an optimization, not a correctness dependency")
 was not built — the Lazy Dead-Letter Sweep already running inside every
 `Claim` call (Phase 2) remains the sole, sufficient mechanism for
 `TF-INV-006` on the reclaim path; a periodic out-of-band sweeper would
 only shrink the (already bounded) window before an attempt-exhausted
 expired lease is visible as `DEAD_LETTERED`, which no required invariant
-or scenario depends on.
+or scenario depends on. Phase 5 confirmed (see
+`TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter`)
+that this sweep's lack of `SKIP LOCKED` causes concurrent claimers to
+briefly serialize under heavy simultaneous-exhaustion load rather than
+error or double-dead-letter — a latency consideration, not a correctness
+gap, and out of this phase's scope to change (docs/roadmap.md's Phase 5
+non-goal: "not adding capability").
 
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1
