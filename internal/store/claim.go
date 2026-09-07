@@ -26,6 +26,9 @@ const (
 	attemptOutcomeFailedPermanent = "FAILED_PERMANENT"
 	attemptOutcomeFailedRetryable = "FAILED_RETRYABLE"
 	attemptOutcomeLeaseExpired    = "LEASE_EXPIRED"
+	// attemptOutcomeTimedOut is Phase 6's execution-timeout attempt
+	// outcome -- see retry.go's CompleteTimeout.
+	attemptOutcomeTimedOut = "TIMED_OUT"
 )
 
 // claimQuery is docs/worker-protocol.md's "Claim Query" verbatim, with two

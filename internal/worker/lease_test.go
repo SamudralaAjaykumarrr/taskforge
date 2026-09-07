@@ -38,6 +38,20 @@ import (
 // that runs longer than a single lease TTL completes successfully under
 // the SAME lease_generation throughout, because the worker's background
 // heartbeat loop renews the lease well before it would otherwise expire.
+//
+// Phase 6 note: execution_timeout_seconds is also this attempt's fixed
+// execution-timeout ceiling (see internal/worker's runWithHeartbeat,
+// docs/execution-semantics.md "Timeout Semantics") — unlike the lease,
+// this ceiling is NOT renewed by heartbeats, so this test's held-open
+// duration must stay safely under it while still crossing multiple
+// heartbeat cycles (proving lease renewal, this test's actual subject,
+// independent of the timeout ceiling). Before Phase 6 added that
+// ceiling, this test used ExecutionTimeoutSeconds=1 with a 1200ms hold
+// specifically because no such ceiling existed yet; seeing the handler
+// run past execution_timeout_seconds without consequence was exactly the
+// Phase 2-5 gap Phase 6 closes (see README's "Phase 6: What's
+// Implemented" and docs/failure-model.md F9) — TestRunOnce_ExecutionTimeout_FiresIndependentlyOfLeaseRenewal
+// in timeout_test.go now proves that closed gap directly.
 func TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive(t *testing.T) {
 	db := testutil.DB(t)
 	s := store.New(db)
@@ -45,12 +59,14 @@ func TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive(t *testing.T) {
 
 	// A short execution_timeout_seconds means a short lease TTL and a
 	// short (TTL/3) heartbeat interval, so the test can force several
-	// real heartbeat cycles without a long-running test.
+	// real heartbeat cycles without a long-running test, while holding
+	// the handler open for less than the same value (the execution-
+	// timeout ceiling) so it is never at risk of firing.
 	created, err := s.Insert(ctx, job.NewParams{
 		JobType:                 "test.longrunning",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
-		ExecutionTimeoutSeconds: 1, // 1s lease TTL -> ~333ms heartbeat interval
+		ExecutionTimeoutSeconds: 3, // 3s lease TTL/execution-timeout ceiling -> ~1s heartbeat interval
 	})
 	require.NoError(t, err)
 
@@ -67,9 +83,9 @@ func TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive(t *testing.T) {
 		claimed, runErr = w.RunOnce(ctx)
 	}()
 
-	// Hold the handler open across more than 3 lease TTLs (i.e. several
-	// heartbeat cycles) before letting it finish.
-	time.Sleep(1200 * time.Millisecond)
+	// Hold the handler open across 2 heartbeat cycles (~1s each) while
+	// staying safely under the 3s execution-timeout ceiling.
+	time.Sleep(2500 * time.Millisecond)
 	close(proceed)
 
 	<-runDone

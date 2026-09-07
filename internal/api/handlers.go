@@ -19,6 +19,13 @@ type createJobRequest struct {
 	Payload                 json.RawMessage `json:"payload"`
 	MaxAttempts             *int            `json:"max_attempts,omitempty"`
 	ExecutionTimeoutSeconds *int            `json:"execution_timeout_seconds,omitempty"`
+	// ScheduledAt is Phase 6's optional future-execution request, per
+	// docs/scheduling.md. Omitted or null means "run as soon as
+	// possible" (unchanged Phase 1-5 behavior). encoding/json parses this
+	// as RFC 3339 automatically -- a malformed value fails at
+	// dec.Decode's DisallowUnknownFields JSON parse in CreateJob below,
+	// before validateCreateJobRequest ever runs, with a 400 response.
+	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
 }
 
 type jobResponse struct {
@@ -31,6 +38,9 @@ type jobResponse struct {
 	CreatedAt               time.Time       `json:"created_at"`
 	UpdatedAt               time.Time       `json:"updated_at"`
 	EligibleAt              time.Time       `json:"eligible_at"`
+	ScheduledAt             *time.Time      `json:"scheduled_at,omitempty"`
+	CancelRequested         bool            `json:"cancel_requested,omitempty"`
+	CancelRequestedAt       *time.Time      `json:"cancel_requested_at,omitempty"`
 	IdempotencyKey          *string         `json:"idempotency_key,omitempty"`
 	LastError               *string         `json:"last_error,omitempty"`
 	LastErrorClass          *string         `json:"last_error_class,omitempty"`
@@ -49,6 +59,9 @@ func toJobResponse(j *job.Job) jobResponse {
 		CreatedAt:               j.CreatedAt,
 		UpdatedAt:               j.UpdatedAt,
 		EligibleAt:              j.EligibleAt,
+		ScheduledAt:             j.ScheduledAt,
+		CancelRequested:         j.CancelRequested,
+		CancelRequestedAt:       j.CancelRequestedAt,
 		IdempotencyKey:          j.IdempotencyKey,
 		LastError:               j.LastError,
 		LastErrorClass:          j.LastErrorClass,
@@ -177,6 +190,7 @@ func validateCreateJobRequest(req createJobRequest) (job.NewParams, string) {
 		Payload:                 payload,
 		MaxAttempts:             maxAttempts,
 		ExecutionTimeoutSeconds: executionTimeout,
+		ScheduledAt:             req.ScheduledAt,
 	}, ""
 }
 
@@ -198,6 +212,59 @@ func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("failed to read job", "error", err, "job_id", id)
 		writeError(w, http.StatusInternalServerError, "failed to read job")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toJobResponse(j))
+}
+
+// CancelJob handles POST /jobs/{id}/cancel, per docs/worker-protocol.md's
+// documented contract:
+//
+//   - QUEUED/RETRY_WAIT: transitions directly to CANCELLED (no worker
+//     involved, no race).
+//   - RUNNING: durably records the request (cancel_requested = true);
+//     the response reports "cancellation requested, not yet confirmed" —
+//     the caller must poll GET /jobs/{id} to observe the eventual
+//     outcome (CANCELLED, or a completion that won the race per
+//     TF-INV-010).
+//   - Already terminal: idempotent no-op, response reports the job's
+//     actual terminal state.
+//
+// This is a three-step cascade rather than a read-then-act check: each
+// step is itself a single fenced, conditional UPDATE (internal/store's
+// CancelQueuedOrRetryWait / RequestCancellation), so there is no
+// check-then-act race window — if a step's guard does not match the
+// job's *current* state, it is because a genuinely different state
+// already applies (possibly changed concurrently by a claim or a
+// worker's own completion call), not because this handler read a stale
+// snapshot. The final GetByID only ever supplies the response body for
+// an already-resolved (terminal, or genuinely nonexistent) job.
+func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
+	idParam := r.PathValue("id")
+	id, err := uuid.Parse(idParam)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "id must be a valid UUID")
+		return
+	}
+
+	j, err := h.store.CancelQueuedOrRetryWait(r.Context(), id)
+	if errors.Is(err, store.ErrStaleTransition) {
+		j, err = h.store.RequestCancellation(r.Context(), id)
+	}
+	if errors.Is(err, store.ErrStaleTransition) {
+		// Neither QUEUED/RETRY_WAIT nor RUNNING matched: the job is
+		// already terminal (or does not exist at all) — report reality
+		// rather than a generic rejection, per the documented contract.
+		j, err = h.store.GetByID(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "job not found")
+			return
+		}
+	}
+	if err != nil {
+		h.logger.Error("failed to cancel job", "error", err, "job_id", id)
+		writeError(w, http.StatusInternalServerError, "failed to cancel job")
 		return
 	}
 

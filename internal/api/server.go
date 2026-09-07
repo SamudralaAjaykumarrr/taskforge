@@ -1,9 +1,12 @@
-// Package api implements the HTTP surface: POST /jobs and GET /jobs/{id},
-// per docs/worker-protocol.md "API Contract (Job Submission and Query)".
-// No other endpoint exists yet — cancellation, scheduling, and history are
-// later-phase surface per docs/roadmap.md and are intentionally not
-// exposed here. Phase 4 added optional Idempotency-Key support to
-// POST /jobs (docs/idempotency.md); no other endpoint changed.
+// Package api implements the HTTP surface: POST /jobs, GET /jobs/{id},
+// and (Phase 6) POST /jobs/{id}/cancel, per docs/worker-protocol.md "API
+// Contract (Job Submission and Query)". History (GET /jobs/{id}/history)
+// remains a documented, deliberately deferred endpoint. Phase 4 added
+// optional Idempotency-Key support to POST /jobs (docs/idempotency.md);
+// Phase 6 added an optional scheduled_at field to POST /jobs
+// (docs/scheduling.md) and the cancellation endpoint
+// (docs/execution-semantics.md, TF-INV-010) — no other endpoint's
+// contract changed.
 package api
 
 import (
@@ -20,6 +23,11 @@ import (
 type JobStore interface {
 	InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job, bool, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*job.Job, error)
+	// CancelQueuedOrRetryWait and RequestCancellation were added in
+	// Phase 6 — see docs/worker-protocol.md's POST /jobs/{id}/cancel
+	// contract and internal/store/cancellation.go.
+	CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job.Job, error)
+	RequestCancellation(ctx context.Context, id uuid.UUID) (*job.Job, error)
 }
 
 // Default values applied when a submission omits them. docs/data-model.md
@@ -54,11 +62,12 @@ func NewHandlers(store JobStore, logger *slog.Logger) *Handlers {
 	return &Handlers{store: store, logger: logger}
 }
 
-// NewRouter wires the Phase 1 endpoints onto a fresh http.ServeMux using
+// NewRouter wires the HTTP endpoints onto a fresh http.ServeMux using
 // Go 1.22+ method+pattern routing.
 func NewRouter(h *Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /jobs", h.CreateJob)
 	mux.HandleFunc("GET /jobs/{id}", h.GetJob)
+	mux.HandleFunc("POST /jobs/{id}/cancel", h.CancelJob)
 	return mux
 }

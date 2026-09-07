@@ -17,6 +17,12 @@
 // statement that performs the write, so the decision and the write can
 // never disagree or be interleaved with a concurrent change to either
 // value).
+//
+// Phase 6 adds CompleteTimeout, sharing this same fenced UPDATE (factored
+// out as completeRetryableOutcome) for the execution-timeout completion
+// path -- see docs/execution-semantics.md "Timeout Semantics" and
+// docs/retry-semantics.md ("A TIMED_OUT ... outcome is treated as
+// retryable by default").
 package store
 
 import (
@@ -63,6 +69,49 @@ import (
 // attempt-level vs job-level distinction) in the SAME transaction as the
 // jobs row update (TF-INV-013).
 func (s *Store) CompleteRetryableFailure(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage string, delay time.Duration) (*job.Job, error) {
+	return s.completeRetryableOutcome(ctx, id, leaseOwner, leaseGeneration, errMessage, "RETRYABLE", attemptOutcomeFailedRetryable, delay)
+}
+
+// CompleteTimeout is Phase 6's execution-timeout completion path: a
+// worker's own client-side deadline (see internal/worker,
+// docs/execution-semantics.md "Timeout Semantics") fired before the
+// handler returned. Per docs/retry-semantics.md ("A TIMED_OUT ... attempt
+// outcome ... is treated as retryable by default -- a timeout does not
+// necessarily mean the work is unsafe to retry, only that this attempt
+// did not confirm success in time"), a timeout is scheduled for retry (or
+// dead-lettered on exhaustion) via the exact same attempt_count vs
+// max_attempts decision as any other retryable failure -- it shares
+// completeRetryableOutcome's SQL verbatim, differing only in the
+// job-level last_error_class ("TIMEOUT", per docs/data-model.md's example
+// values) and the job_attempts.outcome it records ("TIMED_OUT", not
+// "FAILED_RETRYABLE" -- the *attempt* is distinguishable in history even
+// though the job-level retry/dead-letter decision is identical).
+//
+// Fenced exactly like every other completion call in this package
+// (lease_owner/lease_generation/state='RUNNING'): a worker whose lease
+// has already been lost (TF-INV-003/014) is no more authoritative for
+// reporting its own timeout than for reporting success, and a timeout
+// that fires after a cancellation has already been acknowledged, or
+// after the job has already reached another terminal state via a newer
+// generation, is rejected as stale (TF-INV-010's race rule, applied to a
+// third kind of completion).
+func (s *Store) CompleteTimeout(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, delay time.Duration) (*job.Job, error) {
+	return s.completeRetryableOutcome(ctx, id, leaseOwner, leaseGeneration, "execution timeout exceeded", "TIMEOUT", attemptOutcomeTimedOut, delay)
+}
+
+// completeRetryableOutcome is the shared RUNNING -> RETRY_WAIT /
+// RUNNING -> DEAD_LETTERED (via exhaustion) transition both
+// CompleteRetryableFailure and CompleteTimeout drive: the destination is
+// chosen by a SQL CASE on attempt_count vs max_attempts, evaluated
+// against the current row inside the same statement that performs the
+// write, so the decision and the write can never disagree or be
+// interleaved with a concurrent change to either value. errorClass
+// becomes the job-level last_error_class on either destination;
+// attemptOutcome becomes the job_attempts.outcome recorded for the
+// attempt that just ended -- these are the only two things that
+// distinguish an ordinary retryable failure from a timeout, per
+// CompleteTimeout's doc comment above.
+func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage, errorClass, attemptOutcome string, delay time.Duration) (*job.Job, error) {
 	// This single UPDATE can legally land on either RETRY_WAIT or
 	// DEAD_LETTERED depending on attempt_count vs max_attempts at write
 	// time (chosen by the SQL CASE below, not by this Go code) -- both
@@ -81,7 +130,7 @@ func (s *Store) CompleteRetryableFailure(ctx context.Context, id uuid.UUID, leas
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("store: complete retryable failure: begin: %w", err)
+		return nil, fmt.Errorf("store: complete retryable outcome: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
 
@@ -95,24 +144,24 @@ func (s *Store) CompleteRetryableFailure(ctx context.Context, id uuid.UUID, leas
 				ELSE now() + make_interval(secs => $5::double precision)
 			END,
 			last_error = $4,
-			last_error_class = 'RETRYABLE',
+			last_error_class = $6,
 			terminal_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'
 		RETURNING `+jobColumns,
-		id, leaseOwner, leaseGeneration, errMessage, delay.Seconds(),
+		id, leaseOwner, leaseGeneration, errMessage, delay.Seconds(), errorClass,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("store: complete retryable failure: %w", err)
+		return nil, fmt.Errorf("store: complete retryable outcome: %w", err)
 	}
 
-	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeFailedRetryable, "RETRYABLE", errMessage); err != nil {
-		return nil, fmt.Errorf("store: complete retryable failure: record attempt outcome: %w", err)
+	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcome, errorClass, errMessage); err != nil {
+		return nil, fmt.Errorf("store: complete retryable outcome: record attempt outcome: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("store: complete retryable failure: commit: %w", err)
+		return nil, fmt.Errorf("store: complete retryable outcome: commit: %w", err)
 	}
 	return j, nil
 }
