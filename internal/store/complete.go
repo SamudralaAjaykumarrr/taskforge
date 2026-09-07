@@ -51,6 +51,13 @@ func (s *Store) CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner st
 		return nil, fmt.Errorf("store: complete success: record attempt outcome: %w", err)
 	}
 
+	// Phase 7: if id is a workflow node's underlying job, this SUCCEEDED
+	// transition may satisfy dependents' dependency conditions -- see
+	// internal/store/workflow.go. A no-op for an ordinary standalone job.
+	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Succeeded); err != nil {
+		return nil, fmt.Errorf("store: complete success: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete success: commit: %w", err)
 	}
@@ -95,6 +102,13 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 
 	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeFailedPermanent, errClass, errMessage); err != nil {
 		return nil, fmt.Errorf("store: complete failure: record attempt outcome: %w", err)
+	}
+
+	// Phase 7: a permanently-failed workflow node's dependents are
+	// cancelled by default (docs/workflows.md's Failure Propagation
+	// table) -- a no-op for an ordinary standalone job.
+	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered); err != nil {
+		return nil, fmt.Errorf("store: complete failure: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

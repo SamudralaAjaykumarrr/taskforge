@@ -98,27 +98,76 @@ Append-only durable history of every claim → outcome cycle. See TF-INV-007.
   filled in once, by the same attempt's completion call (fenced by
   `lease_generation`, per TF-INV-003).
 
+## Table: `workflow_instances` (Phase 7)
+
+One row per workflow execution. Carries the workflow-level state, a
+**separate state space from `jobs.state`** — see
+[workflows.md](workflows.md).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PRIMARY KEY | |
+| `state` | `text` NOT NULL DEFAULT `'RUNNING'` | One of `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`. Enforced via `CHECK` constraint. |
+| `cancel_requested` | `boolean` NOT NULL DEFAULT `false` | Set by `POST /workflows/{id}/cancel`. Distinguishes an explicit workflow-level cancellation from a workflow that reaches `FAILED` organically via node failure propagation — both drive every affected node through job-level `CANCELLED`/`DEAD_LETTERED`, but only the former's workflow-level terminal state is `CANCELLED` rather than `FAILED`. |
+| `cancel_requested_at` | `timestamptz` NULL | Set when `cancel_requested` becomes true. |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `terminal_at` | `timestamptz` NULL | Set exactly once, on entry to any terminal workflow state (`SUCCEEDED`, `FAILED`, `CANCELLED`). Never updated again — every write to this table's `state` column is guarded by `WHERE state = 'RUNNING'`, so a terminal workflow state, once set, is never reopened. |
+
+### Constraints and Indexes on `workflow_instances`
+
+- `PRIMARY KEY (id)`
+- `CHECK (state IN ('RUNNING','SUCCEEDED','FAILED','CANCELLED'))`
+- `CREATE INDEX idx_workflow_instances_state ON workflow_instances (state);`
+
+## Table: `workflow_nodes` (Phase 7)
+
+One row per node in a workflow's DAG, referencing the `jobs` row it
+wraps. A workflow node's underlying job uses the ordinary `jobs` state
+machine completely unchanged — this table adds no new execution state of
+its own, only structure (which job belongs to which workflow, and its
+predecessor node IDs).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PRIMARY KEY | |
+| `workflow_instance_id` | `uuid` NOT NULL REFERENCES `workflow_instances(id)` | |
+| `node_key` | `text` NOT NULL | Caller-chosen identifier, unique within the workflow instance, used in `depends_on` submissions and API responses (the caller's own vocabulary, not raw internal UUIDs — see [workflows.md](workflows.md)). |
+| `job_id` | `uuid` NOT NULL REFERENCES `jobs(id)` | The underlying job this node executes. |
+| `depends_on` | `uuid[]` NOT NULL DEFAULT `'{}'` | Node IDs (this table's own `id` column, not `job_id`) that must satisfy their dependency condition (default: reach `SUCCEEDED`) before this node's job becomes eligible. See [workflows.md](workflows.md)'s "Why an Array Column Instead of an Edge Table" for why this is a `uuid[]` column rather than a join table. |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+
+### Constraints and Indexes on `workflow_nodes`
+
+- `PRIMARY KEY (id)`
+- `UNIQUE (workflow_instance_id, node_key)` — a `node_key` is only unique
+  within its own workflow instance, not globally.
+- `UNIQUE (job_id)` — a job row backs at most one workflow node; a job is
+  never shared between two logical workflow positions.
+- `CREATE INDEX idx_workflow_nodes_workflow_instance_id ON workflow_nodes (workflow_instance_id);`
+- `CREATE INDEX idx_workflow_nodes_depends_on ON workflow_nodes USING GIN (depends_on);`
+  — supports the reverse lookup "find every node that depends on node X"
+  (`depends_on @> ARRAY[$1]`), which runs once per terminal node-state
+  transition on any workflow-backed job.
+
+### Dependency-Gating Mechanism (no new `jobs` column)
+
+A workflow node's underlying `jobs` row needs **no schema change at all**
+to support dependency gating: a node with one or more dependencies is
+simply inserted with `jobs.eligible_at` set to a fixed, far-future
+sentinel timestamp (`9999-12-31T23:59:59Z` — a concrete, portable value,
+not PostgreSQL's special `infinity` timestamptz, which is not reliably
+representable as a Go `time.Time` through the pgx driver this codebase
+uses). The existing claim query (see
+[worker-protocol.md](worker-protocol.md)) already treats any row with
+`eligible_at > now()` as ineligible, so this requires zero changes to the
+claim query itself. When every dependency is satisfied, the same
+`eligible_at` column is advanced to `COALESCE(scheduled_at, now())` —
+identical to how an ordinary job's `eligible_at` is set at submission
+time. See [workflows.md](workflows.md)'s "Dependency Satisfaction
+Semantics" for the full propagation algorithm.
+
 ## Tables Deferred to Later Phases (documented now, not built yet)
-
-These are named here so the v1 schema's foreign keys and column choices
-don't foreclose them, but they are **not created in Phase 1**:
-
-### `workflow_instances` (Phase 7)
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | `uuid` PRIMARY KEY | |
-| `state` | `text` | `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED` at the workflow level — see [workflows.md](workflows.md). |
-| `created_at` / `terminal_at` | `timestamptz` | |
-
-### `workflow_nodes` (Phase 7)
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | `uuid` PRIMARY KEY | |
-| `workflow_instance_id` | `uuid` REFERENCES `workflow_instances(id)` | |
-| `job_id` | `uuid` REFERENCES `jobs(id)` | The underlying job this node executes. |
-| `depends_on` | `uuid[]` | Node IDs that must satisfy their dependency condition first. See [workflows.md](workflows.md) for why an edge table is deferred in favor of an array column for v1's DAG size expectations. |
 
 ### `job_events` (Phase 8, optional)
 
@@ -130,11 +179,12 @@ needs without a second history table.
 
 ## Why Not Over-Design v1
 
-`job_attempts` is the only history table in v1 beyond `jobs` itself.
-Workflow tables are deferred until Phase 7 because building them before the
-single-job engine is proven (leasing, fencing, retries, idempotency) would
-mean designing DAG semantics on top of an unvalidated foundation. See
-[roadmap.md](roadmap.md).
+`job_attempts`, `workflow_instances`, and `workflow_nodes` are the only
+history/structure tables beyond `jobs` itself. Workflow tables were
+deferred until Phase 7 (now implemented) specifically because building
+them before the single-job engine was proven (leasing, fencing, retries,
+idempotency) would have meant designing DAG semantics on top of an
+unvalidated foundation. See [roadmap.md](roadmap.md).
 
 ## Indexing Strategy Summary for Worker Polling
 

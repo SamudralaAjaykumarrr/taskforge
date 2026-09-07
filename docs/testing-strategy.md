@@ -311,6 +311,92 @@ implementation, satisfying [docs/roadmap.md](roadmap.md)'s Phase 6 quality
 gate ("Deterministic race test (SF-012) passes under both forced
 interleavings, repeatably").
 
+As of Phase 7 ("Workflow/DAG Execution", [roadmap.md](roadmap.md)), the
+following additional categories now have real, passing, executable tests,
+in `internal/workflow/workflow_test.go` (pure, no database),
+`internal/store/workflow_test.go`, and
+`internal/api/workflow_handlers_test.go`:
+
+- **DAG-structure validation tests** (pure, no database): every
+  rejection reason `internal/workflow.ValidateGraph` implements — empty
+  graph, missing/duplicate node key, missing job type, self-dependency,
+  unknown dependency, duplicate dependency within one node, a direct
+  two-node cycle, a longer three-node cycle, and a determinism check
+  (the same invalid graph reports the identical cycle across 20 repeated
+  calls) — plus acceptance tests for a linear chain, a diamond, a fan-out,
+  a lone root node, and disconnected components within one submission.
+- **Atomic-creation tests** (TF-INV-012, TF-INV-013-analogous):
+  `TestCreateWorkflow_AtomicCreation_InvalidGraphNeverPersisted` (an
+  invalid graph creates zero `workflow_instances` rows) and
+  `TestCreateWorkflow_RollbackLeavesNoPartialState` (a direct
+  fault-injection test forcing a mid-transaction constraint violation via
+  a duplicate `job_id` in `workflow_nodes`, asserting zero rows survive
+  in `workflow_instances`, `workflow_nodes`, and `jobs`).
+- **Root activation and fan-out/fan-in tests** (TF-INV-012, SF-019
+  through SF-022): `TestCreateWorkflow_LinearChain_RootEligibleDependentsBlocked`,
+  `TestFanOut_AllChildrenIndependentlyEligibleAfterParentSucceeds`,
+  `TestFanIn_ChildBlockedUntilAllPredecessorsSucceed`, and diamond
+  coverage via `TestWorkflowState_SucceedsWhenEveryNodeSucceeds`.
+- **Concurrency tests with real concurrent workers** (TF-INV-012,
+  TF-INV-002, SF-027): `TestConcurrentFanIn_BothPredecessorsCompleteSimultaneously`
+  (two goroutines racing to complete a shared fan-in dependency's two
+  predecessors, released from a `sync.WaitGroup` start barrier) and
+  `TestMultiWorker_FanOutClaimedSafelyUnderContention` (20 real workers
+  racing 8 simultaneously-eligible fan-out children).
+- **Retry/dead-letter/cancellation propagation tests** (TF-INV-012,
+  SF-023 through SF-025): `TestRetryingPredecessor_DoesNotUnblockDependent`,
+  `TestDeadLetteredPredecessor_CancelsDependentsTransitively`,
+  `TestDeadLetteredPredecessor_ExhaustionViaRetryPath_CancelsDependents`
+  (the same cascade via the OTHER dead-letter code path — retry-budget
+  exhaustion, not `CompleteFailure`), and
+  `TestCancelledPredecessor_CancelsDependents`.
+- **Stale-worker fencing tests extended to workflow propagation**
+  (TF-INV-003, TF-INV-014, SF-028):
+  `TestStaleGeneration_CannotUnblockDependents` and
+  `TestStaleGeneration_LateFailureCannotCancelDependents` — the canonical
+  SF-008 sequence, replayed against a workflow dependency edge, proving a
+  stale generation's rejected completion never reaches the point of
+  propagating anything to dependents.
+- **Workflow-level cancellation tests** (TF-INV-010, SF-026):
+  `TestCancelWorkflow_QueuedAndBlockedNodesCancelledImmediately`,
+  `TestCancelWorkflow_RunningNodeRequestedNotYetConfirmed`,
+  `TestCancelWorkflow_MixedNodeStates` (all five required node states in
+  one workflow), and `TestWorkflowState_TerminalCannotReopen`.
+- **Restart-durability test** (TF-INV-001, TF-INV-004, SF-029):
+  `TestRestart_WorkflowProgressSurvivesFreshStoreInstance`.
+- **Scheduling-interaction tests**: `TestSchedulingInteraction_ActivationRespectsFutureSchedule`
+  and `TestSchedulingInteraction_PastScheduleActivatesImmediately` — proving
+  dependency satisfaction and a node's own `scheduled_at` are independent
+  gates, neither bypassing the other.
+- **HTTP-boundary tests** (`internal/api/workflow_handlers_test.go`):
+  the full `POST /workflows` contract (diamond creation, empty-nodes
+  rejection, cycle/self-dependency/unknown-dependency/duplicate-key
+  rejection, missing-job-type rejection, malformed JSON), `GET
+  /workflows/{id}` (found, not-found, malformed-ID), `POST
+  /workflows/{id}/cancel` (found, not-found), a full submit-progress-
+  cascade round trip through the real HTTP boundary
+  (`TestCreateWorkflow_ProgressAndCascadeVisibleThroughAPI`), and a
+  backward-compatibility guard proving `POST /jobs`/`GET /jobs/{id}`
+  behave identically with the workflow feature present
+  (`TestOrdinaryJobEndpoints_UnaffectedByWorkflowFeature`).
+- **Schema tests** (`internal/migrate/migrate_test.go`):
+  `TestUp_CreatesWorkflowTablesWithExpectedConstraints` and
+  `TestUp_UpgradesPhase6SchemaToPhase7` (an existing Phase 1-6 database
+  upgrades cleanly to include the new tables, without touching existing
+  `jobs`/`job_attempts` data).
+
+Every concurrency-sensitive test above was run repeatedly under `-race`
+(`go test -race -p 1 -count=3 ./internal/store/... -run
+'ConcurrentFanIn|MultiWorker_FanOut|StaleGeneration'`) with zero failures
+and zero detected data races during this phase's development. The full
+pre-existing Phase 1-6 regression suite remains green, including under
+`-race`, with no test's assertions weakened — the only non-test-content
+change required outside `internal/workflow`, `internal/store/workflow.go`,
+and `internal/api/workflow_handlers.go` was
+`internal/testutil/postgres.go`'s per-test `TRUNCATE` statement, extended
+to include the two new workflow tables (which now also reference `jobs`
+via a foreign key, exactly as `job_attempts` already did).
+
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1
 and Phase 2 sections for exactly which invariants each phase is
@@ -357,7 +443,7 @@ scenario from [scenario-corpus.md](scenario-corpus.md).
 | TF-INV-009 | Integration tests | SF-010 |
 | TF-INV-010 | Race tests | SF-012 |
 | TF-INV-011 | Integration tests (clock-controlled) | SF-013 |
-| TF-INV-012 | DAG scenario tests (Phase 7) | (Phase 7 scenarios, TBD) |
+| TF-INV-012 | DAG scenario tests | SF-019 through SF-030 |
 | TF-INV-013 | Fault-injection tests | SF-014 |
 | TF-INV-014 | Stale-worker fencing tests (multi-generation) | SF-008 |
 | TF-INV-015 | Fencing tests (heartbeat-specific) | SF-016, SF-017 |

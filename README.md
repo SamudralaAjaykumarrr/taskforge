@@ -2,12 +2,13 @@
 
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
 Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, Phase 4 —
-Idempotency, Phase 5 — Concurrency Hardening, and Phase 6 — Scheduling,
-Cancellation, Timeouts — all complete; see "Proposed maturity label" under
-"Phase 6: What's Implemented" below for why this README does not yet
-promote to Stable despite [docs/roadmap.md](docs/roadmap.md) naming
-Hardening → Stable as Phase 6's on-completion label).**
-Phases 1 through 6 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+Idempotency, Phase 5 — Concurrency Hardening, Phase 6 — Scheduling,
+Cancellation, Timeouts, and Phase 7 — Workflow/DAG Execution — all
+complete; see "Proposed maturity label" under "Phase 7: What's
+Implemented" below for why this README labels workflow/DAG execution
+Experimental even though the underlying single-job engine it is built on
+has passing coverage for Hardening/Stable-level guarantees).**
+Phases 1 through 7 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication and optional
 `scheduled_at` future-execution requests), multiple concurrent worker
@@ -20,10 +21,14 @@ reachable), with real durable exponential backoff, retryable-vs-permanent
 failure classification, durable scheduled-execution eligibility, a
 `POST /jobs/{id}/cancel` endpoint with deterministic cancel-vs-completion
 race resolution, and a real execution-timeout ceiling distinct from lease
-duration — see "Phase 6: What's Implemented" below. It is **not**
-distributed beyond a single PostgreSQL instance, and does not implement
-workflow/DAG execution yet — see "Phase 1: What's Implemented" through
-"Phase 6: What's Implemented" below for the exact boundary. Everything else
+duration — see "Phase 6: What's Implemented" below — plus, as of Phase 7,
+durable workflow/DAG execution (`POST /workflows`, `GET /workflows/{id}`,
+`POST /workflows/{id}/cancel`) built entirely on top of that same
+single-job engine, with dependency-gated eligibility, fan-out/fan-in,
+failure/cancellation propagation, and workflow-level cancellation — see
+"Phase 7: What's Implemented" below. It is **not** distributed beyond a
+single PostgreSQL instance — see "Phase 1: What's Implemented" through
+"Phase 7: What's Implemented" below for the exact boundary. Everything else
 described in this README past those sections remains a design target for
 later phases, not a demonstrated capability. TaskForge guarantees
 **at-least-once** execution, never exactly-once for arbitrary external side
@@ -43,7 +48,13 @@ foundation — TaskForge can **request** cooperative cancellation of a
 running job and can **detect** that an attempt exceeded its configured
 execution timeout, but it cannot physically terminate arbitrary handler
 code that ignores `ctx.Done()`; see "Phase 6: What's Implemented" below for
-exactly what is and is not guaranteed.
+exactly what is and is not guaranteed. Phase 7 introduces no new execution
+engine, lease mechanism, or claiming path at all — a workflow node's
+underlying job is an ordinary job row, reusing every guarantee above
+unchanged; see "Phase 7: What's Implemented" below for the dependency-gating
+mechanism and its own explicit limitations (no OR/any-of fan-in, no
+compensation/rollback edges, no dynamic workflow modification, no
+workflow-submission idempotency contract).
 
 ## The Problem
 
@@ -119,30 +130,31 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
   real concurrent duplicate submissions, sequential retries, and simulated
   process restarts; see "Phase 4: What's Implemented" below.
 - Deterministic cancellation-vs-completion race semantics (TF-INV-010).
+  **Proven (Phase 6).**
 - Scheduling that survives full process/fleet restarts (TF-INV-011).
-- (Later phase) dependency-gated workflow/DAG execution (TF-INV-012).
-
-The two bullets above with no "Proven" annotation are not implemented yet.
-They are documented now, precisely, so that implementation has an
-unambiguous contract to satisfy and external reviewers have something
-falsifiable to check it against.
+  **Proven (Phase 6).**
+- Dependency-gated workflow/DAG execution (TF-INV-012). **Proven (Phase
+  7)** — fan-out, fan-in (including concurrent completion), retry/
+  dead-letter/cancellation propagation, workflow-level cancellation, and
+  restart durability are all tested against real PostgreSQL; see "Phase
+  7: What's Implemented" below.
 
 ## Project Status
 
 | Area | Status |
 |---|---|
 | Architecture & invariant documentation | **Done** (this repository, current state) |
-| PostgreSQL schema | **Phase 2 done, still sufficient through Phase 6** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`scheduled_at`/`cancel_requested`/`cancel_requested_at`/`terminal_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`/`TIMED_OUT`/`CANCELLED`. Phase 3, Phase 4, and Phase 6 all required **no new migration** — see "Phase 3/4/6: What's Implemented" below) |
-| API server | **Phase 1 done, extended in Phase 6** (`POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status — Phase 6 added `scheduled_at` request/response support and the cancel endpoint) |
-| Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5, extended in Phase 6**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism), cooperative cancellation observation, and a fixed per-attempt execution-timeout ceiling distinct from lease renewal — see "Phase 2", "Phase 5", and "Phase 6: What's Implemented" below |
+| PostgreSQL schema | **Phase 2 done, still sufficient through Phase 6; extended in Phase 7** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`scheduled_at`/`cancel_requested`/`cancel_requested_at`/`terminal_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`/`TIMED_OUT`/`CANCELLED`. Phase 3, Phase 4, and Phase 6 all required **no new migration**. Phase 7 adds migration `0003_create_workflow_tables` — `workflow_instances`/`workflow_nodes` — with **no changes to the `jobs` table itself**: dependency gating reuses the existing `eligible_at` column with a far-future sentinel value — see "Phase 7: What's Implemented" below) |
+| API server | **Phase 1 done, extended in Phase 6 and Phase 7** (`POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status — Phase 6 added `scheduled_at` request/response support and the cancel endpoint. Phase 7 adds `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel` with no change to any existing job endpoint) |
+| Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5, extended in Phase 6, unchanged (by design) in Phase 7**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism), cooperative cancellation observation, and a fixed per-attempt execution-timeout ceiling distinct from lease renewal — see "Phase 2", "Phase 5", and "Phase 6: What's Implemented" below. Phase 7 introduces no new claiming mechanism: a workflow node's job is claimed by the exact same, byte-for-byte unmodified claim query |
 | Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
 | Idempotency enforcement | **Phase 4 done**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below |
 | Concurrency hardening | **Phase 5 done**: tens-of-workers/hundreds-of-jobs claim/reclaim/fencing/retry stress suites against real PostgreSQL, a connection-pool-constrained claim test, and a repeated-seed randomized crash/retry/success simulation — no new product code required, since Phase 1–4's short-transaction, fenced-lease design already satisfied every property tested; see "Phase 5: What's Implemented" below |
 | Scheduling | **Phase 6 done**: `scheduled_at`/`eligible_at` future-execution semantics, PostgreSQL-authoritative eligibility (no in-memory scheduler), survives full process/fleet restart — see "Phase 6: What's Implemented" below |
 | Cancellation / timeouts | **Phase 6 done**: `POST /jobs/{id}/cancel`, deterministic cancel-vs-completion race resolution (TF-INV-010), a real `execution_timeout` ceiling distinct from lease TTL, cooperative cancellation observation via heartbeat — see "Phase 6: What's Implemented" below for the explicit, documented limits (cooperative only, no forced termination of uncooperative handler code) |
-| Workflow / DAG execution | Not started (staged for a later phase) |
+| Workflow / DAG execution | **Phase 7 done**: `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel`; dependency-gated eligibility, fan-out, fan-in (including concurrent completion), retry/dead-letter/cancellation propagation, workflow-level cancellation, atomic workflow creation — see "Phase 7: What's Implemented" below |
 | Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, new/duplicate idempotent submission, cancellation observed/acknowledged, and execution timeout are all logged — see "Phase 2", "Phase 3", "Phase 4", and "Phase 6: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 6 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5) and scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6); sustained multi-hour chaos/load testing remains Phase 9 |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 7 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), and DAG scenario coverage SF-019 through SF-030 (Phase 7); sustained multi-hour chaos/load testing remains Phase 9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -1681,6 +1693,285 @@ consistent with how every prior phase was handled; promotion to Stable is
 a mechanical follow-up once CI has run this suite repeatedly post-merge,
 not a judgment call made preemptively here.
 
+## Phase 7: What's Implemented
+
+**Status: Experimental** — workflows are new surface area built on top of
+the single-job engine's guarantees; per
+[docs/roadmap.md](docs/roadmap.md)'s explicit Phase 7 maturity label,
+this does not automatically inherit Stable from the underlying engine,
+regardless of how thoroughly this phase's own tests pass.
+
+Phase 7 ([docs/roadmap.md](docs/roadmap.md) "Workflow/DAG Execution")
+implements [docs/workflows.md](docs/workflows.md) in full: durable
+workflow definitions, dependency-gated node eligibility, fan-out, fan-in
+(including under concurrent completion), failure/cancellation
+propagation, and workflow-level cancellation — all built entirely on top
+of Phases 1-6's job engine, introducing no second execution engine, no
+new claiming mechanism, and no new lease/retry/cancellation primitive.
+
+### Implemented now
+
+- **`workflow_instances` / `workflow_nodes` tables** (migration
+  `0003_create_workflow_tables`, `internal/store/workflow.go`): per
+  [docs/data-model.md](docs/data-model.md)'s now-promoted Phase 7 schema
+  entries. `depends_on` is a `uuid[]` column (not an edge table), per
+  [docs/workflows.md](docs/workflows.md)'s explicit v1-of-workflows
+  sizing rationale. **No column was added to the existing `jobs` table.**
+- **Dependency-gating mechanism, requiring zero changes to the existing
+  claim query**: a node with one or more dependencies is inserted with
+  its underlying job's `eligible_at` set to a fixed far-future sentinel
+  timestamp (`internal/store/workflow.go`'s `blockedEligibleAt`,
+  `9999-12-31T23:59:59Z` — a concrete value, not PostgreSQL's `infinity`
+  timestamptz, which pgx cannot reliably round-trip through a Go
+  `time.Time`). A root node (no dependencies) is inserted immediately
+  eligible, exactly like an ordinary job.
+- **In-transaction dependency propagation**
+  (`internal/store/workflow.go`'s `propagateWorkflowTransition`,
+  `resolveDependent`, `dependentsOf`, `finalizeWorkflowIfComplete`),
+  invoked from inside the SAME transaction as every existing job
+  transition that can land on a terminal state:
+  `Store.CompleteSuccess`, `Store.CompleteFailure`,
+  `Store.completeRetryableOutcome`'s exhaustion branch (shared by
+  `CompleteRetryableFailure` and `CompleteTimeout`),
+  `Store.CompleteCancelled`, `Store.CancelQueuedOrRetryWait`, and the
+  Lazy Dead-Letter Sweep inside `Store.Claim`. A predecessor reaching
+  `SUCCEEDED` re-evaluates its direct dependents and activates any whose
+  every dependency is now satisfied (fan-in AND semantics); a predecessor
+  reaching `DEAD_LETTERED` or `CANCELLED` cascades `CANCELLED` to every
+  dependent transitively, in the same transaction, via a breadth-first
+  work queue — no separate polling sweep exists or is needed.
+- **Concurrent fan-in correctness**: `resolveDependent` takes a row lock
+  (`SELECT ... FOR UPDATE`) on the dependent's own job before
+  re-evaluating its predecessors, so two predecessors of the same fan-in
+  node completing at the same instant serialize on that lock —
+  whichever transaction acquires it second is guaranteed to see the
+  other's already-committed result, avoiding the lost-update failure
+  mode where both transactions conclude "not ready yet" and neither
+  activates the dependent.
+- **Atomic workflow creation** (`Store.CreateWorkflow`): validates the
+  submitted graph in memory (`internal/workflow.ValidateGraph` — empty
+  graph, missing/duplicate node key, missing job type, self-dependency,
+  unknown dependency, duplicate dependency, cycle, all via a
+  deterministic three-color depth-first search) **before opening any
+  transaction**, then creates the `workflow_instances` row, every node's
+  underlying `jobs` row, and every `workflow_nodes` row inside one
+  PostgreSQL transaction — a caller never observes a partially-created
+  workflow.
+- **Workflow-level cancellation** (`Store.CancelWorkflow`): records
+  `workflow_instances.cancel_requested = true` (idempotent, no-op if
+  already terminal), then cancels every non-terminal node's underlying
+  job via the exact same per-job primitives `POST /jobs/{id}/cancel`
+  uses (`CancelQueuedOrRetryWait` for `QUEUED`/`RETRY_WAIT` — which
+  includes a dependency-blocked node — `RequestCancellation` for
+  `RUNNING`) — not a new workflow-wide cancellation primitive.
+  `cancel_requested` is what lets the eventual workflow-level terminal
+  state be `CANCELLED` rather than `FAILED`, distinguishing an explicit
+  cancellation from a workflow that fails organically via propagation.
+- **Workflow-level state derivation** (`finalizeWorkflowIfComplete`):
+  once every node's job has reached a terminal state, the workflow
+  transitions to `SUCCEEDED` (all nodes `SUCCEEDED`), `CANCELLED`
+  (`cancel_requested` was set), or `FAILED` (otherwise — at least one
+  node `DEAD_LETTERED` or cascade-`CANCELLED`) — guarded by
+  `WHERE state = 'RUNNING'`, so a workflow's terminal state, once set,
+  is never reopened.
+- **HTTP API** (`internal/api/workflow_handlers.go`): `POST /workflows`
+  (atomic creation, 400 on any graph-validation failure before any
+  database write), `GET /workflows/{id}` (current workflow + every
+  node's live job state, freshly joined), `POST /workflows/{id}/cancel`.
+  No existing job endpoint's contract changed — a workflow node's
+  underlying job remains fully visible and manageable through
+  `GET /jobs/{id}` / `POST /jobs/{id}/cancel` directly, since it is an
+  ordinary job row.
+- Structured logs for workflow creation (`internal/api`), reusing the
+  existing per-job logging Phases 2-6 already added for every job
+  transition a workflow node goes through (claim, retry, cancellation,
+  dead-letter) — no new logging surface was needed for node-level
+  events.
+
+### Not implemented yet
+
+- **OR/any-of fan-in semantics** — explicit Phase 7 non-goal per
+  [docs/roadmap.md](docs/roadmap.md) and
+  [docs/workflows.md](docs/workflows.md)'s Open Questions; v1-of-workflows
+  is AND-only.
+- **Compensation/rollback edges** (run node B only if node A fails) —
+  explicit non-goal; not designed.
+- **Dynamic workflow modification** (adding nodes to an already-created,
+  running workflow instance) — explicit non-goal;
+  `Store.CreateWorkflow` provides no such mechanism, and the full DAG
+  must be known at submission time.
+- **Workflow-submission idempotency** (an `Idempotency-Key` equivalent
+  for `POST /workflows`) — [docs/workflows.md](docs/workflows.md) never
+  established such a contract, and Phase 7 deliberately does not invent
+  one; retrying a `POST /workflows` call creates a new workflow.
+- **A `GET /workflows/{id}/history` or per-node attempt-history
+  endpoint** — a workflow node's `job_attempts` history remains
+  queryable exactly like any other job's (directly against the
+  database, per [docs/worker-protocol.md](docs/worker-protocol.md)'s
+  still-deferred `GET /jobs/{id}/history`), just not surfaced inline in
+  the workflow response beyond `attempt_count`/`last_error`/
+  `last_error_class`.
+- **Priority or resource-aware node scheduling** — a workflow node has
+  no scheduling behavior beyond what an ordinary job already has
+  (`scheduled_at`, `max_attempts`, `execution_timeout_seconds`); there is
+  no workflow-aware prioritization of one workflow's nodes over
+  another's.
+- Full metrics/tracing observability (Phase 8), sustained chaos/load
+  testing (Phase 9) — unchanged deferrals from every prior phase's
+  section above.
+
+### How to demonstrate a diamond workflow
+
+```sh
+docker compose up -d
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &
+go run ./cmd/worker &
+
+# A -> B, A -> C, B+C -> D
+curl -X POST localhost:8080/workflows -d '{
+  "nodes": [
+    {"node_key": "A", "job_type": "demo.echo", "payload": {}},
+    {"node_key": "B", "job_type": "demo.echo", "payload": {}, "depends_on": ["A"]},
+    {"node_key": "C", "job_type": "demo.echo", "payload": {}, "depends_on": ["A"]},
+    {"node_key": "D", "job_type": "demo.echo", "payload": {}, "depends_on": ["B", "C"]}
+  ]
+}'
+
+# Poll -- A is claimed and succeeds first; B and C then become
+# independently claimable; D remains QUEUED-but-not-eligible until BOTH
+# B and C have succeeded.
+curl localhost:8080/workflows/<id-from-above>
+```
+
+### How to demonstrate failure propagation
+
+```sh
+# max_attempts:1 so the first failure exhausts immediately and
+# dead-letters A -- B, which depends on it, cascades to CANCELLED
+# without ever being claimed.
+curl -X POST localhost:8080/workflows -d '{
+  "nodes": [
+    {"node_key": "A", "job_type": "demo.flaky", "payload": {}, "max_attempts": 1},
+    {"node_key": "B", "job_type": "demo.echo", "payload": {}, "depends_on": ["A"]}
+  ]
+}'
+curl localhost:8080/workflows/<id-from-above>   # A: DEAD_LETTERED, B: CANCELLED, workflow: FAILED
+```
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+
+# The new Phase 7 tests specifically, verbose:
+go test -v ./internal/workflow/...
+go test -p 1 -v ./internal/store/... -run 'Workflow|FanOut|FanIn|Diamond|ConcurrentFanIn|StaleGeneration|Restart_WorkflowProgress|Scheduling|MultiWorker_FanOut|RetryingPredecessor|Dead[Ll]ettered|Cancelled[Pp]redecessor'
+go test -p 1 -v ./internal/api/... -run 'Workflow'
+
+# Repeated, race-detected runs of the concurrency-sensitive new tests:
+go test -race -p 1 -count=3 ./internal/store/... -run 'ConcurrentFanIn|MultiWorker_FanOut|StaleGeneration'
+```
+
+Same PostgreSQL requirement and `-p 1` constraint as every prior phase.
+`internal/testutil/postgres.go`'s per-test `TRUNCATE` statement was
+extended to include the two new workflow tables (both now reference
+`jobs`, directly or transitively, via a foreign key) — no other change to
+the shared test harness was needed.
+
+### Phase 7 guarantees
+
+- **TF-INV-012** (dependency-gated workflow tasks wait for predecessors):
+  proven by SF-019 through SF-022 (linear chain, fan-out, fan-in, diamond)
+  and, under real concurrency, SF-027
+  (`TestConcurrentFanIn_BothPredecessorsCompleteSimultaneously` — two
+  real goroutines racing to complete a shared fan-in dependency's two
+  predecessors, released from a `sync.WaitGroup` start barrier, never a
+  sleep-based approximation).
+- **Failure/cancellation propagation correctness** (SF-023 through
+  SF-025): a retrying predecessor never unblocks a dependent
+  (`TestRetryingPredecessor_DoesNotUnblockDependent`); a dead-lettered
+  predecessor cascades `CANCELLED` transitively through a chain of
+  dependents regardless of which of the two dead-letter code paths
+  produced it
+  (`TestDeadLetteredPredecessor_CancelsDependentsTransitively`,
+  `TestDeadLetteredPredecessor_ExhaustionViaRetryPath_CancelsDependents`);
+  a directly-cancelled predecessor cascades identically
+  (`TestCancelledPredecessor_CancelsDependents`).
+- **TF-INV-003 / TF-INV-014, extended to workflow propagation** (SF-028):
+  `TestStaleGeneration_CannotUnblockDependents` and
+  `TestStaleGeneration_LateFailureCannotCancelDependents` prove a stale
+  generation's completion call is rejected outright — it never reaches
+  the point of propagating anything to dependents, in either the success
+  or the failure direction — replaying SF-008's canonical two-generation
+  sequence against a real dependency edge.
+- **Workflow-level cancellation** (TF-INV-010, SF-026):
+  `TestCancelWorkflow_MixedNodeStates` proves this task's exact required
+  case list in one workflow — an unstarted/dependency-blocked node, a
+  not-yet-eligible scheduled node, a `RETRY_WAIT` node, a `RUNNING` node,
+  and an already-`SUCCEEDED` node — resolve correctly and independently
+  under one `POST /workflows/{id}/cancel` call.
+- **Workflow terminal state cannot reopen**:
+  `TestWorkflowState_TerminalCannotReopen` proves cancelling an
+  already-`SUCCEEDED` workflow is a no-op — its `state` and `terminal_at`
+  are byte-for-byte unchanged afterward.
+- **Atomic workflow creation** (TF-INV-013-analogous):
+  `TestCreateWorkflow_RollbackLeavesNoPartialState` forces a
+  mid-transaction constraint violation (a duplicate `job_id` across two
+  `workflow_nodes` rows) and proves zero rows survive in
+  `workflow_instances`, `workflow_nodes`, or `jobs`;
+  `TestCreateWorkflow_AtomicCreation_InvalidGraphNeverPersisted` proves a
+  structurally invalid graph never creates a `workflow_instances` row at
+  all.
+- **Restart durability** (TF-INV-001, TF-INV-004, SF-029):
+  `TestRestart_WorkflowProgressSurvivesFreshStoreInstance` — a fresh
+  `*store.Store` sharing only the database correctly claims a
+  newly-eligible dependent with no in-memory workflow-coordinator state
+  anywhere to lose.
+- **Multi-worker fan-out safety**:
+  `TestMultiWorker_FanOutClaimedSafelyUnderContention` — 20 real workers
+  racing 8 simultaneously-eligible fan-out children; every child claimed
+  exactly once.
+- **Scheduling/dependency independence**: dependency satisfaction never
+  bypasses a node's own `scheduled_at`, and vice versa
+  (`TestSchedulingInteraction_ActivationRespectsFutureSchedule`,
+  `TestSchedulingInteraction_PastScheduleActivatesImmediately`).
+- The full pre-existing Phase 1-6 regression suite remains green,
+  including under `-race`, with no test's assertions weakened.
+
+### Phase 7 limitations (explicit, not hidden)
+
+- **AND-only fan-in; no OR/any-of semantics, no compensation/rollback
+  edges, no dynamic workflow modification, no workflow-submission
+  idempotency contract** — see "Not implemented yet" above; all four are
+  explicit [docs/workflows.md](docs/workflows.md) non-goals, not
+  oversights.
+- **No workflow-aware scheduling priority** — a workflow's nodes compete
+  for worker capacity exactly like any other job, with no
+  workflow-level fairness or priority mechanism.
+- **Every limitation of the underlying job engine still applies to
+  workflow nodes** — at-least-once execution (a workflow node's handler
+  may still run twice after a crash-and-reclaim, exactly like a
+  standalone job), cooperative-only cancellation and execution-timeout
+  enforcement (Phase 6's limitations), and no production-readiness claim
+  of any kind.
+- **No production readiness claim of any kind.**
+
+### Proposed maturity label
+
+[docs/roadmap.md](docs/roadmap.md) sets Phase 7's maturity as
+**Experimental** on completion, explicitly not inheriting Stable from the
+underlying engine ("workflows are new surface area; do not inherit Stable
+... automatically"). TF-INV-012 has passing test coverage today
+(SF-019 through SF-030, plus this task's full adversarial-audit list),
+including under `-race` with repeated runs and zero flakes during this
+phase's implementation — but per every prior phase's own section above,
+promotion beyond Experimental requires surviving repeated CI runs of this
+project's actual pipeline post-merge, which has not yet happened for this
+code. This README keeps Phase 7, and the overall project status, at
+**Experimental**, consistent with every prior phase.
+
 ## Documentation Map
 
 | Document | Contents |
@@ -1698,7 +1989,7 @@ not a judgment call made preemptively here.
 | [docs/workflows.md](docs/workflows.md) | DAG execution design (staged for a later phase) |
 | [docs/observability.md](docs/observability.md) | Metrics, structured logs, trace boundaries |
 | [docs/testing-strategy.md](docs/testing-strategy.md) | Test categories and the invariant-to-test matrix |
-| [docs/scenario-corpus.md](docs/scenario-corpus.md) | 18 named, deterministic test scenarios (SF-001 through SF-018) |
+| [docs/scenario-corpus.md](docs/scenario-corpus.md) | 30 named, deterministic test scenarios (SF-001 through SF-030) |
 | [docs/roadmap.md](docs/roadmap.md) | Phased implementation plan with entry/exit criteria per phase |
 | [docs/adr/](docs/adr/README.md) | Architecture decision records — the real tradeoffs behind the design |
 

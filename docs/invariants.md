@@ -342,15 +342,21 @@ dependency at all.
 ignoring that it depends on Node A, and races with A's execution.
 
 **Implementation mechanism**: A workflow node's underlying job is inserted
-with `state = QUEUED` but is only made *eligible* (`eligible_at` set to a
-real timestamp, or an equivalent gating column) once a predecessor
-completion trigger evaluates all required predecessors as satisfied. See
-[workflows.md](workflows.md). This invariant is not enforceable in v1
-because workflows do not exist until Phase 7; it is recorded now so the
-Phase 7 design is bound by it from the start.
+with `state = QUEUED`, and is only made *eligible* by advancing
+`eligible_at` off a fixed far-future sentinel value once a
+predecessor-completion propagation step (running inside the SAME
+transaction as the predecessor's own completion/cancellation/dead-letter
+transition) evaluates all required predecessors as satisfied. See
+[workflows.md](workflows.md) for the exact mechanism as implemented,
+including the concurrent-fan-in row-locking argument. Enforced starting
+Phase 7.
 
-**Test strategy**: (Phase 7) DAG scenario tests for fan-out/fan-in,
-including failed/cancelled predecessor propagation.
+**Test strategy**: DAG scenario tests for fan-out/fan-in (including
+concurrent completion), retrying/failed/cancelled predecessor
+propagation, stale-generation fencing extended to workflow propagation,
+workflow-level cancellation, and restart durability — see
+[scenario-corpus.md](scenario-corpus.md) SF-019 through SF-030 and
+[testing-strategy.md](testing-strategy.md)'s Phase 7 section.
 
 ---
 
@@ -478,7 +484,7 @@ concurrency test for TF-INV-008 doubles as a regression test for this.
 | TF-INV-009 | Dead-lettering preserves failure history | No |
 | TF-INV-010 | Cancellation race is deterministic | Yes |
 | TF-INV-011 | Scheduled jobs don't run early | No |
-| TF-INV-012 | Workflow deps gate execution | No (Phase 7+) |
+| TF-INV-012 | Workflow deps gate execution | No |
 | TF-INV-013 | Rollback never half-transitions | Yes |
 | TF-INV-014 | Stale generations always fenced | No |
 | TF-INV-015 | Heartbeats only extend, never transfer | No |

@@ -253,6 +253,102 @@ full list with descriptions, and [README.md](../README.md)'s "Phase 6:
 What's Implemented" for how these map to invariants and what quality gate
 they satisfy.
 
+The following scenarios are new as of Phase 7 ("Workflow/DAG Execution",
+[roadmap.md](roadmap.md)) — SF-019 through SF-030, defined in full below.
+Per that phase's roadmap entry ("New DAG-specific scenarios ... to be
+added to scenario-corpus.md at the start of this phase"), these did not
+exist before Phase 7 began; they are now all executable, in
+`internal/workflow/workflow_test.go` (pure DAG-validation scenarios, no
+database) and `internal/store/workflow_test.go` /
+`internal/api/workflow_handlers_test.go` (durable/HTTP-boundary
+scenarios, real PostgreSQL):
+
+- **SF-019** (Linear DAG executes in dependency order) —
+  `TestCreateWorkflow_LinearChain_RootEligibleDependentsBlocked`
+  (`internal/store/workflow_test.go`).
+- **SF-020** (Fan-out: one predecessor, multiple independent dependents) —
+  `TestFanOut_AllChildrenIndependentlyEligibleAfterParentSucceeds`.
+- **SF-021** (Fan-in: one dependent, multiple required predecessors) —
+  `TestFanIn_ChildBlockedUntilAllPredecessorsSucceed`.
+- **SF-022** (Diamond dependency: A→B, A→C, B+C→D) — exercised throughout
+  `internal/store/workflow_test.go` via `diamondSpec()`, most directly by
+  `TestWorkflowState_SucceedsWhenEveryNodeSucceeds` (this task's named
+  quality gate: "a diamond-dependency workflow ... executes nodes in
+  correct order under concurrent workers, with a failed parent correctly
+  cancelling dependents" — the failed-parent half is SF-024/SF-025 below,
+  proved against the same diamond shape by
+  `TestDeadLetteredPredecessor_CancelsDependentsTransitively`) and, at the
+  HTTP boundary, `TestCreateWorkflow_DiamondDAG_AllNodesPersistedAtomically`
+  (`internal/api/workflow_handlers_test.go`).
+- **SF-023** (Retrying predecessor does not unblock a dependent) —
+  `TestRetryingPredecessor_DoesNotUnblockDependent`.
+- **SF-024** (Dead-lettered predecessor cancels dependents, transitively)
+  — `TestDeadLetteredPredecessor_CancelsDependentsTransitively` (via
+  `CompleteFailure`) and `TestDeadLetteredPredecessor_ExhaustionViaRetryPath_CancelsDependents`
+  (via retry-budget exhaustion, i.e. `completeRetryableOutcome`'s
+  dead-letter branch — the same cascade must fire regardless of which of
+  the two dead-letter paths produced it).
+- **SF-025** (Cancelled predecessor cancels dependents) —
+  `TestCancelledPredecessor_CancelsDependents`.
+- **SF-026** (Workflow-level cancellation across mixed node states) —
+  `TestCancelWorkflow_QueuedAndBlockedNodesCancelledImmediately`,
+  `TestCancelWorkflow_RunningNodeRequestedNotYetConfirmed`, and
+  `TestCancelWorkflow_MixedNodeStates` (this task's exact required case
+  list in one workflow: an unstarted/dependency-blocked node, a
+  not-yet-eligible scheduled node, a `RETRY_WAIT` node, a `RUNNING` node,
+  and an already-`SUCCEEDED` node), plus the HTTP-boundary
+  `TestCancelWorkflow_QueuedNodesCancelledThroughAPI`
+  (`internal/api/workflow_handlers_test.go`).
+- **SF-027** (Concurrent dependency completion: two predecessors of the
+  same fan-in node complete at the same instant) —
+  `TestConcurrentFanIn_BothPredecessorsCompleteSimultaneously` (two real
+  goroutines, real pooled PostgreSQL connections, released from a
+  `sync.WaitGroup` start barrier so both `CompleteSuccess` calls race
+  directly — never a sleep-based approximation of concurrency).
+- **SF-028** (Stale generation cannot unblock or cancel dependents) —
+  `TestStaleGeneration_CannotUnblockDependents` (the canonical "Worker A
+  loses its lease, Worker B reclaims and succeeds, Worker A's stale
+  success report arrives late" sequence, replayed against a workflow
+  dependency edge) and its mirror,
+  `TestStaleGeneration_LateFailureCannotCancelDependents` (a stale,
+  late failure report must not cascade-cancel dependents either).
+- **SF-029** (Workflow progress survives a full restart) —
+  `TestRestart_WorkflowProgressSurvivesFreshStoreInstance` (a fresh
+  `*store.Store` sharing only the database — standing in for a full
+  process/fleet restart, per SF-018's shape — correctly sees a
+  predecessor's earlier completion and claims its now-eligible
+  dependents, with no in-memory workflow-coordinator state anywhere to
+  lose).
+- **SF-030** (Invalid graph is rejected atomically, before any durable
+  state exists) — the DAG-validation scenarios in
+  `internal/workflow/workflow_test.go` (empty graph, missing/duplicate
+  node key, missing job type, self-dependency, unknown dependency,
+  duplicate dependency, direct and transitive cycles, deterministic cycle
+  reporting) plus `TestCreateWorkflow_AtomicCreation_InvalidGraphNeverPersisted`
+  and `TestCreateWorkflow_RollbackLeavesNoPartialState`
+  (`internal/store/workflow_test.go`, the latter a direct fault-injection
+  test forcing a mid-transaction constraint violation and asserting zero
+  rows survive in any of `workflow_instances`/`workflow_nodes`/`jobs`),
+  and the HTTP-boundary rejection tests in
+  `internal/api/workflow_handlers_test.go`.
+
+Phase 7 also adds coverage beyond these twelve named scenarios, against
+this task's own adversarial-audit list:
+`TestSchedulingInteraction_ActivationRespectsFutureSchedule` /
+`TestSchedulingInteraction_PastScheduleActivatesImmediately` (dependency
+satisfaction never bypasses a node's own `scheduled_at`, and vice versa),
+`TestMultiWorker_FanOutClaimedSafelyUnderContention` (20 real workers
+racing 8 simultaneously-eligible fan-out children — no child claimed
+twice), `TestWorkflowState_TerminalCannotReopen` (cancelling an
+already-`SUCCEEDED` workflow is a no-op; its `terminal_at` never changes),
+and `TestGetWorkflow_DependsOnResolvedToNodeKeys` /
+`TestGetWorkflow_NotFound` / `TestCancelWorkflow_NotFound`.
+
+See [testing-strategy.md](testing-strategy.md)'s Phase 7 section for the
+full list with descriptions, and [README.md](../README.md)'s "Phase 7:
+What's Implemented" for how these map to invariants and what quality gate
+they satisfy.
+
 ---
 
 ### SF-001 — Normal success
@@ -481,6 +577,184 @@ they satisfy.
   in-place — a new claim, new generation, and a fresh attempt is the only
   path back to progress). No job is lost or double-counted.
 - **Invariants proved**: TF-INV-001, TF-INV-004.
+
+### SF-019 — Linear DAG executes in dependency order
+
+- **Initial state**: A workflow `A -> B -> C` is submitted; no node has
+  been claimed.
+- **Actions**: A worker claims and succeeds A, then B, then C, in order.
+- **Fault**: None.
+- **Expected durable state**: A is claimable immediately; B and C are
+  durably `QUEUED` but not claimable (`eligible_at` far in the future)
+  until their sole predecessor succeeds, at which point each becomes
+  claimable exactly once. Final workflow state `SUCCEEDED`.
+- **Invariants proved**: TF-INV-012.
+
+### SF-020 — Fan-out: one predecessor, multiple independent dependents
+
+- **Initial state**: A workflow `A -> B`, `A -> C` is submitted.
+- **Actions**: A worker succeeds A.
+- **Fault**: None.
+- **Expected durable state**: B and C both become independently claimable
+  the instant A succeeds — no ordering dependency between them, and
+  neither's job row is duplicated (exactly one `jobs` row per node, per
+  `workflow_nodes_job_unique`).
+- **Invariants proved**: TF-INV-012.
+
+### SF-021 — Fan-in: one dependent, multiple required predecessors
+
+- **Initial state**: A workflow `A -> C`, `B -> C` is submitted; A and B
+  are independent roots.
+- **Actions**: A worker succeeds A only.
+- **Fault**: None.
+- **Expected durable state**: C remains durably not claimable (AND
+  fan-in semantics: `SUCCEEDED` from only one of two required
+  predecessors does not satisfy the dependency condition). Once B also
+  succeeds, C becomes claimable.
+- **Invariants proved**: TF-INV-012.
+
+### SF-022 — Diamond dependency (A→B, A→C, B+C→D)
+
+- **Initial state**: A workflow `A -> B`, `A -> C`, `B -> D`, `C -> D` is
+  submitted (this task's named quality-gate shape).
+- **Actions**: A worker drives all four nodes to `SUCCEEDED` in dependency
+  order (A; then B and C, in either order or concurrently; then D).
+- **Fault**: None.
+- **Expected durable state**: D never becomes claimable until both B and
+  C have succeeded; the workflow reaches `SUCCEEDED` once all four nodes
+  have.
+- **Invariants proved**: TF-INV-012.
+
+### SF-023 — Retrying predecessor does not unblock a dependent
+
+- **Initial state**: A workflow `A -> B` is submitted, `A.max_attempts >
+  1`.
+- **Actions**: A's first attempt reports a retryable failure (→
+  `RETRY_WAIT`). A's second attempt succeeds.
+- **Fault**: Simulated transient handler failure on A's first attempt.
+- **Expected durable state**: B remains durably not claimable while A is
+  `RETRY_WAIT` — a retrying predecessor is explicitly not treated as
+  failed (docs/workflows.md's Failure Propagation table) and does not
+  satisfy or violate the dependency condition. B becomes claimable only
+  once A's retry actually reaches `SUCCEEDED`.
+- **Invariants proved**: TF-INV-012, TF-INV-006 (A's own retry budget is
+  unaffected by being part of a workflow).
+
+### SF-024 — Dead-lettered predecessor cancels dependents, transitively
+
+- **Initial state**: A workflow `A -> B -> C` is submitted, `A.max_attempts
+  = 1`.
+- **Actions**: A's only attempt reports a permanent failure (or exhausts
+  its retry budget — both paths must produce this outcome identically).
+- **Fault**: Simulated permanent handler failure, or retry-budget
+  exhaustion.
+- **Expected durable state**: A reaches `DEAD_LETTERED`. B, whose only
+  predecessor just dead-lettered, is cancelled (`CANCELLED`) as a direct
+  consequence, without ever being claimed. C, whose only predecessor (B)
+  was just cancelled, is transitively cancelled in the same cascade,
+  also without ever being claimed. The workflow reaches `FAILED`.
+- **Invariants proved**: TF-INV-012, TF-INV-006, TF-INV-009 (A's own
+  dead-letter history is preserved and unaffected by cascading).
+
+### SF-025 — Cancelled predecessor cancels dependents
+
+- **Initial state**: A workflow `A -> B` is submitted; A has not been
+  claimed.
+- **Actions**: A is cancelled directly (`POST /jobs/{id}/cancel` against
+  A's own underlying job, or an equivalent direct store call) — not via
+  workflow-level cancellation.
+- **Fault**: None.
+- **Expected durable state**: B is cancelled as a direct consequence,
+  identically to the dead-letter case (docs/workflows.md's Failure
+  Propagation table treats `CANCELLED` and `DEAD_LETTERED` predecessor
+  outcomes the same way), regardless of which API path produced A's
+  cancellation.
+- **Invariants proved**: TF-INV-012, TF-INV-010 (A's own cancellation race
+  semantics are unaffected by being part of a workflow).
+
+### SF-026 — Workflow-level cancellation across mixed node states
+
+- **Initial state**: A workflow with five independent nodes, one each in:
+  dependency-blocked (unstarted), scheduled for the future (not yet
+  eligible), `RETRY_WAIT`, `RUNNING`, and already `SUCCEEDED`.
+- **Actions**: `POST /workflows/{id}/cancel`.
+- **Fault**: None.
+- **Expected durable state**: The blocked, scheduled, and `RETRY_WAIT`
+  nodes transition directly to `CANCELLED` (no worker involved for any of
+  them). The `RUNNING` node's cancellation is requested
+  (`cancel_requested = true`) but not yet confirmed — the workflow itself
+  remains `RUNNING` until that node's worker acknowledges. The already
+  `SUCCEEDED` node is completely untouched.
+- **Invariants proved**: TF-INV-010 (applied independently per node),
+  TF-INV-005 (the succeeded node's terminal state is never disturbed).
+
+### SF-027 — Concurrent dependency completion
+
+- **Initial state**: A workflow `A -> C`, `B -> C` is submitted; A has
+  already succeeded, and B and C's other predecessor conditions are ready
+  to be evaluated.
+- **Actions**: Two predecessors of the same fan-in node (B and C, both
+  required by C — reusing the diamond shape's naming, D) commit their
+  `SUCCEEDED` transitions at, as close as test synchronization allows,
+  the same instant, released from a shared start barrier across two real,
+  concurrently executing goroutines with real pooled PostgreSQL
+  connections.
+- **Fault**: None (concurrency itself is the stressor).
+- **Expected durable state**: The shared dependent becomes eligible
+  exactly once — not zero times (a lost-update bug where both
+  transactions conclude "not all predecessors have succeeded yet" and
+  neither activates it) and not claimed twice.
+- **Invariants proved**: TF-INV-012, TF-INV-002 (exactly one claim, no
+  matter how the activation race resolved).
+
+### SF-028 — Stale generation cannot unblock or cancel dependents
+
+- **Initial state**: A workflow `X -> Y` is submitted. Worker A claims X
+  (generation 1).
+- **Actions**: Worker A's lease expires. Worker B reclaims X (generation
+  2) and reports success. Worker A, unaware, later reports (a) success or
+  (b) permanent failure for X under generation 1.
+- **Fault**: Worker A's delayed, stale completion call, in both outcome
+  variants.
+- **Expected durable state**: Worker A's stale call is rejected outright
+  (zero rows affected, `ErrStaleTransition`) in both variants — it never
+  reaches the point of attempting to propagate anything to Y. Y's
+  eligibility reflects only Worker B's genuine, committed completion: it
+  becomes eligible if and only if B's generation-2 completion was
+  `SUCCEEDED`, and is never spuriously cancelled by A's rejected stale
+  failure report.
+- **Invariants proved**: TF-INV-003, TF-INV-014, TF-INV-012.
+
+### SF-029 — Workflow progress survives restart
+
+- **Initial state**: A workflow with a still-blocked dependent node exists;
+  its predecessor has just succeeded (dependent now eligible) durably.
+- **Actions**: All API server and worker processes are stopped and
+  restarted (or, at the store level, a fresh `*store.Store` sharing only
+  the database replaces the pre-restart instance).
+- **Fault**: Full-fleet restart.
+- **Expected durable state**: The restarted fleet correctly claims and
+  executes the now-eligible dependent — no "catch-up" logic is needed or
+  invoked, because dependency-satisfaction state (`eligible_at` on the
+  dependent's own job row) was never held only in memory.
+- **Invariants proved**: TF-INV-012, TF-INV-001, TF-INV-004.
+
+### SF-030 — Invalid graph is rejected atomically
+
+- **Initial state**: No workflow exists.
+- **Actions**: `POST /workflows` with a structurally invalid graph (a
+  cycle, a self-dependency, an unknown dependency, a duplicate node key,
+  or an empty node list).
+- **Fault**: None — the invalid input itself is the stressor.
+- **Expected durable state**: The submission is rejected with `400 Bad
+  Request` before any SQL is issued. No `workflow_instances` row, no
+  `jobs` row, and no `workflow_nodes` row is created for the rejected
+  submission — an invalid workflow is never partially persisted and never
+  acknowledged as created.
+- **Invariants proved**: TF-INV-012 (a malformed dependency graph can
+  never reach a state where TF-INV-012 would even need to be evaluated),
+  TF-INV-013 (analogously — no half-created workflow, proved directly by
+  a fault-injection test forcing a mid-transaction failure).
 
 ## Scenario-to-Invariant Cross-Check
 

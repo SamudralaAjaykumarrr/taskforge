@@ -124,7 +124,7 @@ func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
 
-	if err := sweepExpiredExhaustedLeases(ctx, tx); err != nil {
+	if err := s.sweepExpiredExhaustedLeases(ctx, tx); err != nil {
 		return nil, false, fmt.Errorf("store: claim: %w", err)
 	}
 
@@ -166,7 +166,17 @@ func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, err
 // so the claim query's reclaim branch never has to reclaim (and its
 // defense-in-depth "AND attempt_count < max_attempts" clause never has
 // to reject) a row past its attempt budget.
-func sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) error {
+//
+// A method (not a bare function) since Phase 7: a swept job may be a
+// workflow node, and its dependents must be cascade-cancelled exactly as
+// they would be if a worker had explicitly reported this same permanent
+// exhaustion via CompleteRetryableFailure -- see
+// propagateWorkflowTransition below. Without this, a workflow node that
+// exhausts its retry budget purely via repeated lease expiration (no
+// worker ever calls a Complete* method for its final attempt) would leave
+// its dependents blocked forever, violating TF-INV-004's "no permanently
+// stranded" guarantee at the workflow level.
+func (s *Store) sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE jobs
 		SET state = 'DEAD_LETTERED',
@@ -201,6 +211,9 @@ func sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) error {
 	for _, id := range ids {
 		if err := finalizeOpenAttempt(ctx, tx, id, attemptOutcomeLeaseExpired, "", ""); err != nil {
 			return fmt.Errorf("sweep expired-exhausted leases: finalize attempt for job %s: %w", id, err)
+		}
+		if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered); err != nil {
+			return fmt.Errorf("sweep expired-exhausted leases: propagate workflow for job %s: %w", id, err)
 		}
 	}
 	return nil
