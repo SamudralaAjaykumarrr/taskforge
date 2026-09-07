@@ -38,6 +38,74 @@ func (h AlwaysFail) Execute(context.Context, *job.Job) (handler.Result, error) {
 	return handler.Result{}, h.Err
 }
 
+// RetryableFail is a Handler that always fails with a fixed error
+// explicitly classified handler.Retryable, per docs/retry-semantics.md.
+type RetryableFail struct {
+	Err error
+}
+
+// NewRetryableFail returns a RetryableFail with a default error if err is
+// nil.
+func NewRetryableFail(err error) RetryableFail {
+	if err == nil {
+		err = errors.New("testdoubles: retryable fail")
+	}
+	return RetryableFail{Err: err}
+}
+
+func (h RetryableFail) Execute(context.Context, *job.Job) (handler.Result, error) {
+	return handler.Result{}, handler.Retryable(h.Err)
+}
+
+// PermanentFail is a Handler that always fails with a fixed error
+// explicitly classified handler.Permanent.
+type PermanentFail struct {
+	Err error
+}
+
+// NewPermanentFail returns a PermanentFail with a default error if err is
+// nil.
+func NewPermanentFail(err error) PermanentFail {
+	if err == nil {
+		err = errors.New("testdoubles: permanent fail")
+	}
+	return PermanentFail{Err: err}
+}
+
+func (h PermanentFail) Execute(context.Context, *job.Job) (handler.Result, error) {
+	return handler.Result{}, handler.Permanent(h.Err)
+}
+
+// FlakyThenSucceed fails retryably the first FailTimes calls, then
+// succeeds on every call after that. It exists so retry tests (SF-009:
+// "retryable failure eventually succeeds") can exercise a real
+// claim-execute-retry-execute cycle through a handler, rather than
+// asserting store-level transitions in isolation. Safe for concurrent use.
+type FlakyThenSucceed struct {
+	mu        sync.Mutex
+	remaining int
+	Err       error
+}
+
+// NewFlakyThenSucceed returns a FlakyThenSucceed that fails retryably the
+// first failTimes calls. A nil err gets a default.
+func NewFlakyThenSucceed(failTimes int, err error) *FlakyThenSucceed {
+	if err == nil {
+		err = errors.New("testdoubles: flaky failure")
+	}
+	return &FlakyThenSucceed{remaining: failTimes, Err: err}
+}
+
+func (h *FlakyThenSucceed) Execute(context.Context, *job.Job) (handler.Result, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.remaining > 0 {
+		h.remaining--
+		return handler.Result{}, handler.Retryable(h.Err)
+	}
+	return handler.Result{}, nil
+}
+
 // Recorder is a Handler that records every job it was asked to execute,
 // in call order, and delegates the actual outcome to an inner handler
 // (AlwaysSucceed by default). Safe for concurrent use.

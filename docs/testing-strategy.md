@@ -65,12 +65,80 @@ executable tests, all in `internal/store/lease_test.go` and
   `internal/migrate/migrate_test.go` — a database with only migration
   `0001` applied is upgraded to Phase 2's schema without data loss.
 
-**Still not implemented**: property-based tests, fuzz tests, retry tests
-(no `RETRY_WAIT`/backoff exists yet — Phase 3), idempotency tests (Phase
-4), the cancellation race test SF-012 (Phase 6), the scheduling test
-SF-013 (Phase 6), sustained load tests and chaos tests (Phase 5/9 — Phase
-2's concurrency tests use small, fixed worker/job counts to prove
-correctness deterministically, not sustained/randomized load).
+As of Phase 3 ("Retries, Backoff, DLQ"), the following additional
+categories now have real, passing, executable tests, in
+`internal/store/retry_test.go`, `internal/worker/retry_test.go`, and
+`internal/retry/backoff_test.go` unless noted:
+
+- **Unit tests** (backoff calculation, no database): `internal/retry/backoff_test.go`
+  — the exact `raw_delay = min(max_backoff, base_delay * 2^(attempt-1))`
+  formula against concrete attempts, the equal-jitter formula's exact
+  boundaries via a deterministic stub `RandSource`, `Config.Validate`
+  rejecting non-positive/inverted configuration, and overflow safety at
+  extreme attempt counts (`TestRawDelay_OverflowSafeAtExtremeAttempts`,
+  adversarial case #12).
+- **Retry tests** (SF-009, SF-010): see
+  [scenario-corpus.md](scenario-corpus.md)'s Phase 3 section for the full
+  test list at both the store level (direct `Store.CompleteRetryableFailure`
+  calls) and the worker-loop level (a real `handler.Handler` driven through
+  `Worker.RunOnce`).
+- **Property-based test** (the roadmap's Phase 3 quality gate: "property
+  test confirming `attempt_count` never exceeds `max_attempts` across
+  randomized failure sequences"): `TestProperty_AttemptCountNeverExceedsMaxAttempts`
+  in `internal/store/retry_test.go` — a fixed-seed sweep of randomized
+  `max_attempts` values and randomized retryable-failure-before-success/
+  exhaustion sequences, asserting `TF-INV-006` holds in every generated
+  scenario, not just hand-picked examples.
+- **Stale-worker fencing tests, extended to the retry/dead-letter
+  transition**: `TestCompleteRetryableFailure_RejectsStaleGeneration`,
+  `TestCompleteRetryableFailure_RejectsWrongOwner`,
+  `TestCompleteRetryableFailure_RejectedAfterReclaim` (the SF-008 shape
+  replayed against `CompleteRetryableFailure`), and
+  `TestCompleteFailure_PermanentRejectedAfterReclaim` (the same for a
+  permanent failure racing a reclaim — adversarial cases #3/#4/#15). The
+  documented "late but not yet superseded" boundary
+  (`TestCompleteSuccess_AcceptedAfterExpiryButBeforeReclaim`, Phase 2) has a
+  retry-path analogue: `TestCompleteRetryableFailure_AcceptedAfterExpiryButBeforeReclaim`
+  (adversarial case #14).
+- **Fault-injection test, extended to the retry transition** (TF-INV-013):
+  `TestRetryTransition_RollbackLeavesJobAndAttemptConsistent` (adversarial
+  cases #6/#7) — forces the transaction to fail after the job-row UPDATE
+  but before the `job_attempts` finalize UPDATE commits, and asserts both
+  rows are left byte-for-byte as they were before the transaction began.
+- **Retry-eligibility / concurrency tests**: no claim before `eligible_at`
+  (`TestClaim_RetryWaitNotClaimableBeforeEligibility`), claim after
+  (`TestClaim_RetryWaitClaimableAfterEligibility`), N workers racing a
+  single `RETRY_WAIT` job the instant it becomes eligible
+  (`TestClaim_ConcurrentWorkersRaceForEligibleRetryWaitJob`, adversarial
+  case #1), and multiple independently-eligible `RETRY_WAIT` jobs claimed
+  by a worker pool with no double-claim
+  (`TestClaim_MultipleWorkersOnlyOneWinsOnceEligible`) — all using DB-time
+  manipulation (`forceSetEligibleAt`, mirroring Phase 2's
+  `forceExpireLease`), never a sleep.
+- **Durability-across-restart test** (adversarial case #9):
+  `TestRetryWait_SurvivesFreshStoreInstance` — a fresh `*store.Store`
+  standing in for a full process restart correctly still refuses to claim
+  before `eligible_at` and correctly claims after, with no in-memory retry
+  timer involved at any point.
+- **Reclaim interaction test** (adversarial case #8):
+  `TestClaim_ReclaimStillWorksAfterPriorRetryCycle` — Phase 2's
+  lease-expiry reclaim mechanism (a worker crash that never even calls
+  `CompleteRetryableFailure`) still functions correctly on the second (and
+  later) attempt of a job that has already been through one `RETRY_WAIT`
+  cycle.
+
+**Still not implemented**: fuzz tests, the cancellation race test SF-012
+(Phase 6), the scheduling test SF-013 (Phase 6), idempotency tests (Phase
+4), sustained load tests and chaos tests (Phase 5/9 — Phase 2's concurrency
+tests use small, fixed worker/job counts to prove correctness
+deterministically, not sustained/randomized load). Phase 3's optional
+background sweeper (docs/architecture.md: "an optimization, not a
+correctness dependency") was not built — the Lazy Dead-Letter Sweep
+already running inside every `Claim` call (Phase 2) remains the sole,
+sufficient mechanism for `TF-INV-006` on the reclaim path; a periodic
+out-of-band sweeper would only shrink the (already bounded) window before
+an attempt-exhausted expired lease is visible as `DEAD_LETTERED`, which no
+required invariant or scenario depends on.
 
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1

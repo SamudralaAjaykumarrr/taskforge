@@ -24,6 +24,7 @@ import (
 const (
 	attemptOutcomeSucceeded       = "SUCCEEDED"
 	attemptOutcomeFailedPermanent = "FAILED_PERMANENT"
+	attemptOutcomeFailedRetryable = "FAILED_RETRYABLE"
 	attemptOutcomeLeaseExpired    = "LEASE_EXPIRED"
 )
 

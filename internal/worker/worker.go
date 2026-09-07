@@ -1,6 +1,10 @@
-// Package worker implements the Phase 2 claim-execute-(heartbeat)-complete
-// loop, per docs/roadmap.md Phase 2 ("Worker Leases and Heartbeats") and
-// docs/worker-protocol.md.
+// Package worker implements the claim-execute-(heartbeat)-complete loop,
+// per docs/roadmap.md and docs/worker-protocol.md. As of Phase 3
+// ("Retries, Backoff, DLQ"), a handler failure is no longer unconditionally
+// dead-lettered: the worker classifies it (see internal/handler's
+// Retryable/Permanent) and either schedules a durable, backed-off retry
+// (RUNNING -> RETRY_WAIT) or dead-letters it, exactly as
+// docs/retry-semantics.md specifies.
 //
 // Per docs/worker-protocol.md ("Why Not Hold a Transaction Open for the
 // Whole Job"), claiming, heartbeating, and completing are each short,
@@ -12,7 +16,9 @@
 // lease has been lost (a heartbeat call returns store.ErrStaleTransition)
 // stops treating itself as the authoritative owner: it cancels the
 // context passed to the handler and does not attempt a completion call
-// that fencing would reject anyway (TF-INV-003/014).
+// that fencing would reject anyway (TF-INV-003/014) — this includes
+// scheduling a retry or dead-lettering: a lease-lost worker is no more
+// authoritative for those decisions than for a success report.
 package worker
 
 import (
@@ -26,6 +32,8 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/handler"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/retry"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 )
 
@@ -39,6 +47,7 @@ type Store interface {
 	Heartbeat(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, extension time.Duration) (*job.Job, error)
 	CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, resultMetadata []byte) (*job.Job, error)
 	CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage, errClass string) (*job.Job, error)
+	CompleteRetryableFailure(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage string, delay time.Duration) (*job.Job, error)
 }
 
 // heartbeatIntervalFraction is the fraction of the lease duration at which
@@ -53,19 +62,24 @@ type Store interface {
 // the initial lease_expires_at (docs/worker-protocol.md "Claim Query").
 const heartbeatIntervalFraction = 3
 
-// Worker runs the Phase 2 claim-execute-heartbeat-complete loop for a
-// single logical worker identity.
+// Worker runs the claim-execute-heartbeat-complete loop for a single
+// logical worker identity.
 type Worker struct {
 	ID           string
 	store        Store
 	registry     *handler.Registry
 	pollInterval time.Duration
 	logger       *slog.Logger
+	retryConfig  retry.Config
+	rand         retry.RandSource
 }
 
 // New constructs a Worker. id is the lease_owner value recorded on every
 // claimed job (docs/data-model.md: "opaque worker identifier, e.g.
-// hostname+pid+random").
+// hostname+pid+random"). Retry backoff uses docs/retry-semantics.md's v1
+// defaults (retry.DefaultConfig) and a time-seeded jitter source; see
+// SetRetryConfig/SetRandSource to override either (primarily useful for
+// tests that need a fast, deterministic backoff window).
 func New(id string, st Store, registry *handler.Registry, pollInterval time.Duration, logger *slog.Logger) *Worker {
 	if logger == nil {
 		logger = slog.Default()
@@ -76,8 +90,23 @@ func New(id string, st Store, registry *handler.Registry, pollInterval time.Dura
 		registry:     registry,
 		pollInterval: pollInterval,
 		logger:       logger,
+		retryConfig:  retry.DefaultConfig(),
+		rand:         retry.NewRand(time.Now().UnixNano()),
 	}
 }
+
+// SetRetryConfig overrides the backoff configuration used when scheduling a
+// retryable failure's next attempt. docs/retry-semantics.md's per-job-type
+// backoff configuration is an explicitly deferred open question (v1 has
+// exactly one, global configuration per worker); this exists primarily so
+// tests can use a small base delay for fast, still-real (not DB-time-
+// manipulated) retry-then-succeed scenarios.
+func (w *Worker) SetRetryConfig(cfg retry.Config) { w.retryConfig = cfg }
+
+// SetRandSource overrides the jitter source used for backoff computation.
+// Production use relies on the time-seeded default from New; tests inject
+// a deterministic retry.RandSource to assert exact backoff boundaries.
+func (w *Worker) SetRandSource(src retry.RandSource) { w.rand = src }
 
 // RunOnce attempts to claim and fully execute a single job (which may be a
 // fresh QUEUED/RETRY_WAIT job, or a reclaim of a previously RUNNING job
@@ -133,13 +162,7 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 	}
 
 	if execErr != nil {
-		log.Info("job execution failed; dead-lettering (Phase 1/2 have no retry path yet)", "error", execErr)
-		_, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), job.ErrorClassPermanent)
-		if errors.Is(ferr, store.ErrStaleTransition) {
-			log.Warn("failure report rejected: lease no longer current")
-			return true, nil
-		}
-		return true, ferr
+		return true, w.reportFailure(ctx, log, j, execErr)
 	}
 
 	log.Info("job execution succeeded")
@@ -149,6 +172,57 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		return true, nil
 	}
 	return true, cerr
+}
+
+// reportFailure classifies execErr (internal/handler.Classify, per
+// docs/retry-semantics.md) and reports the corresponding outcome:
+// ClassRetryable schedules a durable, backed-off retry (or dead-letters,
+// if attempt_count has already reached max_attempts -- internal/store's
+// CompleteRetryableFailure makes that decision atomically, not this
+// method); ClassPermanent (including any error the handler did not
+// explicitly classify, per Classify's documented default) dead-letters
+// immediately via CompleteFailure, exactly as Phase 1/2 always did for
+// every failure.
+//
+// A rejected completion (store.ErrStaleTransition) is not surfaced as an
+// error: it means this worker's lease is no longer current -- some other
+// generation now owns (or has already resolved) the job, and per
+// TF-INV-003/014 a stale generation is never authoritative for scheduling
+// a retry or a dead-letter transition any more than it is for reporting
+// success. See the package doc comment.
+func (w *Worker) reportFailure(ctx context.Context, log *slog.Logger, j *job.Job, execErr error) error {
+	class, _ := handler.Classify(execErr)
+
+	if class == handler.ClassPermanent {
+		log.Info("permanent failure; dead-lettering", "error", execErr)
+		_, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), job.ErrorClassPermanent)
+		if errors.Is(ferr, store.ErrStaleTransition) {
+			log.Warn("failure report rejected: lease no longer current")
+			return nil
+		}
+		return ferr
+	}
+
+	delay := retry.Delay(j.AttemptCount, w.retryConfig, w.rand)
+	log.Info("retryable failure", "error", execErr, "attempt_count", j.AttemptCount, "max_attempts", j.MaxAttempts)
+
+	result, ferr := w.store.CompleteRetryableFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), delay)
+	if errors.Is(ferr, store.ErrStaleTransition) {
+		log.Warn("retryable failure report rejected: lease no longer current")
+		return nil
+	}
+	if ferr != nil {
+		return ferr
+	}
+
+	if result.State == jobstate.DeadLettered {
+		log.Warn("retries exhausted; job dead-lettered",
+			"attempt_count", result.AttemptCount, "max_attempts", result.MaxAttempts)
+	} else {
+		log.Info("retry scheduled",
+			"eligible_at", result.EligibleAt, "delay_seconds", delay.Seconds())
+	}
+	return nil
 }
 
 // runWithHeartbeat executes h against j, renewing the job's lease on a

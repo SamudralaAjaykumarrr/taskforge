@@ -180,14 +180,32 @@ func (s *Store) transition(ctx context.Context, q queryRower, from, to jobstate.
 	if !jobstate.IsValidTransition(from, to) {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, from, to)
 	}
+	j, err := scanTransitionResult(ctx, q, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: transition %s -> %s: %w", from, to, err)
+	}
+	return j, nil
+}
 
+// scanTransitionResult runs query (a fenced UPDATE ... RETURNING) and maps
+// "affected zero rows" to ErrStaleTransition, per docs/worker-protocol.md's
+// fencing guarantee. It is the low-level primitive transition uses after
+// its single-destination legality check; internal/store's
+// CompleteRetryableFailure (see retry.go) calls this directly because its
+// single UPDATE statement can legally land on either of two destination
+// states (RETRY_WAIT or DEAD_LETTERED, chosen by a SQL CASE expression, not
+// by the caller), so the fixed single-`to` shape transition assumes does
+// not fit -- callers of this function are responsible for validating
+// whichever (from, to) pairs their query can actually produce before
+// issuing it.
+func scanTransitionResult(ctx context.Context, q queryRower, query string, args ...any) (*job.Job, error) {
 	row := q.QueryRowContext(ctx, query, args...)
 	j, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrStaleTransition
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store: transition %s -> %s: %w", from, to, err)
+		return nil, err
 	}
 	return j, nil
 }

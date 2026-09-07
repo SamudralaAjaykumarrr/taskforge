@@ -86,9 +86,44 @@ The following scenarios are executable as of Phase 2, all in
   assertion side) completes successfully under the same `lease_generation`
   throughout.
 
-SF-004, SF-005, SF-009 through SF-013 are **not** executable yet — they
-require Phase 3+ functionality (retries, idempotency keys, cancellation,
-scheduling) this codebase does not implement.
+SF-004, SF-005, SF-011 through SF-013 are **not** executable yet — they
+require Phase 4+ functionality (idempotency keys, cancellation, scheduling)
+this codebase does not implement.
+
+The following scenarios are executable as of Phase 3
+([roadmap.md](roadmap.md)):
+
+- **SF-009** (Retryable failure eventually succeeds) — store-level:
+  `TestCompleteRetryableFailure_SF009_EventuallySucceeds` in
+  `internal/store/retry_test.go` (two `FAILED_RETRYABLE` attempts, then a
+  third that succeeds, driven directly through `Store.CompleteRetryableFailure`/
+  `Store.CompleteSuccess`). Worker-loop level (the full
+  claim-execute-classify-retry cycle through a real `handler.Handler`, not
+  just direct store calls): `TestRunOnce_SF009_RetryableFailureEventuallySucceeds`
+  in `internal/worker/retry_test.go`, using `testdoubles.FlakyThenSucceed`
+  and deterministic `eligible_at` fast-forwarding (never a real sleep for
+  the backoff window) between cycles.
+- **SF-010** (Retries exhausted, transitions to DLQ) — store-level:
+  `TestCompleteRetryableFailure_SF010_ExhaustionTransitionsToDeadLettered`
+  (asserts `DEAD_LETTERED` after the 3rd of 3 max attempts, `last_error`
+  matching the final attempt, and all 3 `job_attempts` rows still
+  queryable). Worker-loop level:
+  `TestRunOnce_SF010_RetriesExhaustedDeadLetters`. Both also prove the
+  scenario's negative half — a further claim attempt against the
+  dead-lettered job never succeeds.
+
+Phase 3 also adds test coverage beyond the two scenarios the roadmap names
+explicitly (SF-009, SF-010), against the same adversarial-audit list this
+document's format is meant to support — see
+`internal/store/retry_test.go` and `internal/worker/retry_test.go` for the
+full set: retry-eligibility timing (before/after `eligible_at`, concurrent
+claim races once a `RETRY_WAIT` job becomes eligible, durability across a
+simulated process restart), stale-generation fencing extended to the new
+retry/dead-letter transition (mirroring SF-008's shape for
+`CompleteRetryableFailure` and for a permanent `CompleteFailure` racing a
+reclaim), a `TF-INV-013` fault-injection test for the new transition, and a
+randomized property test asserting `attempt_count` never exceeds
+`max_attempts` (`TestProperty_AttemptCountNeverExceedsMaxAttempts`).
 
 ---
 

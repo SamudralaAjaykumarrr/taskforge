@@ -33,6 +33,23 @@ func forceExpireLease(t *testing.T, db *sql.DB, jobID uuid.UUID) {
 	require.Equal(t, int64(1), n, "forceExpireLease: job %s was not RUNNING", jobID)
 }
 
+// forceSetEligibleAt rewinds or fast-forwards jobID's eligible_at to
+// exactly delta relative to PostgreSQL's own clock (negative delta ->
+// past, positive -> future), simulating retry-backoff timing without a
+// real sleep. Used for RETRY_WAIT eligibility-boundary tests, mirroring
+// forceExpireLease's role for lease-expiry tests. The row must currently
+// exist and be in RETRY_WAIT, or this fails loudly.
+func forceSetEligibleAt(t *testing.T, db *sql.DB, jobID uuid.UUID, delta time.Duration) {
+	t.Helper()
+	res, err := db.ExecContext(context.Background(), `
+		UPDATE jobs SET eligible_at = now() + $2 * interval '1 second'
+		WHERE id = $1 AND state = 'RETRY_WAIT'`, jobID, delta.Seconds())
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "forceSetEligibleAt: job %s was not RETRY_WAIT", jobID)
+}
+
 // attemptRow mirrors one job_attempts row for test assertions.
 type attemptRow struct {
 	AttemptNumber   int
