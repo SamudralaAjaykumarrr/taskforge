@@ -61,4 +61,5 @@ type NewParams struct {
 // Failure classes recorded in last_error_class, per docs/data-model.md.
 const (
 	ErrorClassPermanent = "PERMANENT"
+	ErrorClassRetryable = "RETRYABLE"
 )

@@ -1,22 +1,31 @@
 # TaskForge
 
-**Status: Experimental (Phase 1 — Single-Node Durable Job Engine — and
-Phase 2 — Worker Leases and Heartbeats — both complete).**
-Phases 1 and 2 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+**Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
+Worker Leases and Heartbeats, and Phase 3 — Retries, Backoff, DLQ — all
+complete; see "Proposed maturity label" under "Phase 3: What's Implemented"
+below for why this README does not yet promote to Hardening despite
+[docs/roadmap.md](docs/roadmap.md) naming Hardening as Phase 3's
+on-completion label).**
+Phases 1 through 3 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission, multiple
 concurrent worker processes, fenced lease-based ownership with heartbeat
-renewal and automatic crash recovery via lease expiration/reclaim, and the
-`QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> DEAD_LETTERED` subset of the
-documented state machine. It is **not** distributed beyond a single
-PostgreSQL instance, and does not implement retry backoff/DLQ
-classification, cancellation, scheduling delay, or idempotency keys yet —
-see "Phase 1: What's Implemented" and "Phase 2: What's Implemented" below
-for the exact boundary. Everything else described in this README past those
-sections remains a design target for later phases, not a demonstrated
-capability. TaskForge guarantees **at-least-once** execution, never
-exactly-once for arbitrary external side effects — see "Phase 2 guarantees"
-below for the specific, tested duplicate-side-effect window this phase
-closes and the one it deliberately leaves open.
+renewal, automatic crash recovery via lease expiration/reclaim, and the full
+`QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> RETRY_WAIT -> RUNNING` /
+`RUNNING -> DEAD_LETTERED` subset of the documented state machine, with real
+durable exponential backoff and retryable-vs-permanent failure
+classification (`CANCELLED` remains out of reach until Phase 6). It is
+**not** distributed beyond a single PostgreSQL instance, and does not
+implement submission idempotency keys, cancellation, scheduling delay, or
+workflow execution yet — see "Phase 1: What's Implemented", "Phase 2: What's
+Implemented", and "Phase 3: What's Implemented" below for the exact
+boundary. Everything else described in this README past those sections
+remains a design target for later phases, not a demonstrated capability.
+TaskForge guarantees **at-least-once** execution, never exactly-once for
+arbitrary external side effects — see "Phase 2 guarantees" below for the
+specific, tested duplicate-side-effect window that phase closes and the one
+it deliberately leaves open (retries, including Phase 3's new backed-off
+`RETRY_WAIT` retries, are exactly this same at-least-once mechanism, not a
+new exposure).
 
 ## The Problem
 
@@ -78,35 +87,37 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
 - Heartbeat renewal without transferring or shortening a lease
   (TF-INV-015). **Proven (Phase 2).**
 - Durable, monotonic retry history with configurable backoff and dead-letter
-  behavior (TF-INV-006, TF-INV-007, TF-INV-009). **Partially proven**: the
-  `job_attempts` ledger exists and is populated (Phase 2), and TF-INV-006 is
-  enforced on the reclaim path (an attempt-exhausted expired lease is
-  dead-lettered, never re-reclaimed) — but real backoff/`RETRY_WAIT` and
-  dead-letter failure classification are Phase 3.
+  behavior (TF-INV-006, TF-INV-007, TF-INV-009). **Proven (Phase 3)** — real
+  exponential-backoff `RETRY_WAIT`, retryable-vs-permanent failure
+  classification, and exhaustion-driven `DEAD_LETTERED` all now exist and
+  are tested against real PostgreSQL, including under adversarial
+  stale-generation and rollback scenarios; see "Phase 3: What's
+  Implemented" below.
 - Database-enforced submission idempotency (TF-INV-008, TF-INV-016).
 - Deterministic cancellation-vs-completion race semantics (TF-INV-010).
 - Scheduling that survives full process/fleet restarts (TF-INV-011).
 - (Later phase) dependency-gated workflow/DAG execution (TF-INV-012).
 
-None of these are implemented yet. They are documented now, precisely,
-so that implementation has an unambiguous contract to satisfy and external
-reviewers have something falsifiable to check it against.
+The three bullets above with no "Proven" annotation are not implemented
+yet. They are documented now, precisely, so that implementation has an
+unambiguous contract to satisfy and external reviewers have something
+falsifiable to check it against.
 
 ## Project Status
 
 | Area | Status |
 |---|---|
 | Architecture & invariant documentation | **Done** (this repository, current state) |
-| PostgreSQL schema | **Phase 2 done** (`jobs` table per Phase 1; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`) |
-| API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only — unchanged in Phase 2, per Phase 2's explicit non-goal of API expansion) |
+| PostgreSQL schema | **Phase 2 done, still sufficient for Phase 3** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`. Phase 3 required **no new migration** — see "Phase 3: What's Implemented" below) |
+| API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only — unchanged through Phase 3, per each phase's non-goal of API expansion; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status) |
 | Worker / claim / lease protocol | **Phase 2 done**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism) — see "Phase 2: What's Implemented" below |
-| Retry / backoff / DLQ | Not started (failures still go straight to `DEAD_LETTERED`, no `RETRY_WAIT`; the reclaim path's Lazy Dead-Letter Sweep enforces `attempt_count <= max_attempts` as an infrastructure precondition, not a retry policy) |
+| Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
 | Idempotency enforcement | Not started (schema constraint exists; no `Idempotency-Key` API support) |
 | Scheduling | Not started |
 | Cancellation / timeouts | Not started (lease TTL bounds a stuck attempt, but there is no `execution_timeout` classification distinct from lease expiry yet, and no cancellation endpoint) |
 | Workflow / DAG execution | Not started (staged for a later phase) |
-| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection are all logged — see "Phase 2: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 2 subset done**: unit, state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races) now exist; sustained-load chaos testing remains Phase 5/9 |
+| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, and permanent-failure dead-letter are all logged — see "Phase 2" and "Phase 3: What's Implemented") |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 3 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races) now exist; sustained-load chaos testing remains Phase 5/9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -447,6 +458,290 @@ merged or pushed). This README therefore keeps Phase 2 at **Experimental**
 for now; promotion to Hardening is a mechanical follow-up once CI has run
 this suite repeatedly post-merge, not a judgment call this document should
 make preemptively on the implementer's own local test runs.
+
+## Phase 3: What's Implemented
+
+**Status: Experimental**, for the same reason Phase 2 is: see "Proposed
+maturity label" below.
+
+Phase 3 ([docs/roadmap.md](docs/roadmap.md) "Retries, Backoff, DLQ") makes
+retries durable, real, and correctly bounded — replacing Phase 1/2's
+simplification ("every failure dead-letters immediately") with the full
+`RUNNING -> RETRY_WAIT -> RUNNING` cycle and genuine
+retryable-vs-permanent failure classification.
+
+### Implemented now
+
+- **Retryable-vs-permanent failure classification in the handler contract**
+  (`internal/handler`): a `Handler` reports failure by returning an error
+  wrapped with `handler.Retryable(err)` or `handler.Permanent(err)`.
+  `handler.Classify` extracts the classification (walking any further
+  `fmt.Errorf("...: %w", ...)` wrapping a handler adds on top, per
+  [docs/retry-semantics.md](docs/retry-semantics.md)). TaskForge never
+  infers retryability from string matching or error type — an error a
+  handler did not explicitly classify is treated as **permanent** (dead-letters
+  immediately, consuming no further retry budget), which is also exactly
+  Phase 1/2's original behavior for every existing handler, so no
+  pre-Phase-3 handler's behavior changed.
+- **Durable exponential backoff with equal jitter** (`internal/retry`), per
+  [docs/retry-semantics.md](docs/retry-semantics.md)'s exact formula:
+  `raw_delay = min(max_backoff, base_delay * 2^(attempt-1))`, then
+  `delay = (raw_delay/2) + random_uniform(0, raw_delay/2)`. Pure and
+  DB-free (unit-tested without PostgreSQL — `internal/retry/backoff_test.go`),
+  overflow-safe at extreme attempt counts, and its jitter source is
+  injectable for deterministic tests. The computed **duration** (not an
+  absolute timestamp) is what crosses into `internal/store`, which applies
+  it as `eligible_at = now() + delay` with `now()` evaluated by PostgreSQL
+  itself — per [docs/failure-model.md](docs/failure-model.md)'s Clock
+  Model, no correctness-critical timestamp is ever compared against a
+  worker's local clock.
+- **`Store.CompleteRetryableFailure`** (`internal/store/retry.go`): the
+  fenced `RUNNING -> RETRY_WAIT` / `RUNNING -> DEAD_LETTERED` transition
+  from [docs/worker-protocol.md](docs/worker-protocol.md)'s "Retryable
+  Failure" SQL, verbatim — the destination is chosen by a single SQL `CASE`
+  comparing `attempt_count` to `max_attempts` inside the same fenced
+  `UPDATE` that performs the write (never a separate read-then-decide step
+  that could race a concurrent change to either value), with the
+  `job_attempts` row for that exact attempt finalized (`FAILED_RETRYABLE`)
+  in the same transaction (TF-INV-013). `Store.CompleteFailure`
+  (Phase 1/2, unchanged) now serves specifically as the **permanent**
+  failure path — its unconditional dead-letter behavior already matched
+  [docs/worker-protocol.md](docs/worker-protocol.md)'s "Permanent Failure"
+  section exactly, so it required no change.
+- **Worker integration** (`internal/worker`): `Worker.RunOnce` classifies a
+  handler's failure and calls `CompleteRetryableFailure` or
+  `CompleteFailure` accordingly, logging `retry scheduled` (with the
+  computed `eligible_at`), `retries exhausted`, or `permanent failure`. A
+  worker that has lost its lease mid-execution (detected via the existing
+  Phase 2 heartbeat mechanism) does not attempt either call — a stale
+  generation is no more authoritative for scheduling a retry or a
+  dead-letter than it is for reporting success (TF-INV-003/014, unchanged
+  from Phase 2, now proven for the two new call paths too). No handler
+  execution ever runs inside a database transaction, and the heartbeat
+  goroutine's lifecycle (started/stopped deterministically around handler
+  execution, no leaks) is unchanged.
+- **Retry eligibility reuses the existing claim query unmodified**: a
+  `RETRY_WAIT` job becomes claimable via the exact same
+  `state IN ('QUEUED', 'RETRY_WAIT') AND eligible_at <= now()` predicate
+  `QUEUED` jobs already used (`internal/store/claim.go`, unchanged since
+  Phase 1) — retry backoff needed no new query, no new index, and no
+  special-casing in the claim path, exactly as
+  [docs/architecture.md](docs/architecture.md) and
+  [docs/worker-protocol.md](docs/worker-protocol.md) designed it.
+- **No new migration required.** Migration `0001` already permitted the
+  `RETRY_WAIT` state and an `eligible_at`/`last_error_class` column with no
+  restrictive `CHECK`, and migration `0002` already permitted the
+  `FAILED_RETRYABLE` `job_attempts` outcome — both deliberately, per each
+  migration's own comments, specifically to avoid a schema migration when
+  Phase 3 arrived. `internal/store/retry_test.go`'s
+  `TestSchema_RetryWaitStateAlreadySupportedByCheckConstraint` and
+  `TestSchema_FailedRetryableOutcomeAlreadySupportedByCheckConstraint`
+  prove this is tested, not merely asserted in prose. Migration history
+  (`migrations/0001_*`, `migrations/0002_*`) is untouched.
+- Structured logs for every event this phase's design requires observable:
+  retry scheduled (with attempt number and computed `eligible_at`),
+  permanent failure, retries exhausted, and dead-letter transition
+  (`internal/worker`) — no payload contents are ever logged.
+
+### Not implemented yet
+
+- Idempotency-Key submission support (Phase 4).
+- Scheduling delay, cancellation, and a real `execution_timeout` distinct
+  from lease TTL (Phase 6).
+- Workflow/DAG execution (Phase 7), full metrics/tracing observability
+  (Phase 8), sustained chaos/load testing (Phase 5/9).
+- Per-job-type backoff configuration — [docs/retry-semantics.md](docs/retry-semantics.md)
+  and [docs/roadmap.md](docs/roadmap.md) both name this an explicitly
+  deferred open question; v1 has exactly one, global `retry.Config` per
+  worker (`Worker.SetRetryConfig`), not a per-`job_type` override.
+  Production callers use the documented v1 defaults
+  (`retry.DefaultConfig()`: 1s base delay, 300s cap) unless they construct
+  a `Worker` with different values.
+  In-process `Worker.SetRetryConfig`/`SetRandSource` overrides exist
+  primarily so tests can use a fast, deterministic backoff window; there is
+  no environment-variable or API surface for tuning this yet.
+- A standalone, periodic background sweeper process. Phase 2's Lazy
+  Dead-Letter Sweep (runs inside every `Claim` call, before the claim
+  query itself) already keeps `attempt_count <= max_attempts` true on the
+  reclaim path (TF-INV-006); [docs/architecture.md](docs/architecture.md)
+  and [docs/roadmap.md](docs/roadmap.md) both describe a periodic sweeper
+  as an optional promptness *optimization*, not a correctness requirement
+  — building one was deliberately out of this phase's scope (see
+  "Explicit Phase 4+ deferrals" implications below; this is really a
+  Phase-3-optional item, not deferred to a numbered later phase).
+- A manual `POST /jobs/{id}/retry` (DLQ replay) endpoint — documented as a
+  deferred endpoint in [docs/worker-protocol.md](docs/worker-protocol.md)
+  and not required by Phase 3's scope; a `DEAD_LETTERED` job remains
+  terminal with no automatic or manual-via-API path back to execution in
+  this codebase today.
+- Handler panics are not caught, classified, or retried specially — an
+  unrecovered panic during handler execution crashes the worker process
+  exactly as it did in Phase 1/2, which degrades to an ordinary crash (F1/F2:
+  the lease expires, and Phase 2's existing reclaim mechanism — not the new
+  `RETRY_WAIT` path — picks the job back up under a new generation). No
+  authoritative doc specifies catching handler panics, so Phase 3
+  deliberately does not add a `recover()` that would turn a panic into a
+  classified retryable/permanent outcome.
+
+### How to run a retry demonstration
+
+```sh
+docker compose up -d
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &
+go run ./cmd/worker &
+
+# demo.flaky (registered in cmd/worker) reports a retryable failure on
+# every attempt before attempt_count reaches 3, then succeeds. A short
+# execution_timeout_seconds is irrelevant here (this handler returns
+# immediately); the interesting part is the delay BETWEEN attempts, which
+# is real, computed backoff -- not a fixed retry interval.
+curl -X POST localhost:8080/jobs \
+  -d '{"job_type":"demo.flaky","payload":{},"max_attempts":5}'
+
+# Poll -- the state cycles QUEUED -> RUNNING -> RETRY_WAIT -> RUNNING ->
+# RETRY_WAIT -> RUNNING -> SUCCEEDED, attempt_count reaching 3 at success.
+# eligible_at on each RETRY_WAIT response shows exactly when the next
+# attempt becomes claimable (base delay 1s, so this completes in a few
+# seconds total).
+curl localhost:8080/jobs/<id-from-above>
+```
+
+To see exhaustion instead, submit with `"max_attempts":2` (fewer than
+`demo.flaky`'s built-in 3-attempt failure threshold): the job reaches
+`DEAD_LETTERED` after its 2nd attempt, with `last_error`/`last_error_class`
+(`"RETRYABLE"`) populated from that final attempt — `GET /jobs/{id}` never
+needs a separate endpoint to see this; the existing response fields already
+carry it.
+
+### How to inspect attempt history
+
+There is still no `GET /jobs/{id}/history` endpoint (deliberately deferred,
+per [docs/worker-protocol.md](docs/worker-protocol.md) "Deferred
+Endpoints" — unchanged by Phase 3). Inspect `job_attempts` directly against
+the database for now:
+
+```sh
+psql "$TASKFORGE_DATABASE_URL" -c \
+  "SELECT attempt_number, lease_generation, worker_id, started_at, finished_at, outcome, error_class, error_message
+   FROM job_attempts WHERE job_id = '<id>' ORDER BY attempt_number;"
+```
+
+Every attempt — including ones superseded by reclaim (`LEASE_EXPIRED`) and
+ones that failed retryably before an eventual success or dead-letter — is
+preserved and queryable, even after the job reaches a terminal state
+(TF-INV-007, TF-INV-009).
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+```
+
+Same PostgreSQL requirement and `-p 1` constraint as Phase 1/2. New in
+Phase 3: `internal/retry/backoff_test.go` (pure unit tests, no database at
+all) and `internal/store/retry_test.go` /
+`internal/worker/retry_test.go` (real PostgreSQL integration tests,
+including a randomized property test and several adversarial
+stale-generation/rollback scenarios) — all part of the normal suite, no
+extra tooling or command required.
+
+### Phase 3 guarantees
+
+- **TF-INV-006** (retry attempts respect configured limits), now proven on
+  the *explicit failure-report* path (Phase 2 only proved it on the
+  reclaim/sweep path): `TestCompleteRetryableFailure_SF010_ExhaustionTransitionsToDeadLettered`,
+  `TestCompleteRetryableFailure_ExhaustionExactlyAtMaxAttemptsBoundary`
+  (the `max_attempts=1` boundary — exhaustion on the very first failure),
+  and `TestProperty_AttemptCountNeverExceedsMaxAttempts` (a randomized
+  property test across many `max_attempts` values and failure sequences,
+  per [docs/roadmap.md](docs/roadmap.md)'s Phase 3 quality gate).
+- **TF-INV-007** (attempt history durable and monotonic), extended to
+  `FAILED_RETRYABLE` outcomes: `TestCompleteRetryableFailure_SF009_EventuallySucceeds`,
+  `TestCompleteRetryableFailure_SF010_ExhaustionTransitionsToDeadLettered`
+  (all `job_attempts` rows present, in order, after dead-lettering).
+- **TF-INV-009** (dead-lettering preserves failure history), now proven for
+  exhaustion-driven dead-lettering specifically (Phase 1/2 only proved it
+  for the unconditional/permanent path):
+  `TestCompleteRetryableFailure_AttemptOutcomeAndErrorClassRecorded` (the
+  job-level `last_error_class = 'RETRYABLE'` even though exhaustion, not
+  permanence, caused the dead-letter — the exact documented distinction
+  from `CompleteFailure`'s `'PERMANENT'`).
+- **TF-INV-003 / TF-INV-014**, extended to the new retry/dead-letter
+  transition: `TestCompleteRetryableFailure_RejectsStaleGeneration`,
+  `TestCompleteRetryableFailure_RejectsWrongOwner`,
+  `TestCompleteRetryableFailure_RejectedAfterReclaim` (the SF-008 shape,
+  now for a retryable-failure report), `TestCompleteFailure_PermanentRejectedAfterReclaim`
+  (same, for a permanent failure), and the worker-loop-level
+  `TestRunOnce_RetryableFailureRejectedAfterLeaseLoss`.
+- **TF-INV-011**'s mechanism (eligibility evaluated by PostgreSQL's own
+  clock, never a worker's), applied to `RETRY_WAIT`:
+  `TestClaim_RetryWaitNotClaimableBeforeEligibility`,
+  `TestClaim_RetryWaitClaimableAfterEligibility`.
+- **TF-INV-002**, extended to concurrent claims of an eligible `RETRY_WAIT`
+  job: `TestClaim_ConcurrentWorkersRaceForEligibleRetryWaitJob` (the SF-006
+  shape, replayed from `RETRY_WAIT`), `TestClaim_MultipleWorkersOnlyOneWinsOnceEligible`.
+- **TF-INV-013**, extended to the retry transition's two-statement
+  transaction: `TestRetryTransition_RollbackLeavesJobAndAttemptConsistent`
+  (forces a rollback between the job-row UPDATE and the `job_attempts`
+  finalize UPDATE, asserts both rows are left completely unchanged).
+- **TF-INV-004**, proven unaffected by the new retry machinery:
+  `TestClaim_ReclaimStillWorksAfterPriorRetryCycle` (Phase 2's lease-expiry
+  reclaim still works correctly on the second and later attempt of a job
+  that has already been through one `RETRY_WAIT` cycle) and
+  `TestRetryWait_SurvivesFreshStoreInstance` (a `RETRY_WAIT` job's backoff
+  window survives a simulated full process restart — no in-memory retry
+  timer is ever the source of truth).
+- Backoff correctness itself, independent of any database:
+  `TestRawDelay_MatchesDocumentedFormula`, `TestRawDelay_CappedAtMaxBackoff`,
+  `TestRawDelay_OverflowSafeAtExtremeAttempts` (adversarial case #12),
+  `TestEqualJitter_BoundsAndDeterminism`, `TestConfig_Validate`.
+
+### Phase 3 limitations (explicit, not hidden)
+
+- **Still no submission idempotency, cancellation, scheduling delay, or
+  workflow execution** — unchanged from Phase 1/2, see "Not implemented
+  yet" above.
+- **No per-job-type backoff configuration.** One global `retry.Config` per
+  worker process; see "Not implemented yet" above.
+- **No manual DLQ replay.** A `DEAD_LETTERED` job is genuinely terminal in
+  this codebase — the only documented path back to execution
+  ([docs/execution-semantics.md](docs/execution-semantics.md),
+  [docs/worker-protocol.md](docs/worker-protocol.md)) is submitting a
+  **new** job that references the old one, and even that is not wired up
+  as an API endpoint yet.
+- **No concurrency hardening at scale** — unchanged from Phase 2; Phase 3's
+  new concurrency tests use the same small, fixed worker/job counts
+  Phase 2's did, for the same reason (sustained-load hardening is Phase 5).
+- **The at-least-once duplicate-side-effect window is unchanged, not
+  widened.** A `RETRY_WAIT`-driven retry re-invokes the handler exactly
+  like a Phase 2 reclaim-driven retry does — [ADR-0003](docs/adr/0003-at-least-once-execution-not-exactly-once.md)'s
+  limitation (a crash after a side effect but before acknowledgement may
+  cause that side effect to run again) applies identically whether the
+  next attempt arrives via reclaim or via backed-off `RETRY_WAIT`. Phase 3
+  does not change, worsen, or fix this — idempotency primitives for
+  handlers remain Phase 4 scope.
+- **No production readiness claim of any kind.**
+
+### Proposed maturity label
+
+[docs/roadmap.md](docs/roadmap.md) sets Phase 3's maturity as "Hardening"
+on completion. Every invariant and scenario Phase 3's roadmap entry
+requires (TF-INV-006, TF-INV-007, TF-INV-009; SF-009, SF-010) has passing,
+deterministic test coverage today — including the specific "property test
+confirming `attempt_count` never exceeds `max_attempts` across randomized
+failure sequences" the roadmap's quality gate names explicitly — and the
+full suite (`go test -race -p 1 ./...`) was run repeatedly (3+ consecutive
+local runs) without a flake during this phase's implementation. But exactly
+as Phase 2's own section above explains, "Hardening" per
+[docs/roadmap.md](docs/roadmap.md)'s Maturity Labels definition requires
+surviving **repeated CI runs** of this project's actual pipeline over time
+— which, like Phase 2, has not yet happened for this code (not yet merged
+or pushed). This README therefore keeps the overall project status at
+**Experimental** for now, consistent with how Phase 2 was handled;
+promotion to Hardening is a mechanical follow-up once CI has run this suite
+repeatedly post-merge, not a judgment call made preemptively here.
 
 ## Documentation Map
 

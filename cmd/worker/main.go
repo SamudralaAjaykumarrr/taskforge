@@ -37,6 +37,27 @@ func (h echoHandler) Execute(_ context.Context, j *job.Job) (handler.Result, err
 	return handler.Result{}, nil
 }
 
+// flakyHandler is a Phase 3 demonstration handler: it reports a retryable
+// failure on every attempt strictly before j.AttemptCount reaches its
+// FailUntilAttempt threshold, then succeeds. It performs no real external
+// side effect. Registered under demo.flaky so
+// "How to demonstrate retries" in README.md has a concrete, runnable
+// example beyond demo.echo's always-succeeds path.
+type flakyHandler struct {
+	logger           *slog.Logger
+	failUntilAttempt int
+}
+
+func (h flakyHandler) Execute(_ context.Context, j *job.Job) (handler.Result, error) {
+	if j.AttemptCount < h.failUntilAttempt {
+		h.logger.Info("demo.flaky executing: reporting retryable failure",
+			"job_id", j.ID.String(), "attempt_count", j.AttemptCount, "fail_until_attempt", h.failUntilAttempt)
+		return handler.Result{}, handler.Retryable(fmt.Errorf("demo.flaky: simulated transient failure on attempt %d", j.AttemptCount))
+	}
+	h.logger.Info("demo.flaky executing: succeeding", "job_id", j.ID.String(), "attempt_count", j.AttemptCount)
+	return handler.Result{}, nil
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -69,6 +90,7 @@ func run(logger *slog.Logger) error {
 
 	registry := handler.NewRegistry()
 	registry.Register("demo.echo", echoHandler{logger: logger})
+	registry.Register("demo.flaky", flakyHandler{logger: logger, failUntilAttempt: 3})
 
 	workerID := fmt.Sprintf("worker-%d-%s", os.Getpid(), hostname())
 	w := worker.New(workerID, store.New(db), registry, cfg.WorkerPollInterval, logger)
