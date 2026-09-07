@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+.env.local
+
+# Build outputs
+bin/
+dist/
+*.exe
+
+# Test / coverage
+coverage.out
+*.coverprofile
+
+# Temporary files
+tmp/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

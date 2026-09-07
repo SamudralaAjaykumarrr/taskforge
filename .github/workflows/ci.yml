@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: taskforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TASKFORGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/taskforge_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # -p 1 runs one package's test binary at a time. This is required
+      # here (not just a style choice): every package's integration tests
+      # share the single Postgres service container above via
+      # TASKFORGE_TEST_DATABASE_URL, all against the same `jobs` table, so
+      # concurrent package test binaries would truncate/mutate that table
+      # out from under each other. See docs/testing-strategy.md and
+      # internal/testutil.
+      - name: go test
+        run: go test -p 1 ./...
+
+      - name: go test -race
+        run: go test -race -p 1 ./...

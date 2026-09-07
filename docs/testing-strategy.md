@@ -2,8 +2,43 @@
 
 Status: foundational. This is the verification plan for every invariant in
 [invariants.md](invariants.md). No invariant is considered credible without
-a corresponding entry here mapping to an executable test, even though no
-tests exist yet at this architecture-foundation stage.
+a corresponding entry here mapping to an executable test.
+
+## Phase 1 Implementation Status
+
+As of Phase 1 ([roadmap.md](roadmap.md)), the following test categories
+below have real, passing, executable tests — everything else in this
+document remains the verification *plan* for later phases, not yet built:
+
+- **Unit tests** (request validation): `internal/api/handlers_validation_test.go`.
+- **State-machine table tests**: `internal/jobstate/state_test.go` — the
+  full 6×6 matrix, not just Phase 1's subset.
+- **PostgreSQL integration tests**: `internal/store/store_test.go`,
+  `internal/worker/worker_test.go`, `internal/api/handlers_integration_test.go`,
+  `internal/migrate/migrate_test.go` — all against a real PostgreSQL
+  instance per `internal/testutil` (embedded-postgres locally, or a real
+  service container in CI via `TASKFORGE_TEST_DATABASE_URL`), never a mock.
+- **Fault-injection tests** (TF-INV-013 only):
+  `TestFaultInjection_RollbackLeavesRowUnchanged` in
+  `internal/store/store_test.go`.
+- **Process restart tests** (an early, minimal version of SF-018 only —
+  the exact scope [roadmap.md](roadmap.md) requires for Phase 1):
+  `TestRestart_RunningJobSurvivesFreshStoreInstance` in
+  `internal/store/store_test.go`.
+
+**Not yet implemented**: property-based tests, fuzz tests, concurrency
+tests with real concurrent workers, lease-expiration tests, stale-worker
+fencing under genuine concurrency (only the single-worker fencing
+*mechanism* is tested — see the invariant-to-test matrix note below), retry
+tests, race tests, load tests, chaos tests. These require Phase 2+
+functionality (multiple workers, leases, retries) that does not exist yet.
+
+The invariant-to-test matrix below is the full, multi-phase plan and is
+**not** rewritten for Phase 1 — see
+[docs/roadmap.md](roadmap.md)'s Phase 1 section for exactly which
+invariants (TF-INV-001, TF-INV-005 trivially, TF-INV-013) Phase 1 is
+responsible for proving, and README.md's "Phase 1 guarantees" section for
+which of this matrix's scenarios have a passing Phase 1 test today.
 
 ## Test Categories
 

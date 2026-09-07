@@ -1,11 +1,14 @@
 # TaskForge
 
-**Status: ARCHITECTURE FOUNDATION.** No application code exists yet. This
-repository currently contains only design documentation: a precise state
-machine, a numbered list of system invariants, a failure model, a full
-scenario corpus, and architecture decision records. Nothing described below
-has been implemented, benchmarked, or deployed. Treat every claim in this
-README as a design target, not a demonstrated capability.
+**Status: Experimental (Phase 1 — Single-Node Durable Job Engine complete).**
+Phase 1 of [docs/roadmap.md](docs/roadmap.md) is implemented: a durable
+PostgreSQL-backed job engine with HTTP submission, a single synchronous
+worker, and the `QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> DEAD_LETTERED`
+subset of the documented state machine. It is **not** distributed, has no
+crash recovery, and does not implement retries, cancellation, scheduling, or
+idempotency keys yet — see "Phase 1: What's Implemented" below for the exact
+boundary. Everything else described in this README past that section remains
+a design target for later phases, not a demonstrated capability.
 
 ## The Problem
 
@@ -77,21 +80,149 @@ reviewers have something falsifiable to check it against.
 | Area | Status |
 |---|---|
 | Architecture & invariant documentation | **Done** (this repository, current state) |
-| PostgreSQL schema | Not started |
-| API server | Not started |
-| Worker / claim / lease protocol | Not started |
-| Retry / backoff / DLQ | Not started |
-| Idempotency enforcement | Not started |
+| PostgreSQL schema | **Phase 1 done** (`jobs` table per data-model.md; `job_attempts` deferred to Phase 2) |
+| API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only) |
+| Worker / claim / lease protocol | **Phase 1 subset done** (single synchronous worker, no lease expiration/reclaim, no fencing under real concurrency — see Phase 1 limitations below) |
+| Retry / backoff / DLQ | Not started (Phase 1 sends every failure straight to `DEAD_LETTERED`, no `RETRY_WAIT`) |
+| Idempotency enforcement | Not started (schema constraint exists; no `Idempotency-Key` API support) |
 | Scheduling | Not started |
 | Cancellation / timeouts | Not started |
 | Workflow / DAG execution | Not started (staged for a later phase) |
-| Observability | Not started |
-| Test suite (unit/integration/concurrency/chaos) | Not started |
+| Observability | Not started (structured logs only) |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 1 subset done**: unit, state-machine table, and PostgreSQL integration tests exist; concurrency/chaos tests are Phase 2+ |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
 hardening and v1.0), including required invariants, required tests, and
 completion criteria for each phase.
+
+## Phase 1: What's Implemented
+
+### Implemented now
+
+- A `jobs` table (see [docs/data-model.md](docs/data-model.md)), created by
+  the migration in `migrations/`. `job_attempts` is **not** created yet —
+  deferred to Phase 2, per [docs/roadmap.md](docs/roadmap.md)'s explicit
+  allowance ("no `job_attempts` yet ... `job_attempts` table introduced
+  here if not already in Phase 1").
+- `POST /jobs` and `GET /jobs/{id}` (`internal/api`). No other endpoint
+  exists — no cancellation, idempotency keys, scheduling, or history
+  endpoint yet.
+- A single, synchronous worker process (`cmd/worker`, `internal/worker`)
+  that claims one eligible job at a time, runs a registered `Handler`
+  (`internal/handler`), and reports success or failure.
+- The state machine subset `QUEUED -> RUNNING -> SUCCEEDED` and
+  `RUNNING -> DEAD_LETTERED` on any failure (no `RETRY_WAIT`), per
+  [docs/roadmap.md](docs/roadmap.md)'s Phase 1 scope. The full state
+  machine's legality table (`internal/jobstate`) is implemented and
+  exhaustively tested now, even though the database operations
+  (`internal/store`) only ever drive the Phase 1 subset of it.
+- Fenced completion (`lease_owner`/`lease_generation`/`state='RUNNING'`
+  guard clauses, per [docs/worker-protocol.md](docs/worker-protocol.md)),
+  wired from the start so Phase 2 does not need a schema or query-shape
+  migration — but see "Phase 1 limitations" below for what this does and
+  does not prove yet.
+
+### Not implemented yet
+
+- Multiple concurrent workers, lease expiration, and reclaim (Phase 2).
+- Retry/backoff and real dead-letter classification (Phase 3) — Phase 1
+  sends every failure straight to `DEAD_LETTERED`.
+- Idempotency-Key submission support (Phase 4) — the database unique
+  constraint exists, but no API surface uses it yet.
+- Scheduling, cancellation, and execution timeouts (Phase 6).
+- Workflow/DAG execution (Phase 7), observability (Phase 8), chaos/load
+  testing (Phase 9).
+
+### How to run locally
+
+```sh
+docker compose up -d          # starts PostgreSQL on localhost:5432
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &            # HTTP API on :8080
+go run ./cmd/worker &         # single worker process
+curl -X POST localhost:8080/jobs \
+  -d '{"job_type":"demo.echo","payload":{"hello":"world"}}'
+curl localhost:8080/jobs/<id-from-above>
+```
+
+`cmd/worker` registers one demonstration handler, `demo.echo`, which logs
+its payload and always succeeds — useful for manual smoke testing, not a
+real job type.
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+```
+
+Integration tests need a real PostgreSQL instance
+([docs/testing-strategy.md](docs/testing-strategy.md) requires this — no
+mocked driver). Two ways to provide one:
+
+- Set `TASKFORGE_TEST_DATABASE_URL` (e.g. to the `docker compose up -d`
+  instance above, or a CI service container).
+- Leave it unset: tests start a real, temporary PostgreSQL server via
+  [`embedded-postgres`](https://github.com/fergusstrange/embedded-postgres)
+  automatically (no Docker or root required) — this is how the test suite
+  runs in this project's own sandboxed development environment, where
+  Docker was not available.
+
+`-p 1` is required, not a style preference: every package's integration
+tests share one PostgreSQL instance, so their test binaries must not run
+concurrently (see `internal/testutil` and
+[docs/testing-strategy.md](docs/testing-strategy.md)).
+
+### Phase 1 guarantees
+
+- **TF-INV-001** (accepted jobs cannot disappear): `POST /jobs` returns
+  2xx if and only if the INSERT has committed (`internal/store.Insert` is
+  a single statement/transaction; see
+  `TestCreateJob_AcknowledgementImpliesDurableCommit`,
+  `TestInsert_ReturnsCommittedRow`).
+- **TF-INV-005** (terminal states never reopen), proven two ways: (a) the
+  full state-transition legality table is exhaustively tested
+  (`internal/jobstate`, all 36 `(from, to)` pairs); (b) database-backed,
+  for the states Phase 1 actually reaches
+  (`TestTerminalStates_RejectFurtherTransitions` for `SUCCEEDED` and
+  `DEAD_LETTERED`).
+- **TF-INV-013** (rollback never leaves a half-transitioned job): every
+  transition is one SQL statement or one transaction; proven by forcing a
+  mid-transaction constraint violation and asserting the row is unchanged
+  (`TestFaultInjection_RollbackLeavesRowUnchanged`).
+- A restarted process observes only durable state — no in-memory state is
+  correctness-relevant (`TestRestart_RunningJobSurvivesFreshStoreInstance`,
+  an early/minimal version of SF-018).
+- The fencing *mechanism* (lease_owner/lease_generation guard clauses)
+  correctly rejects a stale credential
+  (`TestCompleteSuccess_RejectsWrongLeaseGeneration`,
+  `TestCompleteSuccess_RejectsWrongLeaseOwner`) — see limitations below for
+  what this does not yet prove.
+
+### Phase 1 limitations (explicit, not hidden)
+
+- **No crash recovery.** If the worker process crashes between claiming a
+  job and reporting its outcome, the job is stuck `RUNNING` forever —
+  there is no lease expiration or reclaim mechanism yet. This is an
+  explicitly accepted Phase 1 limitation per
+  [docs/roadmap.md](docs/roadmap.md) ("job then requires manual
+  re-submission at this phase, since reclaim doesn't exist yet"), closed
+  in Phase 2.
+- **No proof of concurrent-worker safety.** Only one worker process should
+  run against a database in Phase 1. The fencing guard clauses are wired
+  and tested against a *stale credential*, but TF-INV-002/003/014's real
+  claim is about *concurrent* workers racing — that proof (SF-006, SF-008)
+  is Phase 2 scope, run against a real second worker.
+- **No retries.** Any handler error dead-letters the job immediately, per
+  [docs/roadmap.md](docs/roadmap.md)'s Phase 1 simplification. Retry
+  budgets, backoff, and real dead-letter classification are Phase 3.
+- **No duplicate-submission protection.** The `(job_type, idempotency_key)`
+  unique constraint exists in the schema, but `POST /jobs` does not accept
+  an `Idempotency-Key` yet.
+- **No production readiness claim of any kind** — single instance,
+  single worker, no observability beyond structured logs, no
+  authentication.
 
 ## Documentation Map
 
@@ -116,7 +247,8 @@ completion criteria for each phase.
 
 ## Technology Direction
 
-- **Go** as the implementation language (not yet written).
+- **Go** as the implementation language (Phase 1 implemented; see
+  `go.mod`).
 - **PostgreSQL** as the sole durable source of truth — no additional
   infrastructure (Kafka, Redis, Kubernetes-specific tooling) unless a
   documented limitation of this design genuinely requires it. See

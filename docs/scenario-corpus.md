@@ -11,6 +11,43 @@ matrix).
 Format per scenario: **Initial state**, **Actions**, **Fault** (if any),
 **Expected durable state**, **Invariants proved**.
 
+## Phase 1 Implementation Status
+
+Only the following scenarios are executable as of Phase 1
+([roadmap.md](roadmap.md)); every other scenario below remains a
+specification for a later phase, not yet built:
+
+- **SF-001** (Normal success) — `TestRunOnce_SF001_NormalSuccess` in
+  `internal/worker/worker_test.go`, exactly as specified: submit, claim,
+  handler succeeds, `SUCCEEDED` with `attempt_count = 1`.
+- **SF-014** (Database failure during transition) — a *simplified,
+  single-worker* analogue only, per [roadmap.md](roadmap.md)'s explicit
+  Phase 1 allowance ("fault-injection test for TF-INV-013 ... simplified
+  to the single-worker case"):
+  `TestFaultInjection_RollbackLeavesRowUnchanged` in
+  `internal/store/store_test.go`. It proves the row is byte-for-byte
+  unchanged after a forced mid-transaction failure; it does not exercise
+  SF-014's exact "completion call, connection severed" shape.
+- **SF-015** (Terminal state cannot reopen) — a partial version:
+  `internal/jobstate`'s table tests exhaustively cover the full state
+  machine (all three terminal states, every attempted outbound
+  transition), and `TestTerminalStates_RejectFurtherTransitions` in
+  `internal/store/store_test.go` proves it at the database level for the
+  two terminal states Phase 1 actually reaches (`SUCCEEDED`,
+  `DEAD_LETTERED`) — `CANCELLED` is not reachable until Phase 6.
+- **SF-018** (Process restart with outstanding jobs) — a minimal version,
+  per [roadmap.md](roadmap.md)'s explicit Phase 1 quality gate ("an early,
+  minimal version of SF-018"), covering the `RUNNING` case only (no
+  `QUEUED`/`RETRY_WAIT` fleet restart, no full-process restart — a fresh
+  `*store.Store` stands in for "no in-memory state"):
+  `TestRestart_RunningJobSurvivesFreshStoreInstance` in
+  `internal/store/store_test.go`.
+
+SF-002, SF-003, SF-006, SF-007, SF-008 (all require either multiple
+concurrent workers or lease expiration/reclaim), SF-004, SF-005, SF-009
+through SF-013, SF-016, and SF-017 are **not** executable yet — they
+require Phase 2+ functionality this codebase does not implement.
+
 ---
 
 ### SF-001 — Normal success
