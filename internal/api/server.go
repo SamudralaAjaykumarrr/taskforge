@@ -1,8 +1,9 @@
-// Package api implements Phase 1's HTTP surface: POST /jobs and
-// GET /jobs/{id}, per docs/worker-protocol.md "API Contract (Job
-// Submission and Query)". No other endpoint exists yet — cancellation,
-// idempotency keys, scheduling, and history are later-phase surface per
-// docs/roadmap.md and are intentionally not exposed here.
+// Package api implements the HTTP surface: POST /jobs and GET /jobs/{id},
+// per docs/worker-protocol.md "API Contract (Job Submission and Query)".
+// No other endpoint exists yet — cancellation, scheduling, and history are
+// later-phase surface per docs/roadmap.md and are intentionally not
+// exposed here. Phase 4 added optional Idempotency-Key support to
+// POST /jobs (docs/idempotency.md); no other endpoint changed.
 package api
 
 import (
@@ -17,7 +18,7 @@ import (
 
 // JobStore is the persistence contract this package depends on.
 type JobStore interface {
-	Insert(ctx context.Context, p job.NewParams) (*job.Job, error)
+	InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job, bool, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*job.Job, error)
 }
 
@@ -29,6 +30,14 @@ type JobStore interface {
 const (
 	DefaultMaxAttempts             = 5
 	DefaultExecutionTimeoutSeconds = 30
+
+	// MaxIdempotencyKeyLength bounds the optional Idempotency-Key request
+	// header. docs/data-model.md places no length limit on the
+	// idempotency_key column itself (plain TEXT); this bound is a Phase 4
+	// API-layer choice, matching job_type's existing 255-character bound,
+	// not a documented TaskForge contract -- see
+	// docs/idempotency.md "Implementation Notes."
+	MaxIdempotencyKeyLength = 255
 )
 
 // Handlers holds the dependencies for the job HTTP endpoints.

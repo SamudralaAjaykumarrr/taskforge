@@ -125,6 +125,51 @@ reclaim), a `TF-INV-013` fault-injection test for the new transition, and a
 randomized property test asserting `attempt_count` never exceeds
 `max_attempts` (`TestProperty_AttemptCountNeverExceedsMaxAttempts`).
 
+The following scenarios are executable as of Phase 4 ("Idempotency",
+[roadmap.md](roadmap.md)):
+
+- **SF-005** (Duplicate submission, same idempotency key) — store level:
+  `TestInsertIdempotent_ConcurrentDuplicateSubmissions_SF005` in
+  `internal/store/idempotency_test.go` (60 real goroutines, real pooled
+  PostgreSQL connections, identical `(job_type, idempotency_key)` —
+  exactly one job row, every caller observes the same `job_id`, per this
+  scenario's exact quality-gate wording, "50+ simultaneous duplicate-key
+  submissions"). Full HTTP-boundary level:
+  `TestCreateJob_IdempotencyKey_ConcurrentDuplicates_ExactlyOneJobCreated`
+  in `internal/api/handlers_integration_test.go`. The sequential variant
+  (submit, response lost, client retries) is
+  `TestInsertIdempotent_SequentialDuplicate_ReturnsExistingJob` /
+  `TestCreateJob_IdempotencyKey_SequentialDuplicateReturnsSameJob`.
+- **SF-004** (Worker crashes after side effect, before acknowledgement) —
+  now fully executable, both halves: the duplication-happens half is
+  `TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice` in
+  `internal/worker/idempotency_test.go` (a non-idempotent side-effect
+  double is invoked twice across a forced reclaim, exactly this
+  scenario's Initial-state/Actions/Fault sequence); the companion
+  "handler using a `job_id`-keyed idempotency token avoids the duplicate
+  logical effect" half is
+  `TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+  in the same file (identical crash sequence, but the side effect goes
+  through a `job_id`-keyed dedup table, ending with exactly one durable
+  effect row despite two handler invocations).
+
+Phase 4 also adds direct coverage of the scope note in SF-005's own
+definition (`(job_type, idempotency_key)`) and of the execution-side
+identity SF-004's companion half depends on:
+`TestInsertIdempotent_DifferentJobTypeSameKey_CreatesSeparateJobs`,
+`TestInsertIdempotent_ConflictingPayloadSameKey_FirstWriteWins` (the
+documented [idempotency.md](idempotency.md) Open Questions decision),
+`TestInsertIdempotent_DuplicateSubmissionAfterDeadLetter_ReturnsExistingJob`
+(adversarial case #10), `TestInsertIdempotent_SurvivesFreshStoreInstance`
+/ `TestCreateJob_IdempotencyKey_ProcessRestartThenDuplicateReturnsExistingJob`
+(restart durability), `TestInsertIdempotent_RollbackLeavesNoPartialIdempotencyState`
+(adversarial case #2 — moot by construction here since `idempotency_key`
+is a column on the `jobs` row itself, never a separate mapping table, but
+proved rather than only asserted), and
+`TestIdempotencyIdentity_JobIDStableAcrossReclaim` /
+`TestIdempotencyIdentity_JobIDStableAcrossRetry` (adversarial cases #7/#8
+— `job_id` unchanged across a retry or a reclaim).
+
 ---
 
 ### SF-001 — Normal success

@@ -136,3 +136,48 @@ handler cooperates" is wrong and should be corrected on sight — see
   undecided; v1 has no expiry, meaning a key is bound to its job row
   forever (rows are never deleted). This is acceptable at v1 scale and
   revisited if storage growth becomes a concern.
+
+## Implementation Notes (Phase 4)
+
+These are Phase 4 API-layer decisions this document did not previously
+pin down. They are implementation choices, not new correctness contracts —
+nothing here changes TF-INV-008/TF-INV-016 or the semantics above.
+
+- **Header name**: `Idempotency-Key` (`internal/api`'s
+  `idempotencyKeyHeader`), read case-insensitively per HTTP header
+  semantics.
+- **Empty/whitespace-only header**: treated as "no key supplied," not a
+  validation error — operationally indistinguishable from a caller who did
+  not mean to send one. Each such submission creates its own job, exactly
+  as if the header were omitted entirely.
+- **Maximum length**: 255 characters (`api.MaxIdempotencyKeyLength`),
+  matching `job_type`'s existing bound. A longer value is rejected with
+  `400 Bad Request` before any database call — the `idempotency_key`
+  column itself is unbounded `TEXT` (see [data-model.md](data-model.md));
+  this cap exists only to keep the key comparable/loggable at the API
+  layer, not because the schema requires it.
+- **Duplicate submission after a terminal state**: resubmitting the same
+  key after the job it maps to has reached `SUCCEEDED`, `CANCELLED`, or
+  `DEAD_LETTERED` still returns that job's current (terminal)
+  representation — never a new job, and never an attempt to reopen the
+  terminal row (TF-INV-005 is untouched: `InsertIdempotent` only ever
+  performs an `INSERT` or a plain read, never an `UPDATE`).
+- **How to demonstrate duplicate submission**: see
+  `internal/store/idempotency_test.go`'s
+  `TestInsertIdempotent_ConcurrentDuplicateSubmissions_SF005` (50+
+  concurrent duplicate-key submissions, store level) and
+  `internal/api/handlers_integration_test.go`'s
+  `TestCreateJob_IdempotencyKey_ConcurrentDuplicates_ExactlyOneJobCreated`
+  (same proof at the real HTTP boundary) and
+  `TestCreateJob_IdempotencyKey_SequentialDuplicateReturnsSameJob` (the
+  "submit, response lost, retry" case).
+- **How to demonstrate exactly-once logical effect**: see
+  `internal/worker/idempotency_test.go`'s
+  `TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice` (the
+  limitation, made concrete and executable) paired with
+  `TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+  (the same crash sequence, but the handler's effect is deduplicated via a
+  `job_id`-keyed table) — the exact "at-least-once execution + application
+  idempotency = exactly-once logical effect" argument made in this
+  document's "Execution / Side-Effect Idempotency" section above, proved
+  rather than only asserted.
