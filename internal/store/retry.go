@@ -160,6 +160,20 @@ func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leas
 		return nil, fmt.Errorf("store: complete retryable outcome: record attempt outcome: %w", err)
 	}
 
+	// Phase 7: propagate only when this attempt's outcome exhausted the
+	// retry budget and landed on DEAD_LETTERED -- a RETRY_WAIT outcome is
+	// explicitly NOT a terminal/failure event for dependency-propagation
+	// purposes (docs/workflows.md: "Still RETRY_WAIT/RUNNING (retrying):
+	// Dependents remain non-eligible; no propagation occurs until the
+	// predecessor reaches a terminal state. A retrying predecessor is not
+	// treated as failed."). A no-op for an ordinary standalone job either
+	// way.
+	if j.State == jobstate.DeadLettered {
+		if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered); err != nil {
+			return nil, fmt.Errorf("store: complete retryable outcome: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete retryable outcome: commit: %w", err)
 	}

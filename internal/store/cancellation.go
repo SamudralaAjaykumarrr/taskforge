@@ -73,7 +73,13 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, jobstate.RetryWait, jobstate.Cancelled)
 	}
 
-	j, err := scanTransitionResult(ctx, s.db, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: cancel queued/retry_wait job: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
+
+	j, err := scanTransitionResult(ctx, tx, `
 		UPDATE jobs
 		SET state = 'CANCELLED',
 			terminal_at = now(),
@@ -85,6 +91,21 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: cancel queued/retry_wait job: %w", err)
+	}
+
+	// Phase 7: a QUEUED/RETRY_WAIT job may be a workflow node -- including
+	// a dependency-blocked node, which is QUEUED by construction (see
+	// internal/store/workflow.go's blockedEligibleAt) -- so a direct
+	// cancellation here must propagate exactly like any other route to
+	// CANCELLED (docs/workflows.md's Failure Propagation table treats
+	// CANCELLED the same as DEAD_LETTERED regardless of which API path
+	// produced it). A no-op for an ordinary standalone job.
+	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled); err != nil {
+		return nil, fmt.Errorf("store: cancel queued/retry_wait job: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: cancel queued/retry_wait job: commit: %w", err)
 	}
 	return j, nil
 }
@@ -188,6 +209,13 @@ func (s *Store) CompleteCancelled(ctx context.Context, id uuid.UUID, leaseOwner 
 
 	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeCancelled, "", ""); err != nil {
 		return nil, fmt.Errorf("store: complete cancelled: record attempt outcome: %w", err)
+	}
+
+	// Phase 7: a cancelled workflow node's dependents are cancelled by
+	// default, exactly like a dead-lettered one -- a no-op for an
+	// ordinary standalone job.
+	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled); err != nil {
+		return nil, fmt.Errorf("store: complete cancelled: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

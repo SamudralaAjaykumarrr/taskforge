@@ -1,9 +1,12 @@
 # Workflows / DAG Execution
 
-Status: **staged for Phase 7** (see [roadmap.md](roadmap.md)). This document
-records the target design now so that v1's schema and job primitives do not
-foreclose it, but no workflow code or table exists yet. Treat this as a
-design contract for a future phase, not a current capability.
+Status: **implemented (Phase 7)**, per [roadmap.md](roadmap.md). This
+document originally recorded the target design ahead of implementation;
+it now also records the exact mechanism Phase 7 built, including the two
+points the original draft explicitly left open ("exact mechanism to be
+finalized during Phase 7 implementation"). See README.md's "Phase 7: What's
+Implemented" section for the full implementation summary, test list, and
+current maturity label.
 
 ## Why Workflows Are Not Part of v1 Core
 
@@ -50,20 +53,49 @@ eligible only when **all** required predecessors satisfy this condition —
 AND semantics by default. OR/any-of fan-in semantics are deferred past the
 initial workflow implementation (tracked as an open question below).
 
-Mechanically: a node's underlying job is inserted in a non-eligible holding
-state (`eligible_at` set far in the future, or a dedicated gating column —
-exact mechanism to be finalized during Phase 7 implementation) at workflow
-submission time. When a predecessor's job reaches a terminal state, a
-trigger (application-level, evaluated in the same transaction as the
-predecessor's completion, or a polling check — to be decided in Phase 7)
-re-evaluates each dependent node's readiness and, if all its dependencies
-are now satisfied, sets its `eligible_at = now()`, making it a normal
-claimable job through the existing claim query. **No new claiming mechanism
-is introduced for workflow nodes** — they become ordinary `QUEUED` jobs
-once eligible, reusing every guarantee already built for standalone jobs.
+Mechanically (as implemented — this resolves the open question below):
+a node's underlying job is inserted with `eligible_at` set to a fixed,
+concrete far-future sentinel timestamp (`9999-12-31T23:59:59Z`; see
+`internal/store/workflow.go`'s `blockedEligibleAt` and migration
+`0003`'s comment) if it has one or more dependencies, or immediately
+eligible (`eligible_at = COALESCE(scheduled_at, now())`, exactly like an
+ordinary job) if it is a root node with none. PostgreSQL's special
+`infinity` timestamptz value was considered and rejected — it is not
+reliably representable as a Go `time.Time` through the pgx driver this
+codebase uses, so a concrete sentinel was chosen instead; the effect for
+correctness purposes is identical (the row is simply never selected by
+the claim query's `eligible_at <= now()` predicate).
 
-This directly implements TF-INV-012 (documented now, enforced starting
-Phase 7).
+Propagation is application-level, evaluated inside the SAME transaction
+as the predecessor's own completion/cancellation/dead-letter transition
+(`internal/store/workflow.go`'s `propagateWorkflowTransition`, called from
+`CompleteSuccess`, `CompleteFailure`, the retry-exhaustion branch of
+`completeRetryableOutcome`, `CompleteCancelled`,
+`CancelQueuedOrRetryWait`, and the Lazy Dead-Letter Sweep) — not a
+separate polling sweep, resolving this document's other open question in
+favor of transactional correctness over the "everything is a query
+predicate, no service" simplicity a polling approach would have offered.
+A predecessor reaching `SUCCEEDED` re-evaluates each direct dependent's
+readiness and, if every one of its dependencies is now satisfied, advances
+its `eligible_at` off the sentinel to `COALESCE(scheduled_at, now())`,
+making it a normal claimable job through the existing, completely
+unmodified claim query. **No new claiming mechanism is introduced for
+workflow nodes** — they become ordinary `QUEUED` jobs once eligible,
+reusing every guarantee already built for standalone jobs (leasing,
+fencing, retries, DLQ, cancellation, scheduling).
+
+Concurrent fan-in (two predecessors of the same dependent completing at
+the same instant) is resolved by row-locking the dependent's job
+(`SELECT ... FOR UPDATE`) before re-evaluating its predecessors: whichever
+of the two completing transactions acquires that lock second is
+guaranteed to see the other's already-committed terminal state, so
+exactly one of the two performs the activation. See
+`internal/store/workflow.go`'s `resolveDependent` doc comment for the
+precise argument, and `internal/store/workflow_test.go`'s
+`TestConcurrentFanIn_BothPredecessorsCompleteSimultaneously` for the test
+that exercises it with two real, concurrently-committing goroutines.
+
+This directly implements TF-INV-012.
 
 ## Failure Propagation
 
@@ -87,7 +119,25 @@ underlying job via the same `POST /jobs/{id}/cancel` semantics
 ([worker-protocol.md](worker-protocol.md)) — a workflow cancellation is
 implemented as "cancel all of my currently-non-terminal jobs," not as a new
 primitive. The same TF-INV-010 race rule applies independently to each
-node.
+node. `POST /workflows/{id}/cancel` (`internal/store.CancelWorkflow`) is
+the concrete implementation: it durably records
+`workflow_instances.cancel_requested = true` (idempotent, no-op if the
+workflow is already terminal), then calls `CancelQueuedOrRetryWait` for
+every node currently `QUEUED`/`RETRY_WAIT` (this includes a
+dependency-blocked node — it is `QUEUED` by construction, gated only by
+`eligible_at`) and `RequestCancellation` for every node currently
+`RUNNING`. A `RUNNING` node's cancellation is requested, not yet
+confirmed, exactly like a standalone job — the caller polls
+`GET /workflows/{id}` to observe the eventual outcome.
+
+`workflow_instances.cancel_requested` exists specifically to distinguish
+an explicit workflow-level cancellation from a workflow that reaches
+`FAILED` organically via failure propagation (a dead-lettered node
+cascade-cancelling its dependents also drives every affected node through
+the same job-level `CANCELLED` state) — the workflow's own terminal state
+is `CANCELLED` only when `cancel_requested` was set, `FAILED` otherwise,
+once every node has reached a terminal job state
+(`internal/store.finalizeWorkflowIfComplete`).
 
 ## Fan-Out / Fan-In
 
@@ -108,22 +158,98 @@ node X efficiently at scale"). This is recorded as an explicit,
 revisitable simplification — if workflow use cases grow to need efficient
 graph traversal queries in SQL, an edge table is the natural evolution.
 
+## API Contract
+
+Per [worker-protocol.md](worker-protocol.md)'s "Deferred Endpoints"
+section naming this Phase 7's scope:
+
+- `POST /workflows` — submit a full `GraphSpec` (every node and its
+  `depends_on` list, keyed by a caller-chosen `node_key` string rather
+  than a server-generated ID, since dependencies must reference sibling
+  nodes before any database identifiers exist). Per-node fields
+  (`job_type`, `payload`, `max_attempts`, `execution_timeout_seconds`,
+  `scheduled_at`) mirror `POST /jobs`'s own fields and defaults exactly.
+  A 201 response is returned if and only if the entire workflow (instance
+  + every node's job + every node's dependency edges) has committed
+  atomically; an invalid graph (see "DAG Validation" below) is rejected
+  with 400 before any database write. There is no `Idempotency-Key`
+  equivalent for workflow submission — see "Open Questions."
+- `GET /workflows/{id}` — the current durable workflow-level state plus
+  every node's current job state, freshly joined on every call (never
+  cached). 404 if the workflow does not exist.
+- `POST /workflows/{id}/cancel` — see "Workflow-Level Cancellation" above.
+  200 with the workflow's current representation whether or not every
+  node's cancellation has been confirmed yet; 404 if the workflow does not
+  exist.
+
+Every ordinary job endpoint (`POST /jobs`, `GET /jobs/{id}`,
+`POST /jobs/{id}/cancel`) is unchanged and fully usable against a workflow
+node's underlying job directly — a workflow node is an ordinary job row,
+not a distinct kind of resource with restricted visibility.
+
+## DAG Validation
+
+`internal/workflow.ValidateGraph` rejects, entirely in memory and before
+any SQL is issued (so an invalid submission is never partially persisted
+and never acknowledged): an empty node list; a missing or duplicate
+`node_key`; a missing `job_type`; a `depends_on` entry referencing an
+unknown `node_key`, the node's own key (self-dependency), or the same
+key twice; and any directed cycle (detected via a deterministic
+three-color depth-first search in submission order, so the same invalid
+graph always reports the same cycle). `internal/store.CreateWorkflow`
+calls this before opening its transaction — see "Atomic Workflow
+Creation" below.
+
+## Atomic Workflow Creation
+
+`internal/store.CreateWorkflow` creates the `workflow_instances` row,
+every node's underlying `jobs` row, and every `workflow_nodes` row inside
+one PostgreSQL transaction. A failure partway through (a constraint
+violation, a cancelled context, a dropped connection) rolls back the
+entire transaction, leaving no partial workflow, no orphaned job rows,
+and no dangling dependency edges — see
+`internal/store/workflow_test.go`'s
+`TestCreateWorkflow_RollbackLeavesNoPartialState` for the fault-injection
+test proving this directly.
+
 ## Cross-References
 
 - Invariant: TF-INV-012 in [invariants.md](invariants.md)
-- Deferred schema: [data-model.md](data-model.md)
+- Schema: [data-model.md](data-model.md)'s `workflow_instances` /
+  `workflow_nodes` tables
 - Roadmap staging: [roadmap.md](roadmap.md) Phase 7
+- Scenario corpus: [scenario-corpus.md](scenario-corpus.md)'s Phase 7
+  section (SF-019 through SF-030)
 
 ## Open Questions
+
+Resolved by the Phase 7 implementation (see "Dependency Satisfaction
+Semantics" and "Why an Array Column Instead of an Edge Table" above):
+
+- ~~Exact mechanism for "re-evaluate dependents when a predecessor
+  completes"~~ — resolved in favor of an in-transaction propagation step
+  (`internal/store/workflow.go`'s `propagateWorkflowTransition`), not a
+  polling sweep, so a predecessor's completion and its dependents'
+  activation/cascade are part of one atomic commit.
+- ~~`eligible_at` sentinel vs. a dedicated gating column~~ — resolved in
+  favor of a concrete far-future `eligible_at` sentinel value
+  (`blockedEligibleAt`), not PostgreSQL's `infinity` timestamptz (not
+  reliably representable as a Go `time.Time` via this codebase's pgx
+  driver) and not a new column (which would have required a claim-query
+  change this design specifically avoids).
+
+Still deferred, not designed — explicit Phase 8+ non-goals per
+[roadmap.md](roadmap.md)'s Phase 7 entry:
 
 - OR/any-of fan-in semantics: deferred, not designed.
 - Compensation/rollback edges (run B if A fails): deferred, not designed.
 - Dynamic workflow modification (adding nodes to a running workflow):
   deferred, not designed. v1-of-workflows assumes the full DAG is known at
-  submission time.
-- Exact mechanism for "re-evaluate dependents when a predecessor
-  completes" (trigger inside the completion transaction vs. a separate
-  polling sweep) is unresolved and will be decided during Phase 7
-  implementation, weighing transactional complexity against the
-  "everything is a query predicate, no service" philosophy established in
-  [scheduling.md](scheduling.md).
+  submission time, and `internal/store.CreateWorkflow` provides no
+  mechanism to add nodes to an already-created workflow_instance.
+- Workflow submission idempotency (an `Idempotency-Key`-equivalent for
+  `POST /workflows`): not designed or implemented — this document never
+  established a workflow-level idempotency contract, and Phase 7
+  deliberately does not invent one; a caller that needs safe retry of
+  workflow submission must handle deduplication at the caller's own
+  layer for now.

@@ -169,11 +169,13 @@ func DB(t *testing.T) *sql.DB {
 	if err := migrate.Up(ctx, db); err != nil {
 		t.Fatalf("testutil: run migrations: %v", err)
 	}
-	// job_attempts references jobs via a foreign key, so it must be
-	// truncated in the same statement (or first) — TRUNCATE jobs alone
-	// fails once that constraint exists (Phase 2, migration 0002).
-	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE job_attempts, jobs`); err != nil {
-		t.Fatalf("testutil: truncate jobs/job_attempts tables: %v", err)
+	// job_attempts and workflow_nodes both reference jobs via a foreign
+	// key (migrations 0002 and 0003), and workflow_nodes also references
+	// workflow_instances — all four must be truncated in the same
+	// statement (or in dependency order) — TRUNCATE jobs alone fails once
+	// these constraints exist.
+	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs`); err != nil {
+		t.Fatalf("testutil: truncate tables: %v", err)
 	}
 
 	return db

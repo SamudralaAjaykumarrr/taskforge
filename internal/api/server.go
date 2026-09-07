@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
 // JobStore is the persistence contract this package depends on.
@@ -28,6 +29,15 @@ type JobStore interface {
 	// contract and internal/store/cancellation.go.
 	CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job.Job, error)
 	RequestCancellation(ctx context.Context, id uuid.UUID) (*job.Job, error)
+	// CreateWorkflow, GetWorkflow, and CancelWorkflow were added in Phase
+	// 7 — see docs/workflows.md and internal/store/workflow.go. Kept on
+	// the same interface as the job methods (rather than a separate
+	// WorkflowStore) since *store.Store already implements both and
+	// Handlers has no reason to depend on two interfaces for one
+	// underlying store.
+	CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*workflow.Instance, error)
+	GetWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error)
+	CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error)
 }
 
 // Default values applied when a submission omits them. docs/data-model.md
@@ -69,5 +79,9 @@ func NewRouter(h *Handlers) *http.ServeMux {
 	mux.HandleFunc("POST /jobs", h.CreateJob)
 	mux.HandleFunc("GET /jobs/{id}", h.GetJob)
 	mux.HandleFunc("POST /jobs/{id}/cancel", h.CancelJob)
+	// Phase 7 — see docs/workflows.md and internal/api/workflow_handlers.go.
+	mux.HandleFunc("POST /workflows", h.CreateWorkflow)
+	mux.HandleFunc("GET /workflows/{id}", h.GetWorkflow)
+	mux.HandleFunc("POST /workflows/{id}/cancel", h.CancelWorkflow)
 	return mux
 }
