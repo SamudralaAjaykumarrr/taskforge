@@ -1,12 +1,13 @@
 # TaskForge
 
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
-Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, and Phase 4 —
-Idempotency — all complete; see "Proposed maturity label" under "Phase 4:
-What's Implemented" below for why this README does not yet promote to
-Hardening despite [docs/roadmap.md](docs/roadmap.md) naming Hardening as
-Phase 4's on-completion label).**
-Phases 1 through 4 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, Phase 4 —
+Idempotency, and Phase 5 — Concurrency Hardening — all complete; see
+"Proposed maturity label" under "Phase 5: What's Implemented" below for why
+this README does not yet promote to Stable despite
+[docs/roadmap.md](docs/roadmap.md) naming Stable as Phase 5's
+on-completion label).**
+Phases 1 through 5 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication), multiple concurrent
 worker processes, fenced lease-based ownership with heartbeat renewal,
@@ -14,21 +15,26 @@ automatic crash recovery via lease expiration/reclaim, and the full
 `QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> RETRY_WAIT -> RUNNING` /
 `RUNNING -> DEAD_LETTERED` subset of the documented state machine, with real
 durable exponential backoff and retryable-vs-permanent failure
-classification (`CANCELLED` remains out of reach until Phase 6). It is
-**not** distributed beyond a single PostgreSQL instance, and does not
-implement cancellation, scheduling delay, or workflow execution yet — see
-"Phase 1: What's Implemented" through "Phase 4: What's Implemented" below
-for the exact boundary. Everything else described in this README past those
-sections remains a design target for later phases, not a demonstrated
-capability. TaskForge guarantees **at-least-once** execution, never
-exactly-once for arbitrary external side effects — see "Phase 2 guarantees"
-below for the specific, tested duplicate-side-effect window that phase
-closes and the one it deliberately leaves open (retries, including Phase
-3's new backed-off `RETRY_WAIT` retries, are exactly this same
-at-least-once mechanism, not a new exposure); see "Phase 4 guarantees"
+classification (`CANCELLED` remains out of reach until Phase 6), now
+re-verified under sustained multi-worker contention rather than only small,
+hand-crafted two/three-worker scenarios — see "Phase 5: What's Implemented"
+below. It is **not** distributed beyond a single PostgreSQL instance, and
+does not implement cancellation, scheduling delay, or workflow execution
+yet — see "Phase 1: What's Implemented" through "Phase 5: What's
+Implemented" below for the exact boundary. Everything else described in
+this README past those sections remains a design target for later phases,
+not a demonstrated capability. TaskForge guarantees **at-least-once**
+execution, never exactly-once for arbitrary external side effects — see
+"Phase 2 guarantees" below for the specific, tested duplicate-side-effect
+window that phase closes and the one it deliberately leaves open (retries,
+including Phase 3's new backed-off `RETRY_WAIT` retries, are exactly this
+same at-least-once mechanism, not a new exposure); see "Phase 4 guarantees"
 below for how a handler achieves exactly-once **logical effects** on top of
 that at-least-once model, without TaskForge ever claiming exactly-once
-execution itself.
+execution itself. Phase 5 does not change any of these guarantees — it adds
+no new capability, per its explicit non-goal — it only proves the existing
+ones continue to hold under tens of concurrent workers and sustained,
+repeated, randomized-crash contention rather than just isolated scenarios.
 
 ## The Problem
 
@@ -84,9 +90,11 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
   worker that loses its lease cannot retroactively complete the job, even
   arbitrarily late (TF-INV-002, TF-INV-003, TF-INV-014). **Proven (Phase
   2) — including under real concurrent workers, not just the stale-credential
-  mechanism.**
+  mechanism; re-proven under sustained tens-of-workers/hundreds-of-jobs
+  contention and repeated randomized crash injection (Phase 5).**
 - Automatic crash recovery via lease expiration — no permanently stranded
-  jobs (TF-INV-004). **Proven (Phase 2).**
+  jobs (TF-INV-004). **Proven (Phase 2); re-proven under sustained
+  concurrent reclaim pressure (Phase 5).**
 - Heartbeat renewal without transferring or shortening a lease
   (TF-INV-015). **Proven (Phase 2).**
 - Durable, monotonic retry history with configurable backoff and dead-letter
@@ -117,14 +125,15 @@ falsifiable to check it against.
 | Architecture & invariant documentation | **Done** (this repository, current state) |
 | PostgreSQL schema | **Phase 2 done, still sufficient for Phase 3** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`. Phase 3 required **no new migration** — see "Phase 3: What's Implemented" below) |
 | API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only — unchanged through Phase 3, per each phase's non-goal of API expansion; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status) |
-| Worker / claim / lease protocol | **Phase 2 done**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism) — see "Phase 2: What's Implemented" below |
+| Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism) — see "Phase 2: What's Implemented" and "Phase 5: What's Implemented" below |
 | Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
 | Idempotency enforcement | **Phase 4 done**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below |
+| Concurrency hardening | **Phase 5 done**: tens-of-workers/hundreds-of-jobs claim/reclaim/fencing/retry stress suites against real PostgreSQL, a connection-pool-constrained claim test, and a repeated-seed randomized crash/retry/success simulation — no new product code required, since Phase 1–4's short-transaction, fenced-lease design already satisfied every property tested; see "Phase 5: What's Implemented" below |
 | Scheduling | Not started |
 | Cancellation / timeouts | Not started (lease TTL bounds a stuck attempt, but there is no `execution_timeout` classification distinct from lease expiry yet, and no cancellation endpoint) |
 | Workflow / DAG execution | Not started (staged for a later phase) |
 | Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, and new/duplicate idempotent submission are all logged — see "Phase 2", "Phase 3: What's Implemented", and "Phase 4: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 4 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races) now exist; sustained-load chaos testing remains Phase 5/9 |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 5 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races) at small scale (Phase 1–4) now extended with tens-of-workers/hundreds-of-jobs stress variants, a constrained-connection-pool test, and a repeated-seed randomized crash-injection simulation (Phase 5); sustained multi-hour chaos/load testing remains Phase 9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -1012,6 +1021,285 @@ surviving **repeated CI runs** of this project's actual pipeline over time
 merged or pushed). This README therefore keeps the overall project status
 at **Experimental** for now, consistent with how Phase 2/3 were handled;
 promotion to Hardening is a mechanical follow-up once CI has run this
+suite repeatedly post-merge, not a judgment call made preemptively here.
+
+## Phase 5: What's Implemented
+
+Phase 5 ([docs/roadmap.md](docs/roadmap.md) "Concurrency Hardening") is
+explicitly a proving phase, not a feature phase: its non-goal is "New
+features — this phase is about proving Phase 1–4 guarantees hold under
+load and adversarial timing, not adding capability." Consistent with that,
+**no product code changed in this phase** — `internal/store` and
+`internal/worker` are byte-for-byte what Phase 4 left them. What Phase 5
+adds is two new test files exercising the existing claim/lease/retry/
+idempotency mechanisms under real, sustained, multi-worker PostgreSQL
+contention at a scale Phase 1–4's tests (small, hand-crafted two/three-
+worker scenarios) did not attempt.
+
+### Implemented now
+
+- **Store-level stress suite** (`internal/store/concurrency_stress_test.go`):
+  - `TestStress_SF006_ManyWorkersManyJobs_NoDoubleClaimNoGenerationReuse` —
+    25 workers, 300 jobs, all released from one barrier so first-claim
+    attempts genuinely overlap.
+  - `TestStress_ManyWorkersRaceForOneJob` — 20 workers race a single job
+    (adversarial case "N workers race for one job").
+  - `TestStress_ClaimContention_JobToWorkerRatios` — fewer jobs than
+    workers, more jobs than workers, and a roughly-equal case, table-driven.
+  - `TestStress_SF007_SustainedConcurrentReclaimOfManyExpiredLeases` — 120
+    jobs claimed and abandoned (simulated crash), all leases force-expired
+    at once, 20 workers reclaim concurrently.
+  - `TestStress_SF008_FencingHoldsUnderSustainedConcurrentCompletionAttempts`
+    — 40 jobs each advanced through 4 generations; every stale generation's
+    completion call and the one legitimate completion call are fired
+    concurrently, all at once, for every job simultaneously (~160
+    concurrent completion attempts against a connection-pool-bounded
+    `*sql.DB`).
+  - `TestStress_ConcurrentWorkersRaceForManyEligibleRetryWaitJobs` — 60
+    `RETRY_WAIT` jobs become eligible simultaneously (DB-time
+    fast-forwarded, never a sleep), 15 workers race for them.
+  - `TestStress_ConcurrentClaimPressureWithTerminalJobsPresent` — 80
+    already-terminal jobs (with adversarially long-expired lease
+    timestamps left on the row) sit alongside 80 genuinely claimable jobs
+    under 20-worker claim pressure; no terminal job is ever claimed.
+  - `TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter`
+    — 60 attempt-exhausted, lease-expired jobs swept concurrently by 15
+    claimers; proves the Lazy Dead-Letter Sweep's lack of `SKIP LOCKED`
+    (see "Concurrency model and locking strategy" below) causes lock
+    waiting, not errors, deadlocks, or double dead-lettering.
+  - `TestStress_ClaimProgressesUnderConstrainedConnectionPool` — 15 worker
+    goroutines draining 60 jobs against a `*sql.DB` deliberately capped at
+    3 open connections; proves claim/complete's single-short-transaction
+    design degrades to queuing under pool pressure, never deadlock.
+  - `TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold` —
+    a bounded, round-based, deterministically-synchronized simulation (5
+    fixed seeds, 80 jobs, 12 workers/round, up to 30 rounds) where each
+    claimed job is randomly resolved as success, retryable failure, or a
+    simulated crash (abandoned, then force-expired for the next round);
+    every seed's run is checked for full convergence to a terminal state,
+    `attempt_count <= max_attempts`, gapless/monotonic `job_attempts`
+    history, and strictly increasing `lease_generation` per job.
+- **Worker-loop-level stress suite** (`internal/worker/concurrency_stress_test.go`):
+  - `TestStress_ManyWorkersProcessLargeMixedJobPool` — 20 real
+    `*worker.Worker` instances against 200 jobs with a realistic outcome
+    mix (always-succeed, retry-then-succeed, always-permanently-fail);
+    asserts exactly-once execution, correct terminal state per job, and
+    `job_attempts` row counts matching `attempt_count` for every job.
+  - `TestStress_ManyConcurrentLeaseLossRaces_NoStaleAuthoritativeCompletions`
+    — 15 jobs each held open by a first wave of workers; all 15 leases
+    force-expired and reclaimed concurrently by a second wave, which
+    completes all 15 concurrently; only then are the first wave's handlers
+    released to finish and attempt their (now-stale) completions — the
+    worker-loop-level, many-jobs-at-once generalization of
+    `TestRunOnce_LeaseLostDuringExecution_SkipsCompletion`.
+  - `TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`
+    — a 10-worker pool is shut down (context cancelled) while every worker
+    is mid-execution and heartbeating; proves no heartbeat goroutine leaks,
+    no worker fabricates a completion it lost the authority to make, every
+    job is left cleanly `RUNNING` under its original lease (not corrupted),
+    and every one of those jobs is still fully recoverable afterward via
+    the normal lease-expiry/reclaim path.
+- Every test above uses explicit synchronization (start barriers,
+  `sync.WaitGroup`, DB-time manipulation via the existing
+  `forceExpireLease`/`forceSetEligibleAt` helpers) — never a sleep-based
+  race — per [docs/testing-strategy.md](docs/testing-strategy.md)'s
+  determinism requirement.
+- **Transaction-boundary audit** (no code change; confirms an existing
+  property): every `internal/store` write remains a single short
+  transaction (`Claim`, `CompleteSuccess`, `CompleteFailure`,
+  `CompleteRetryableFailure`, `Heartbeat`), and the job handler always runs
+  entirely outside any database transaction
+  (`internal/worker.runWithHeartbeat` — heartbeats are their own separate
+  short transactions issued while the handler runs, not nested inside a
+  claim/completion transaction). This was true since Phase 2/3; Phase 5's
+  contribution is re-confirming it under real concurrent load rather than
+  by code inspection alone — a held lock or an accidentally
+  handler-spanning transaction would have caused the stress suite above to
+  time out or deadlock, and it did not, across repeated `-race` runs.
+- **Connection-pool audit**: no `internal/store` or `internal/worker` code
+  path holds a connection across a wait for another connection or across
+  handler execution, so worker concurrency degrades to queuing (not
+  deadlock) under a connection pool smaller than the worker count — proven
+  by `TestStress_ClaimProgressesUnderConstrainedConnectionPool` and
+  exercised incidentally by capping `TestStress_SF008_...`'s pool at 50
+  connections for its ~160-way concurrent completion burst.
+- **Adversarial audit findings during this phase's own test development**
+  (both were bugs in the new *test* code, not in `internal/store` or
+  `internal/worker`; both were fixed and the fixes are what ships here):
+  - The initial randomized-chaos simulation shared one `math/rand.Rand`
+    across concurrent worker goroutines; `math/rand.Rand` is not safe for
+    concurrent use, and `go test -race` caught the resulting data race
+    immediately. Fixed by switching to `internal/retry.Rand`, the
+    mutex-guarded `RandSource` this codebase already uses for backoff
+    jitter for exactly this reason.
+  - The initial fencing-under-load test (`TestStress_SF008_...`) fired
+    ~160 concurrent completion calls against an unbounded connection pool,
+    which exceeded the test PostgreSQL instance's default
+    `max_connections` under `-count=3` repeated runs. Fixed by capping that
+    test's `*sql.DB` with `SetMaxOpenConns(50)` — a test-harness fix, not a
+    product-code change, since `internal/store` itself never assumes an
+    unbounded pool.
+
+### Not implemented yet
+
+- **No new product code or capability** — by design (Phase 5's explicit
+  non-goal); everything the store/worker packages do is unchanged from
+  Phase 4.
+- **No sustained multi-hour chaos/load harness** — Phase 5's roadmap entry
+  distinguishes "bounded, deterministic stress tests suitable for CI" (what
+  this phase built) from the dedicated, longer-running chaos/load testing
+  phase (Phase 9); this phase does not pull that forward.
+- **No fabricated throughput/latency numbers.** The stress suite proves
+  correctness under load, not performance — no benchmark claims are made
+  here (Phase 9's quality gate is explicit that such numbers are "only
+  published once actually measured").
+- **No mathematically strict fairness guarantee.** The claim query's
+  `ORDER BY priority DESC, eligible_at ASC` combined with `SKIP LOCKED`
+  gives an approximate oldest/highest-priority-first ordering under
+  contention, not a proven starvation-freedom bound; see "Fairness and
+  starvation" below for what was actually checked.
+- **Cancellation, scheduling, workflow execution** — unchanged from
+  Phase 1–4, still Phase 6/7 work.
+
+### Concurrency model and locking strategy (re-confirmed, not changed)
+
+TaskForge's claim query (see [docs/worker-protocol.md](docs/worker-protocol.md))
+uses `SELECT ... FOR UPDATE SKIP LOCKED` in its candidate subquery, so
+concurrent claimers lock disjoint rows and never block waiting on each
+other for the claim step itself — this is what Phase 5's `SF-006` stress
+variants (25 workers/300 jobs, 20 workers/1 job) confirm holds at higher
+concurrency than Phase 2's original tests exercised. The one step in the
+claim transaction that does **not** use `SKIP LOCKED` is the Lazy
+Dead-Letter Sweep (a plain `UPDATE ... WHERE state = 'RUNNING' AND
+lease_expires_at < now() AND attempt_count >= max_attempts`), which can
+cause concurrent claimers to briefly serialize on overlapping rows when
+many attempt-exhausted, lease-expired jobs exist at once.
+`TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter`
+confirms this serialization is a latency consideration, not a correctness
+one — no error, no deadlock, no double dead-lettering, across repeated
+`-race` runs — and this phase makes no code change to it, since doing so
+was not required to satisfy any TF-INV-* or SF-* requirement and would be
+unrequested scope beyond what Phase 5's roadmap entry actually asks for.
+
+### Fairness and starvation
+
+[docs/roadmap.md](docs/roadmap.md)'s Phase 5 entry asks to "verify
+contention behavior under `SKIP LOCKED` at higher concurrency (verifying
+no lock convoy/starvation)," not to design or prove a fairness guarantee
+TaskForge does not implement. What was checked:
+`TestStress_ConcurrentClaimPressureWithTerminalJobsPresent` and the
+job-to-worker-ratio tests confirm that a large pool of terminal or
+irrelevant rows never prevents genuinely eligible jobs from being drained
+by a concurrent worker pool, and the randomized-chaos simulation confirms
+convergence to all-terminal within a bounded number of rounds across five
+different seeds. No claim beyond that is made: TaskForge does not
+implement or prove strict FIFO fairness across priorities/ages under
+adversarial scheduling, and this is stated honestly here rather than
+implied.
+
+### How to run the Phase 5 stress suite
+
+```sh
+# The full new suite (store-level and worker-level), verbose:
+go test -p 1 -run 'TestStress' -v ./internal/store/... ./internal/worker/...
+
+# The same suite under the race detector, repeated 3x to catch flakes
+# (this is what was actually run to validate this phase — see "Phase 5
+# guarantees" below):
+go test -race -p 1 -count=3 -run 'TestStress' ./internal/store/... ./internal/worker/...
+
+# The full regression suite (Phase 1-5, everything):
+go test -p 1 ./...
+go test -race -p 1 ./...
+```
+
+### Phase 5 guarantees
+
+- **TF-INV-002** (at most one valid lease per job) and **TF-INV-014**
+  (stale generations fenced no matter how late or how many generations
+  have advanced), re-proven under sustained load:
+  `TestStress_SF006_ManyWorkersManyJobs_NoDoubleClaimNoGenerationReuse`,
+  `TestStress_ManyWorkersRaceForOneJob`,
+  `TestStress_ClaimContention_JobToWorkerRatios`,
+  `TestStress_SF008_FencingHoldsUnderSustainedConcurrentCompletionAttempts`
+  (40 jobs × 4 generations × concurrent completion attempts from every
+  generation at once).
+- **TF-INV-003** (a lost lease cannot authoritatively complete a job),
+  re-proven at the worker-loop level with many simultaneous races (not
+  just one hand-sequenced pair of workers):
+  `TestStress_ManyConcurrentLeaseLossRaces_NoStaleAuthoritativeCompletions`.
+- **TF-INV-004** (worker crashes cannot permanently strand a recoverable
+  job), re-proven under sustained concurrent reclaim pressure and repeated
+  randomized crash injection:
+  `TestStress_SF007_SustainedConcurrentReclaimOfManyExpiredLeases`,
+  `TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold`,
+  `TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`
+  (recovery after a cooperative pool shutdown, not just a hard crash).
+- **TF-INV-005/TF-INV-006/TF-INV-007/TF-INV-009** (terminal states never
+  reopen; retry limits respected; attempt history gapless/monotonic;
+  dead-lettering preserves failure history), all re-checked as end-of-run
+  invariant assertions in
+  `TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold` and
+  `TestStress_ManyWorkersProcessLargeMixedJobPool`, across many concurrently
+  processed jobs rather than one hand-picked example each.
+- **Quality gate from docs/roadmap.md** ("no job claimed twice, no stale
+  completion accepted, no job stranded, across a sustained run ... with
+  zero invariant violations"): met across this phase's full stress suite,
+  run repeatedly (`-race`, `-count=3`) with zero failures and zero
+  detected data races. The suite's cumulative scale across its ten new
+  tests spans several thousand individual claim/complete/heartbeat
+  operations against real PostgreSQL; no single test claims "thousands of
+  jobs" in isolation, since [docs/roadmap.md](docs/roadmap.md)'s "e.g.,
+  thousands of jobs, tens of workers" is stated as an illustrative scale,
+  not a literal per-test minimum, and deliberately bounded per-test sizes
+  are what keep this suite CI-suitable (per that phase's own "Load/Stress
+  Boundary" guidance to prefer deterministic bounded tests over an
+  unbounded load-test harness, which is Phase 9's job).
+- The full pre-existing Phase 1–4 regression suite remains green,
+  including under `-race`, with no test modified or weakened to
+  accommodate this phase's additions.
+
+### Phase 5 limitations (explicit, not hidden)
+
+- **No new correctness guarantee was added** — Phase 5 re-verifies
+  existing invariants under load; it does not extend TaskForge's
+  guarantees beyond what Phase 1–4 already established. TaskForge still
+  guarantees at-least-once execution, never exactly-once, exactly as
+  before.
+- **No sustained multi-hour or truly unbounded-scale chaos run** was
+  performed — that is Phase 9's explicit scope, not Phase 5's; this
+  phase's stress tests are deliberately bounded so they remain fast and
+  deterministic enough for ordinary CI, per
+  [docs/testing-strategy.md](docs/testing-strategy.md) and
+  [docs/roadmap.md](docs/roadmap.md)'s own Phase 5/Phase 9 boundary.
+- **No production connection-pool tuning guidance beyond what was
+  tested** — `cmd/api`/`cmd/worker` still open a `*sql.DB` with Go's
+  default pool settings (no `SetMaxOpenConns` call); Phase 5 proves the
+  design does not *require* a large or unbounded pool to make progress,
+  it does not prescribe a specific production pool size, which remains an
+  operational tuning question outside this phase's scope.
+- **No mathematically proven fairness/starvation bound** — see "Fairness
+  and starvation" above.
+- **Still no scheduling, cancellation, or workflow execution.**
+- **No production readiness claim of any kind.**
+
+### Proposed maturity label
+
+[docs/roadmap.md](docs/roadmap.md) sets Phase 5's maturity as "Stable (for
+the single-job-engine core)" on completion, contingent on that document's
+own quality gate: "no job claimed twice, no stale completion accepted, no
+job stranded, across a sustained run ... with zero invariant violations."
+That gate was met in this session's local runs — the full new stress suite,
+plus the full pre-existing Phase 1–4 suite, passed repeatedly
+(`go test -p 1 ./...`, then `go test -race -p 1 -count=1 ./...`, then the
+new suite specifically under `-race -count=3`) with zero failures and zero
+detected races. But exactly as Phase 2/3/4's own sections explain,
+[docs/roadmap.md](docs/roadmap.md)'s Maturity Labels definition requires
+surviving **repeated CI runs** of this project's actual pipeline over
+time — which, like Phase 2/3/4, has not yet happened for this code (not yet
+merged or pushed). This README therefore keeps the overall project status
+at **Experimental** for now, consistent with how every prior phase was
+handled; promotion to Stable is a mechanical follow-up once CI has run this
 suite repeatedly post-merge, not a judgment call made preemptively here.
 
 ## Documentation Map

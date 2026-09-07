@@ -170,6 +170,44 @@ proved rather than only asserted), and
 `TestIdempotencyIdentity_JobIDStableAcrossRetry` (adversarial cases #7/#8
 — `job_id` unchanged across a retry or a reclaim).
 
+The following scenarios have extended/stress variants as of Phase 5
+("Concurrency Hardening", [roadmap.md](roadmap.md)), which requires
+"extended/stress variants of SF-006, SF-007, SF-008" specifically (not new
+scenario IDs — Phase 5 adds no new named scenario, per its non-goal of
+adding capability). All variants below are in
+`internal/store/concurrency_stress_test.go` and
+`internal/worker/concurrency_stress_test.go`:
+
+- **SF-006 extended**: `TestStress_SF006_ManyWorkersManyJobs_NoDoubleClaimNoGenerationReuse`
+  (25 workers/300 jobs), `TestStress_ManyWorkersRaceForOneJob` (20 workers/1
+  job), `TestStress_ClaimContention_JobToWorkerRatios` (fewer/more/equal
+  jobs-to-workers), and `TestStress_ConcurrentClaimPressureWithTerminalJobsPresent`
+  (claim pressure with a large pool of already-terminal jobs mixed in).
+- **SF-007 extended**: `TestStress_SF007_SustainedConcurrentReclaimOfManyExpiredLeases`
+  (120 simultaneously expired leases, 20 concurrent reclaimers) and
+  `TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter`
+  (60 attempt-exhausted expired leases swept concurrently).
+- **SF-008 extended**: `TestStress_SF008_FencingHoldsUnderSustainedConcurrentCompletionAttempts`
+  (40 jobs × 4 generations, every generation's completion fired
+  concurrently) and, at the worker-loop level,
+  `TestStress_ManyConcurrentLeaseLossRaces_NoStaleAuthoritativeCompletions`
+  (15 simultaneous lease-loss races between a first and second wave of
+  real `*worker.Worker` instances).
+- Additional Phase 5 tests not named as an extension of one specific
+  scenario, but proving the same TF-INV-002/003/004/014 properties under
+  load: `TestStress_ConcurrentWorkersRaceForManyEligibleRetryWaitJobs`,
+  `TestStress_ClaimProgressesUnderConstrainedConnectionPool`,
+  `TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold`
+  (repeated/overlapping randomized crash injection across 5 seeds, the
+  specific case docs/roadmap.md's Phase 5 entry names: "repeated/
+  overlapping crashes"), `TestStress_ManyWorkersProcessLargeMixedJobPool`,
+  and `TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`.
+
+See [testing-strategy.md](testing-strategy.md)'s Phase 5 section for the
+full list with descriptions, and [README.md](../README.md)'s "Phase 5:
+What's Implemented" for how these map to invariants and what quality gate
+they satisfy.
+
 ---
 
 ### SF-001 — Normal success
