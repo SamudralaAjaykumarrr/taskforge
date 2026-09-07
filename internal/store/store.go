@@ -133,19 +133,14 @@ func scanJob(row rowScanner) (*job.Job, error) {
 // there is no partially-applied intermediate state (TF-INV-013), and
 // callers (see internal/api) must not report submission success to a
 // caller until this method returns without error (TF-INV-001).
+//
+// Insert is a thin wrapper around InsertIdempotent (see idempotency.go)
+// that discards the "created" flag: every existing caller predates Phase
+// 4 and never sets p.IdempotencyKey, so this preserves Insert's exact
+// pre-Phase-4 behavior and signature unchanged.
 func (s *Store) Insert(ctx context.Context, p job.NewParams) (*job.Job, error) {
-	id := uuid.New()
-	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds)
-		VALUES ($1, $2, $3, 'QUEUED', $4, $5)
-		RETURNING `+jobColumns,
-		id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds,
-	)
-	j, err := scanJob(row)
-	if err != nil {
-		return nil, fmt.Errorf("store: insert job: %w", err)
-	}
-	return j, nil
+	j, _, err := s.InsertIdempotent(ctx, p)
+	return j, err
 }
 
 // GetByID returns the current durable row for id. It is a plain read: no

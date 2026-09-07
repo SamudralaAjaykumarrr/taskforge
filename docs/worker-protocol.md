@@ -315,7 +315,9 @@ Semantics:
   `(job_type, idempotency_key)` already exists, the **existing** job's
   current representation is returned (not a new job), with the same 2xx
   status the original submission would have produced — see
-  [idempotency.md](idempotency.md).
+  [idempotency.md](idempotency.md), including that document's
+  "Implementation Notes (Phase 4)" for the header's exact validation rules
+  (empty-header handling, max length).
 - Response body includes the job's `id`, `state`, and `created_at`, i.e.
   enough for the caller to poll `GET /jobs/{id}` afterward.
 

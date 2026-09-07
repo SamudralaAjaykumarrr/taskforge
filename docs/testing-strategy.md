@@ -127,18 +127,51 @@ categories now have real, passing, executable tests, in
   later) attempt of a job that has already been through one `RETRY_WAIT`
   cycle.
 
+As of Phase 4 ("Idempotency"), the following additional categories now
+have real, passing, executable tests, in `internal/store/idempotency_test.go`,
+`internal/api/handlers_integration_test.go`, and
+`internal/worker/idempotency_test.go`:
+
+- **Idempotency tests** (SF-005, TF-INV-008, TF-INV-016): sequential
+  duplicate, 60-goroutine concurrent duplicate (store level) and
+  25-goroutine concurrent duplicate (full HTTP boundary), scope
+  (`job_type` isolation), the documented first-write-wins conflicting-
+  payload decision, duplicate submission after the mapped job reaches a
+  terminal state, and durability across a simulated process/API restart
+  (a fresh `*store.Store`/`*api.Handlers` sharing only the database) — see
+  [scenario-corpus.md](scenario-corpus.md)'s Phase 4 section for the full
+  test list.
+- **Fault-injection test, extended to submission idempotency**
+  (TF-INV-013): `TestInsertIdempotent_RollbackLeavesNoPartialIdempotencyState`
+  — proves a rolled-back submission leaves neither a job row nor an
+  idempotency mapping (the two cannot diverge here: `idempotency_key` is a
+  column on the `jobs` row itself, written in the same single `INSERT`
+  statement as the row it maps to, not a separate table).
+- **Execution-side idempotency identity tests** (SF-004, ADR-0004):
+  `TestIdempotencyIdentity_JobIDStableAcrossReclaim` and
+  `TestIdempotencyIdentity_JobIDStableAcrossRetry` prove `job_id` is
+  unchanged across a reclaim/retry even though `lease_generation`/
+  `attempt_count` advance. `TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice`
+  and its companion `TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+  are the exactly-once-logical-effect demonstration docs/roadmap.md's
+  Phase 4 scope requires: the same forced-reclaim crash sequence, once
+  with a non-idempotent side-effect double (duplication occurs, proving
+  TaskForge still only offers at-least-once execution) and once with a
+  `job_id`-keyed dedup table (exactly one durable effect row despite two
+  handler invocations).
+
 **Still not implemented**: fuzz tests, the cancellation race test SF-012
-(Phase 6), the scheduling test SF-013 (Phase 6), idempotency tests (Phase
-4), sustained load tests and chaos tests (Phase 5/9 — Phase 2's concurrency
-tests use small, fixed worker/job counts to prove correctness
-deterministically, not sustained/randomized load). Phase 3's optional
-background sweeper (docs/architecture.md: "an optimization, not a
-correctness dependency") was not built — the Lazy Dead-Letter Sweep
-already running inside every `Claim` call (Phase 2) remains the sole,
-sufficient mechanism for `TF-INV-006` on the reclaim path; a periodic
-out-of-band sweeper would only shrink the (already bounded) window before
-an attempt-exhausted expired lease is visible as `DEAD_LETTERED`, which no
-required invariant or scenario depends on.
+(Phase 6), the scheduling test SF-013 (Phase 6), sustained load tests and
+chaos tests (Phase 5/9 — Phase 2's concurrency tests use small, fixed
+worker/job counts to prove correctness deterministically, not
+sustained/randomized load). Phase 3's optional background sweeper
+(docs/architecture.md: "an optimization, not a correctness dependency")
+was not built — the Lazy Dead-Letter Sweep already running inside every
+`Claim` call (Phase 2) remains the sole, sufficient mechanism for
+`TF-INV-006` on the reclaim path; a periodic out-of-band sweeper would
+only shrink the (already bounded) window before an attempt-exhausted
+expired lease is visible as `DEAD_LETTERED`, which no required invariant
+or scenario depends on.
 
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1

@@ -1,31 +1,34 @@
 # TaskForge
 
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
-Worker Leases and Heartbeats, and Phase 3 — Retries, Backoff, DLQ — all
-complete; see "Proposed maturity label" under "Phase 3: What's Implemented"
-below for why this README does not yet promote to Hardening despite
-[docs/roadmap.md](docs/roadmap.md) naming Hardening as Phase 3's
-on-completion label).**
-Phases 1 through 3 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
-durable PostgreSQL-backed job engine with HTTP submission, multiple
-concurrent worker processes, fenced lease-based ownership with heartbeat
-renewal, automatic crash recovery via lease expiration/reclaim, and the full
+Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, and Phase 4 —
+Idempotency — all complete; see "Proposed maturity label" under "Phase 4:
+What's Implemented" below for why this README does not yet promote to
+Hardening despite [docs/roadmap.md](docs/roadmap.md) naming Hardening as
+Phase 4's on-completion label).**
+Phases 1 through 4 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+durable PostgreSQL-backed job engine with HTTP submission (including
+database-enforced `Idempotency-Key` deduplication), multiple concurrent
+worker processes, fenced lease-based ownership with heartbeat renewal,
+automatic crash recovery via lease expiration/reclaim, and the full
 `QUEUED -> RUNNING -> SUCCEEDED` / `RUNNING -> RETRY_WAIT -> RUNNING` /
 `RUNNING -> DEAD_LETTERED` subset of the documented state machine, with real
 durable exponential backoff and retryable-vs-permanent failure
 classification (`CANCELLED` remains out of reach until Phase 6). It is
 **not** distributed beyond a single PostgreSQL instance, and does not
-implement submission idempotency keys, cancellation, scheduling delay, or
-workflow execution yet — see "Phase 1: What's Implemented", "Phase 2: What's
-Implemented", and "Phase 3: What's Implemented" below for the exact
-boundary. Everything else described in this README past those sections
-remains a design target for later phases, not a demonstrated capability.
-TaskForge guarantees **at-least-once** execution, never exactly-once for
-arbitrary external side effects — see "Phase 2 guarantees" below for the
-specific, tested duplicate-side-effect window that phase closes and the one
-it deliberately leaves open (retries, including Phase 3's new backed-off
-`RETRY_WAIT` retries, are exactly this same at-least-once mechanism, not a
-new exposure).
+implement cancellation, scheduling delay, or workflow execution yet — see
+"Phase 1: What's Implemented" through "Phase 4: What's Implemented" below
+for the exact boundary. Everything else described in this README past those
+sections remains a design target for later phases, not a demonstrated
+capability. TaskForge guarantees **at-least-once** execution, never
+exactly-once for arbitrary external side effects — see "Phase 2 guarantees"
+below for the specific, tested duplicate-side-effect window that phase
+closes and the one it deliberately leaves open (retries, including Phase
+3's new backed-off `RETRY_WAIT` retries, are exactly this same
+at-least-once mechanism, not a new exposure); see "Phase 4 guarantees"
+below for how a handler achieves exactly-once **logical effects** on top of
+that at-least-once model, without TaskForge ever claiming exactly-once
+execution itself.
 
 ## The Problem
 
@@ -94,12 +97,16 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
   stale-generation and rollback scenarios; see "Phase 3: What's
   Implemented" below.
 - Database-enforced submission idempotency (TF-INV-008, TF-INV-016).
+  **Proven (Phase 4)** — `Idempotency-Key` deduplication is enforced by a
+  PostgreSQL unique constraint (not a check-then-act read), proven under
+  real concurrent duplicate submissions, sequential retries, and simulated
+  process restarts; see "Phase 4: What's Implemented" below.
 - Deterministic cancellation-vs-completion race semantics (TF-INV-010).
 - Scheduling that survives full process/fleet restarts (TF-INV-011).
 - (Later phase) dependency-gated workflow/DAG execution (TF-INV-012).
 
-The three bullets above with no "Proven" annotation are not implemented
-yet. They are documented now, precisely, so that implementation has an
+The two bullets above with no "Proven" annotation are not implemented yet.
+They are documented now, precisely, so that implementation has an
 unambiguous contract to satisfy and external reviewers have something
 falsifiable to check it against.
 
@@ -112,12 +119,12 @@ falsifiable to check it against.
 | API server | **Phase 1 done** (`POST /jobs`, `GET /jobs/{id}` only — unchanged through Phase 3, per each phase's non-goal of API expansion; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status) |
 | Worker / claim / lease protocol | **Phase 2 done**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism) — see "Phase 2: What's Implemented" below |
 | Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
-| Idempotency enforcement | Not started (schema constraint exists; no `Idempotency-Key` API support) |
+| Idempotency enforcement | **Phase 4 done**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below |
 | Scheduling | Not started |
 | Cancellation / timeouts | Not started (lease TTL bounds a stuck attempt, but there is no `execution_timeout` classification distinct from lease expiry yet, and no cancellation endpoint) |
 | Workflow / DAG execution | Not started (staged for a later phase) |
-| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, and permanent-failure dead-letter are all logged — see "Phase 2" and "Phase 3: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 3 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races) now exist; sustained-load chaos testing remains Phase 5/9 |
+| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, and new/duplicate idempotent submission are all logged — see "Phase 2", "Phase 3: What's Implemented", and "Phase 4: What's Implemented") |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 4 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races) now exist; sustained-load chaos testing remains Phase 5/9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -157,8 +164,9 @@ completion criteria for each phase.
   see "Phase 2: What's Implemented" below.**
 - Retry/backoff and real dead-letter classification (Phase 3) — every
   failure still goes straight to `DEAD_LETTERED`.
-- Idempotency-Key submission support (Phase 4) — the database unique
-  constraint exists, but no API surface uses it yet.
+- ~~Idempotency-Key submission support (Phase 4) — the database unique
+  constraint exists, but no API surface uses it yet.~~ **Closed in Phase
+  4** — see "Phase 4: What's Implemented" below.
 - Scheduling, cancellation, and execution timeouts (Phase 6).
 - Workflow/DAG execution (Phase 7), observability (Phase 8), chaos/load
   testing (Phase 9).
@@ -239,9 +247,10 @@ concurrently (see `internal/testutil` and
   [docs/roadmap.md](docs/roadmap.md)'s Phase 1/2 simplification (Phase 2's
   non-goals explicitly keep "failure = dead-letter"). Retry budgets,
   backoff, and real dead-letter classification are Phase 3.
-- **No duplicate-submission protection.** The `(job_type, idempotency_key)`
-  unique constraint exists in the schema, but `POST /jobs` does not accept
-  an `Idempotency-Key` yet.
+- ~~**No duplicate-submission protection.** The `(job_type,
+  idempotency_key)` unique constraint exists in the schema, but
+  `POST /jobs` does not accept an `Idempotency-Key` yet.~~ **Closed in
+  Phase 4** — see "Phase 4: What's Implemented" below.
 - **No production readiness claim of any kind** — no observability beyond
   structured logs, no authentication, no load/chaos testing yet (Phase 5/9).
 
@@ -308,7 +317,8 @@ testing.
 - Retry/backoff, `RETRY_WAIT`, and real dead-letter classification (Phase
   3) — every failure still dead-letters immediately, now correctly
   reclaimed if the crash happens before that report.
-- Idempotency-Key submission support (Phase 4).
+- ~~Idempotency-Key submission support (Phase 4).~~ **Closed in Phase 4**
+  — see "Phase 4: What's Implemented" below.
 - Scheduling delay, cancellation, and a real `execution_timeout`
   distinct from lease TTL (Phase 6) — lease expiration is the only timeout
   mechanism that exists.
@@ -436,7 +446,9 @@ suite.
   code is a cooperative contract with the handler author, not something
   TaskForge can enforce unilaterally.
 - **Still no retries, idempotency keys, scheduling, or cancellation** —
-  unchanged from Phase 1, see "Not implemented yet" above.
+  unchanged from Phase 1, see "Not implemented yet" above. (Retries:
+  closed in Phase 3. Idempotency keys: closed in Phase 4. See those
+  phases' sections below.)
 - **No concurrency hardening at scale.** Correctness under N *real*
   concurrent workers is proven (this phase's tests use 8 concurrent
   goroutines against small job pools), but sustained load with tens of
@@ -545,7 +557,8 @@ retryable-vs-permanent failure classification.
 
 ### Not implemented yet
 
-- Idempotency-Key submission support (Phase 4).
+- ~~Idempotency-Key submission support (Phase 4).~~ **Closed in Phase 4**
+  — see "Phase 4: What's Implemented" below.
 - Scheduling delay, cancellation, and a real `execution_timeout` distinct
   from lease TTL (Phase 6).
 - Workflow/DAG execution (Phase 7), full metrics/tracing observability
@@ -702,7 +715,7 @@ extra tooling or command required.
 
 - **Still no submission idempotency, cancellation, scheduling delay, or
   workflow execution** — unchanged from Phase 1/2, see "Not implemented
-  yet" above.
+  yet" above. (Submission idempotency: closed in Phase 4, see below.)
 - **No per-job-type backoff configuration.** One global `retry.Config` per
   worker process; see "Not implemented yet" above.
 - **No manual DLQ replay.** A `DEAD_LETTERED` job is genuinely terminal in
@@ -742,6 +755,264 @@ or pushed). This README therefore keeps the overall project status at
 **Experimental** for now, consistent with how Phase 2 was handled;
 promotion to Hardening is a mechanical follow-up once CI has run this suite
 repeatedly post-merge, not a judgment call made preemptively here.
+
+## Phase 4: What's Implemented
+
+**Status: Experimental**, for the same reason Phase 2 and Phase 3 are —
+see "Proposed maturity label" below.
+
+Phase 4 ([docs/roadmap.md](docs/roadmap.md) "Idempotency") makes duplicate
+*submission* provably impossible within its documented scope, and makes
+the pre-existing at-least-once *execution* limitation an executable,
+demonstrated fact rather than only a documented one — while explicitly
+proving, not just asserting, that TaskForge still does not and cannot
+guarantee exactly-once execution of arbitrary side effects.
+
+### Implemented now
+
+- **`Idempotency-Key` request header on `POST /jobs`**
+  (`internal/api.CreateJob`/`parseIdempotencyKey`): optional, read
+  case-insensitively, trimmed, and validated (empty/whitespace-only is
+  treated as "no key supplied," not an error; longer than
+  `api.MaxIdempotencyKeyLength` — 255 characters, matching `job_type`'s
+  existing bound — is rejected with `400 Bad Request`). See
+  [docs/idempotency.md](docs/idempotency.md) "Implementation Notes (Phase
+  4)" for the exact rules.
+- **`Store.InsertIdempotent`** (`internal/store/idempotency.go`): the
+  INSERT-first, no-check-then-act-read pattern [docs/idempotency.md](docs/idempotency.md)
+  and [ADR-0004](docs/adr/0004-idempotency-for-exactly-once-effects.md)
+  require — the INSERT (with `idempotency_key` set in the SAME statement
+  as the rest of the row, never a separate mapping write) is attempted
+  directly; a unique-constraint violation against
+  `idx_jobs_idempotency_key` is caught and resolved by re-reading and
+  returning the already-committed existing row, never by a preceding
+  `SELECT`. `Store.Insert` (all pre-Phase-4 callers) is now a thin wrapper
+  around this with `IdempotencyKey` left `nil`, so no existing behavior or
+  call site changed. **No new migration was required** — migration
+  0001's `idx_jobs_idempotency_key` unique index
+  (`UNIQUE (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL`)
+  was deliberately created ahead of this phase specifically so it would
+  need none, exactly as that migration's own comment says.
+- **First-write-wins, no conflict detection, per the documented v1
+  decision**: a retried submission under the same key with a *different*
+  payload is not rejected, not flagged, and does not update the existing
+  row — [docs/idempotency.md](docs/idempotency.md)'s Open Questions
+  section decided this explicitly, and Phase 4 implements exactly that
+  decision rather than inventing new conflict-detection behavior.
+- **Duplicate submission after a terminal state**: resubmitting a key
+  whose job has already reached `SUCCEEDED`/`CANCELLED`/`DEAD_LETTERED`
+  returns that job's current terminal representation — `InsertIdempotent`
+  never performs an `UPDATE`, so TF-INV-005 (terminal states never reopen)
+  is untouched by idempotency logic entirely, by construction.
+- **Execution-side idempotency identity**: no code change was needed here
+  — `job_id` (`job.Job.ID`, already passed to every `Handler.Execute`
+  call since Phase 1) and `attempt_number` (`job.Job.AttemptCount`) are
+  already TaskForge's stable identifiers per
+  [docs/idempotency.md](docs/idempotency.md). Phase 4's contribution is
+  proving `job_id` is stable across a retry and across a reclaim
+  (`internal/worker/idempotency_test.go`'s
+  `TestIdempotencyIdentity_JobIDStableAcrossRetry`/`...AcrossReclaim`) and
+  documenting/demonstrating the pattern, per
+  [docs/roadmap.md](docs/roadmap.md)'s Phase 4 scope ("building a
+  reference example job handler demonstrating the pattern").
+- **The exactly-once LOGICAL EFFECT demonstration**
+  (`internal/worker/idempotency_test.go`): a matched pair of tests
+  reconstructing SF-004's exact crash point (side effect performed,
+  worker crashes before any completion call, job reclaimed and retried).
+  `TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice` proves
+  a non-idempotent side-effect double runs twice — the documented
+  at-least-once limitation, made executable rather than only asserted.
+  `TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+  runs the identical crash sequence, but the handler's effect goes
+  through a `job_id`-keyed dedup table (the "Deduplication token table"
+  pattern from [docs/idempotency.md](docs/idempotency.md)) — the handler
+  still runs twice (asserted explicitly), but the dedup table ends with
+  exactly one row. **This is exactly-once logical effect via
+  application-level idempotency built on TaskForge's stable identity — it
+  is not, and must never be read as, a claim that TaskForge achieves
+  exactly-once execution in general.**
+- **Response body**: `GET`/`POST /jobs` responses now include
+  `idempotency_key` (omitted when absent) alongside the fields already
+  returned since Phase 1 — part of the durable row per
+  [docs/data-model.md](docs/data-model.md), useful for a caller
+  confirming what key TaskForge recorded.
+- Structured logs for the two events this phase's design requires
+  observable: `new idempotent submission` and `duplicate submission
+  detected` (`internal/api`), logged only when an `Idempotency-Key` was
+  actually supplied — no log line changes for ordinary (no-key)
+  submissions.
+
+### Not implemented yet
+
+- **Conflicting-key-reuse rejection.** Per
+  [docs/idempotency.md](docs/idempotency.md)'s Open Questions, this is a
+  deliberate v1 non-goal, not an oversight: TaskForge does not compare a
+  retried submission's payload against the original, and never reports a
+  distinct "conflict" status for a mismatched retry under the same key.
+- **Idempotency key TTL/expiry.** Undecided per
+  [docs/idempotency.md](docs/idempotency.md); a key is bound to its job
+  row forever in v1 (job rows are never deleted).
+- Scheduling delay, cancellation, and a real `execution_timeout` distinct
+  from lease TTL (Phase 6).
+- Workflow/DAG execution (Phase 7), full metrics/tracing observability
+  (Phase 8), sustained chaos/load testing (Phase 5/9).
+- Per-job-type or configurable idempotency-key validation rules (length
+  bound, empty-header handling) beyond the fixed Phase 4 defaults above —
+  not requested by any authoritative doc, so not built speculatively.
+
+### How to demonstrate duplicate submission
+
+```sh
+docker compose up -d
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &
+
+# First submission with a key: creates a job.
+curl -i -X POST localhost:8080/jobs \
+  -H 'Idempotency-Key: order-42' \
+  -d '{"job_type":"demo.echo","payload":{"order_id":42}}'
+# -> 201 Created, a fresh job id
+
+# "Response lost, client retries": the identical key, same or even a
+# DIFFERENT payload -- TaskForge returns the SAME job, not a new one.
+curl -i -X POST localhost:8080/jobs \
+  -H 'Idempotency-Key: order-42' \
+  -d '{"job_type":"demo.echo","payload":{"order_id":42,"anything":"else"}}'
+# -> 201 Created, the SAME job id as above -- no second job was created
+```
+
+Fire the second `curl` many times concurrently (or with `xargs -P`) against
+the same key to see `TestInsertIdempotent_ConcurrentDuplicateSubmissions_SF005`'s
+guarantee live: every response carries the same job id.
+
+### How to demonstrate exactly-once logical effect
+
+There is no HTTP-visible demonstration of this one (it is about a
+*handler's* internal behavior, not the API surface) — run the paired test
+directly:
+
+```sh
+go test ./internal/worker/... -run TestSF004 -v
+```
+
+`TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice` shows the
+side effect happening twice (documented at-least-once limitation);
+`TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+shows the same crash sequence ending with exactly one durable effect row,
+because the handler used `job_id` as a dedup token. Read both tests'
+comments in `internal/worker/idempotency_test.go` for the full walkthrough
+— they are also the answer to "how would I make my own handler's side
+effects idempotent," per [docs/idempotency.md](docs/idempotency.md).
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+```
+
+Same PostgreSQL requirement and `-p 1` constraint as Phase 1/2/3. New in
+Phase 4: `internal/store/idempotency_test.go` (including a 60-goroutine
+concurrency test), `internal/api/handlers_integration_test.go`'s new
+`TestCreateJob_IdempotencyKey_*` tests (including a 25-goroutine
+HTTP-boundary concurrency test), and `internal/worker/idempotency_test.go`
+— all part of the normal suite, no extra tooling or command required. The
+concurrency-sensitive new tests were run repeatedly (3+ consecutive local
+runs, plus `-race`) without a flake during this phase's implementation.
+
+### Phase 4 guarantees
+
+- **TF-INV-008** (an idempotency key never creates two logical jobs), now
+  proven under real concurrency at two layers:
+  `TestInsertIdempotent_ConcurrentDuplicateSubmissions_SF005` (60
+  goroutines, direct store calls) and
+  `TestCreateJob_IdempotencyKey_ConcurrentDuplicates_ExactlyOneJobCreated`
+  (25 goroutines, real HTTP requests through the actual router) — both
+  assert exactly one job row and that every caller observes the identical
+  `job_id`. The sequential "submit, response lost, retry" case (this
+  task's explicitly required failure case) is
+  `TestInsertIdempotent_SequentialDuplicate_ReturnsExistingJob` /
+  `TestCreateJob_IdempotencyKey_SequentialDuplicateReturnsSameJob`.
+- **TF-INV-016** (idempotency uniqueness enforced by the database, not
+  application logic): `TestSchema_IdempotencyKeyUniqueConstraint`
+  (`internal/store/store_test.go`, pre-existing since Phase 1) proves the
+  constraint itself exists; `isIdempotencyKeyViolation`
+  (`internal/store/idempotency.go`) is the only code path that ever
+  reconciles a duplicate, and it does so by inspecting the database's own
+  `23505` unique-violation error against the specific index name, never by
+  a `SELECT`-then-`INSERT` sequence that could reintroduce a TOCTOU race.
+- **TF-INV-005** (terminal states never reopen), extended to idempotency:
+  `TestInsertIdempotent_DuplicateSubmissionAfterDeadLetter_ReturnsExistingJob`
+  proves a duplicate submission against a `DEAD_LETTERED` job's key
+  returns that job's current state, never reopening or duplicating it.
+- **TF-INV-013** (rollback never leaves a half-transitioned/half-mapped
+  state), extended to submission idempotency:
+  `TestInsertIdempotent_RollbackLeavesNoPartialIdempotencyState` proves a
+  rolled-back INSERT leaves neither a job row nor an idempotency mapping
+  — by construction, since both are the same single-statement write, not
+  two writes that could diverge.
+- **Durability across restart**, extended to idempotency:
+  `TestInsertIdempotent_SurvivesFreshStoreInstance` and
+  `TestCreateJob_IdempotencyKey_ProcessRestartThenDuplicateReturnsExistingJob`
+  — a fresh `*store.Store`/`*api.Handlers`/`httptest.Server` sharing only
+  the durable database (no in-memory idempotency cache exists anywhere in
+  this codebase) still deduplicates correctly.
+- **Execution-side identity stability**, the documented mechanism behind
+  [ADR-0004](docs/adr/0004-idempotency-for-exactly-once-effects.md):
+  `TestIdempotencyIdentity_JobIDStableAcrossReclaim` and
+  `TestIdempotencyIdentity_JobIDStableAcrossRetry` prove `job_id` is
+  byte-identical across a reclaim/retry, even as `lease_generation`/
+  `attempt_count` change.
+- **The exactly-once-logical-effect argument, proven not just argued**:
+  `TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice` +
+  `TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect`
+  — see "Implemented now" above.
+- Scope isolation (`TestInsertIdempotent_DifferentJobTypeSameKey_CreatesSeparateJobs`)
+  and the documented first-write-wins decision
+  (`TestInsertIdempotent_ConflictingPayloadSameKey_FirstWriteWins`) are
+  both proven, not just described in docs.
+
+### Phase 4 limitations (explicit, not hidden)
+
+- **TaskForge still guarantees at-least-once execution, never
+  exactly-once, for arbitrary side effects.** Phase 4 does not change this
+  in any way — it only makes the boundary between "submission dedup
+  TaskForge solves completely" and "side-effect dedup the handler author
+  is responsible for" executable and explicit, per
+  [ADR-0003](docs/adr/0003-at-least-once-execution-not-exactly-once.md)
+  and [ADR-0004](docs/adr/0004-idempotency-for-exactly-once-effects.md).
+  A handler that does not use `job_id` (or an equivalent downstream
+  idempotency mechanism) can and will have its side effect performed more
+  than once under the same crash/reclaim/retry conditions Phase 2/3
+  already documented.
+- **No conflicting-payload detection or rejection** — a deliberate v1
+  decision (see "Not implemented yet" above), not a gap.
+- **No idempotency key TTL/expiry.**
+- **Still no scheduling, cancellation, or workflow execution** — unchanged
+  from Phase 1–3, see "Not implemented yet" above.
+- **No production readiness claim of any kind.**
+
+### Proposed maturity label
+
+[docs/roadmap.md](docs/roadmap.md) sets Phase 4's maturity as "Hardening"
+on completion. Every invariant and scenario Phase 4's roadmap entry
+requires (TF-INV-008, TF-INV-016; SF-005, and the "documents the
+limitation" half of SF-004) has passing, deterministic test coverage
+today — including the specific "concurrency test with 50+ simultaneous
+duplicate-key submissions consistently yields exactly one job row" quality
+gate the roadmap names explicitly (this implementation uses 60 at the
+store level and 25 at the HTTP level) — and the full suite
+(`go test -race -p 1 ./...`) was run repeatedly (3+ consecutive local
+runs, including the concurrency-sensitive new tests specifically) without
+a single flake during this phase's implementation. But exactly as Phase
+2/3's own sections explain, "Hardening" per
+[docs/roadmap.md](docs/roadmap.md)'s Maturity Labels definition requires
+surviving **repeated CI runs** of this project's actual pipeline over time
+— which, like Phase 2/3, has not yet happened for this code (not yet
+merged or pushed). This README therefore keeps the overall project status
+at **Experimental** for now, consistent with how Phase 2/3 were handled;
+promotion to Hardening is a mechanical follow-up once CI has run this
+suite repeatedly post-merge, not a judgment call made preemptively here.
 
 ## Documentation Map
 

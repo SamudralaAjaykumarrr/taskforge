@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ type jobResponse struct {
 	CreatedAt               time.Time       `json:"created_at"`
 	UpdatedAt               time.Time       `json:"updated_at"`
 	EligibleAt              time.Time       `json:"eligible_at"`
+	IdempotencyKey          *string         `json:"idempotency_key,omitempty"`
 	LastError               *string         `json:"last_error,omitempty"`
 	LastErrorClass          *string         `json:"last_error_class,omitempty"`
 	ResultMetadata          json.RawMessage `json:"result_metadata,omitempty"`
@@ -47,6 +49,7 @@ func toJobResponse(j *job.Job) jobResponse {
 		CreatedAt:               j.CreatedAt,
 		UpdatedAt:               j.UpdatedAt,
 		EligibleAt:              j.EligibleAt,
+		IdempotencyKey:          j.IdempotencyKey,
 		LastError:               j.LastError,
 		LastErrorClass:          j.LastErrorClass,
 		ResultMetadata:          j.ResultMetadata,
@@ -54,11 +57,26 @@ func toJobResponse(j *job.Job) jobResponse {
 	}
 }
 
+// idempotencyKeyHeader is the request header docs/worker-protocol.md's API
+// Contract and docs/idempotency.md document: "The client supplies an
+// Idempotency-Key header." http.Header.Get canonicalizes the name, so
+// lookups are case-insensitive regardless of how the client wrote it.
+const idempotencyKeyHeader = "Idempotency-Key"
+
 // CreateJob handles POST /jobs. Per TF-INV-001 and ADR-0006, the 201
-// response is written if and only if internal/store.Insert returns
-// successfully — which itself only happens after the INSERT transaction
-// has committed. Any error from Insert (validation already having passed)
-// results in a 5xx response and no success acknowledgement is ever sent.
+// response is written if and only if internal/store.InsertIdempotent
+// returns successfully — which itself only happens after the INSERT
+// transaction has committed (whether that INSERT created a new row or lost
+// a race and fell through to re-reading an already-committed one — either
+// way, a durable, committed row is guaranteed to exist before any response
+// is written). Any error (validation already having passed) results in a
+// 5xx response and no success acknowledgement is ever sent.
+//
+// Per docs/idempotency.md, a duplicate submission (same job_type +
+// Idempotency-Key as an existing job) returns that existing job's current
+// representation with the SAME 2xx status a fresh submission would have
+// produced — never a different status code, and never a comparison against
+// the new request's payload.
 func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 	var req createJobRequest
 	dec := json.NewDecoder(r.Body)
@@ -74,14 +92,52 @@ func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j, err := h.store.Insert(r.Context(), params)
+	idemKey, verr := parseIdempotencyKey(r.Header.Get(idempotencyKeyHeader))
+	if verr != "" {
+		writeError(w, http.StatusBadRequest, verr)
+		return
+	}
+	params.IdempotencyKey = idemKey
+
+	j, created, err := h.store.InsertIdempotent(r.Context(), params)
 	if err != nil {
 		h.logger.Error("failed to insert job", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to durably persist job")
 		return
 	}
 
+	if idemKey != nil {
+		if created {
+			h.logger.Info("new idempotent submission", "job_id", j.ID.String(), "job_type", j.JobType, "idempotency_key", *idemKey)
+		} else {
+			h.logger.Info("duplicate submission detected; returning existing job", "job_id", j.ID.String(), "job_type", j.JobType, "idempotency_key", *idemKey)
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, toJobResponse(j))
+}
+
+// parseIdempotencyKey validates the optional Idempotency-Key request
+// header per docs/idempotency.md. A missing header, or one that is empty
+// or all-whitespace after trimming, is treated as "no key supplied" — not
+// a validation error — mirroring docs/idempotency.md's "No
+// Idempotency-Key supplied: every POST /jobs call creates a new job" (an
+// empty header value is operationally indistinguishable from a caller who
+// did not mean to send one). This empty-header rule, and the
+// MaxIdempotencyKeyLength bound below, are Phase 4 implementation
+// decisions not separately specified in docs/idempotency.md — documented
+// here, in docs/idempotency.md's "Implementation Notes," and in README's
+// Phase 4 section, rather than decided silently, per the task's
+// requirement not to invent an undocumented public contract.
+func parseIdempotencyKey(raw string) (*string, string) {
+	key := strings.TrimSpace(raw)
+	if key == "" {
+		return nil, ""
+	}
+	if len(key) > MaxIdempotencyKeyLength {
+		return nil, fmt.Sprintf("Idempotency-Key must be at most %d characters", MaxIdempotencyKeyLength)
+	}
+	return &key, ""
 }
 
 func validateCreateJobRequest(req createJobRequest) (job.NewParams, string) {
