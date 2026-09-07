@@ -11,11 +11,10 @@ matrix).
 Format per scenario: **Initial state**, **Actions**, **Fault** (if any),
 **Expected durable state**, **Invariants proved**.
 
-## Phase 1 Implementation Status
+## Phase 1 & Phase 2 Implementation Status
 
-Only the following scenarios are executable as of Phase 1
-([roadmap.md](roadmap.md)); every other scenario below remains a
-specification for a later phase, not yet built:
+The following scenarios were executable as of Phase 1
+([roadmap.md](roadmap.md)):
 
 - **SF-001** (Normal success) — `TestRunOnce_SF001_NormalSuccess` in
   `internal/worker/worker_test.go`, exactly as specified: submit, claim,
@@ -27,26 +26,69 @@ specification for a later phase, not yet built:
   `TestFaultInjection_RollbackLeavesRowUnchanged` in
   `internal/store/store_test.go`. It proves the row is byte-for-byte
   unchanged after a forced mid-transaction failure; it does not exercise
-  SF-014's exact "completion call, connection severed" shape.
+  SF-014's exact "completion call, connection severed" shape. (Phase 2
+  extends this coverage to the new multi-statement claim transaction —
+  see below.)
 - **SF-015** (Terminal state cannot reopen) — a partial version:
   `internal/jobstate`'s table tests exhaustively cover the full state
   machine (all three terminal states, every attempted outbound
   transition), and `TestTerminalStates_RejectFurtherTransitions` in
   `internal/store/store_test.go` proves it at the database level for the
-  two terminal states Phase 1 actually reaches (`SUCCEEDED`,
-  `DEAD_LETTERED`) — `CANCELLED` is not reachable until Phase 6.
-- **SF-018** (Process restart with outstanding jobs) — a minimal version,
-  per [roadmap.md](roadmap.md)'s explicit Phase 1 quality gate ("an early,
-  minimal version of SF-018"), covering the `RUNNING` case only (no
-  `QUEUED`/`RETRY_WAIT` fleet restart, no full-process restart — a fresh
-  `*store.Store` stands in for "no in-memory state"):
-  `TestRestart_RunningJobSurvivesFreshStoreInstance` in
-  `internal/store/store_test.go`.
+  two terminal states Phase 1/2 actually reach (`SUCCEEDED`,
+  `DEAD_LETTERED`) — `CANCELLED` is not reachable until Phase 6. Phase 2
+  adds `TestClaim_TerminalJobNeverReclaimed`, proving the same property
+  specifically against the reclaim query (a terminal row is never
+  presented as a reclaim candidate, even with an artificially expired
+  lease).
+- **SF-018** (Process restart with outstanding jobs) — Phase 1 had a
+  minimal version covering only a `RUNNING` job with a still-valid lease
+  (`TestRestart_RunningJobSurvivesFreshStoreInstance` in
+  `internal/store/store_test.go`, renamed from its Phase 1 description
+  since its "no reclaim" assertion is now about lease validity, not a
+  missing mechanism). Phase 2 adds the scenario's actual crash-recovery
+  case — a `RUNNING` job whose lease *has* expired, reclaimed by a process
+  that never held any in-memory reference to it:
+  `TestReclaim_SurvivesFreshStoreInstance` in `internal/store/store_test.go`.
+  Full-fleet (API + all workers) restart and a `QUEUED`/`RETRY_WAIT` mix
+  remain unexercised — `RETRY_WAIT` does not exist yet (Phase 3).
 
-SF-002, SF-003, SF-006, SF-007, SF-008 (all require either multiple
-concurrent workers or lease expiration/reclaim), SF-004, SF-005, SF-009
-through SF-013, SF-016, and SF-017 are **not** executable yet — they
-require Phase 2+ functionality this codebase does not implement.
+The following scenarios are executable as of Phase 2, all in
+`internal/store/lease_test.go` unless noted:
+
+- **SF-002** (Worker crashes before execution) / **SF-003** (Worker
+  crashes during execution) — proven at the worker-loop level (not just
+  the store level) by `TestRunOnce_LeaseLostDuringExecution_SkipsCompletion`
+  in `internal/worker/lease_test.go`: a worker's claim is force-expired
+  and genuinely reclaimed by a second `Store.Claim` call while the first
+  worker's handler is still (simulated-)running, and the first worker's
+  `RunOnce` correctly detects the lost lease via heartbeat and skips
+  completion.
+- **SF-006** (Two workers race for same job) — `TestClaim_ConcurrentWorkersRaceForSameJob`:
+  N real goroutines, real pooled PostgreSQL connections, racing for a
+  shared pool of jobs; exactly one claim per job, no `lease_generation`
+  reused.
+- **SF-007** (Lease expires and job is reclaimed) — `TestClaim_ReclaimsExpiredLease`,
+  using deterministic DB-time manipulation (`forceExpireLease`) rather
+  than a sleep.
+- **SF-008** (Stale worker attempts completion after losing its lease) —
+  `TestFencing_StaleWorkerCompletionRejectedAfterReclaim` (the canonical
+  sequence), `TestFencing_StaleCompletionRejectedBeforeNewOwnerCompletes`
+  (the ordering where the stale call arrives before the new owner
+  completes), and `TestFencing_ArbitrarilyLateArrivalAcrossManyGenerations`
+  (the TF-INV-014 "3+ generations, out-of-order arrival" extension this
+  scenario's description explicitly calls for).
+- **SF-016** (Heartbeat delay) — `TestHeartbeat_ThenReclaim_ValidLeaseIsNotStolen`
+  proves a heartbeat that arrives and extends the lease is never
+  spuriously followed by a reclaim.
+- **SF-017** (Long-running job renewal) — `TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive`
+  in `internal/worker/lease_test.go`: a handler held open across several
+  real heartbeat cycles (via `testdoubles.Gated`, not a fixed sleep on the
+  assertion side) completes successfully under the same `lease_generation`
+  throughout.
+
+SF-004, SF-005, SF-009 through SF-013 are **not** executable yet — they
+require Phase 3+ functionality (retries, idempotency keys, cancellation,
+scheduling) this codebase does not implement.
 
 ---
 
