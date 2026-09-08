@@ -359,6 +359,22 @@ event sequence must produce — see
 [testing-strategy.md](testing-strategy.md)'s Phase 8 section for the full
 list.
 
+Phase 9 ("Chaos, Load, and Failure Testing", [roadmap.md](roadmap.md))
+likewise introduces no new named scenario IDs: its "Required tests" entry
+calls for "a chaos-test harness driving randomized combinations of every
+fault in failure-model.md's 'handled in v1' list," i.e. combined,
+seeded execution of the scenarios already defined above (and the
+invariants they prove), not a new corpus. Every scenario SF-001 through
+SF-030 is exercised, in combination rather than isolation, by
+`internal/chaos`'s seeded campaigns and `cmd/chaos`'s manual stress/soak
+harness — see [testing-strategy.md](testing-strategy.md)'s Phase 9
+section for the full test list and README.md's "Phase 9: What's
+Implemented" for results actually obtained. No defect found during this
+phase's implementation required a new regression scenario here — every
+one found was in the chaos test harness's own assumptions, not in
+product behavior; see README.md's "Phase 9: Defects found" for the full,
+honest account.
+
 ---
 
 ### SF-001 — Normal success

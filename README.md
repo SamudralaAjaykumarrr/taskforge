@@ -3,14 +3,19 @@
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
 Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, Phase 4 —
 Idempotency, Phase 5 — Concurrency Hardening, Phase 6 — Scheduling,
-Cancellation, Timeouts, Phase 7 — Workflow/DAG Execution, and Phase 8 —
-Observability — all complete; see "Proposed maturity label" under "Phase
-7: What's Implemented" below for why this README labels workflow/DAG
-execution Experimental even though the underlying single-job engine it is
-built on has passing coverage for Hardening/Stable-level guarantees; Phase
-8 is Stable per its own roadmap maturity label — see "Phase 8: What's
+Cancellation, Timeouts, Phase 7 — Workflow/DAG Execution, Phase 8 —
+Observability, and Phase 9 — Chaos, Load, and Failure Testing — all
+complete; see "Proposed maturity label" under "Phase 7: What's
+Implemented" below for why this README labels workflow/DAG execution
+Experimental even though the underlying single-job engine it is built on
+has passing coverage for Hardening/Stable-level guarantees; Phase 8 is
+Stable per its own roadmap maturity label — see "Phase 8: What's
 Implemented" below — since it adds no new correctness surface for that
-label to qualify).**
+label to qualify; Phase 9 is **Hardening**, not yet Stable — see "Phase 9:
+What's Implemented" below for exactly why: docs/roadmap.md's Stable bar
+for this phase requires "zero invariant violations across a multi-hour
+chaos run," and only a bounded, short manual run has actually been
+executed so far, not a multi-hour one).**
 Phases 1 through 8 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication and optional
@@ -63,7 +68,15 @@ top of every phase above, changing no correctness behavior anywhere —
 observability is diagnostic only, never authoritative; see "Phase 8:
 What's Implemented" below for the exact metric/log surface and its
 explicit non-goals (no tracing, no vendor-specific dashboards or alerting
-rules).
+rules). Phase 9 adds no new feature at all — its entire purpose is
+adversarial evidence for every guarantee claimed above, under combined,
+seeded, reproducible chaos (worker crashes, lease/fencing races, database
+transaction rollback and connection interruption, retry storms,
+duplicate submissions, scheduling/cancellation/timeout races, and
+workflow dependency propagation, all at once) plus a bounded manual
+load/stress/soak harness; see "Phase 9: What's Implemented" below for the
+exact campaigns, the durable invariant checker, and the honest limits of
+what has actually been run.
 
 ## The Problem
 
@@ -163,7 +176,8 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
 | Cancellation / timeouts | **Phase 6 done**: `POST /jobs/{id}/cancel`, deterministic cancel-vs-completion race resolution (TF-INV-010), a real `execution_timeout` ceiling distinct from lease TTL, cooperative cancellation observation via heartbeat — see "Phase 6: What's Implemented" below for the explicit, documented limits (cooperative only, no forced termination of uncooperative handler code) |
 | Workflow / DAG execution | **Phase 7 done**: `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel`; dependency-gated eligibility, fan-out, fan-in (including concurrent completion), retry/dead-letter/cancellation propagation, workflow-level cancellation, atomic workflow creation — see "Phase 7: What's Implemented" below |
 | Observability | **Phase 8 done**: every metric in [docs/observability.md](docs/observability.md) implemented (Prometheus-compatible, `GET /metrics`), structured event/correlation logging across submission/claim/reclaim/retry/dead-letter/cancellation/timeout/workflow, durable-state gauges computed at scrape time (no drift across restart) — see "Phase 8: What's Implemented" below. Tracing not implemented (explicit, documented deferral — see that section) |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 8 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), DAG scenario coverage SF-019 through SF-030 (Phase 7), and metric-assertion tests attached to SF-001/SF-005/SF-007 through SF-012 plus a cardinality/race audit (Phase 8); sustained multi-hour chaos/load testing remains Phase 9 |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 9 done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), DAG scenario coverage SF-019 through SF-030 (Phase 7), metric-assertion tests attached to SF-001/SF-005/SF-007 through SF-012 plus a cardinality/race audit (Phase 8), and a CI-safe seeded chaos suite (`internal/chaos`) plus a manual stress/soak harness (`cmd/chaos`) driving every documented failure class in combination with continuous durable-invariant checking (Phase 9) — see "Phase 9: What's Implemented" below for what has and has not actually been run |
+| Chaos / load / soak testing | **Phase 9 done** (Hardening, not yet Stable): deterministic seeded fault injection (`internal/chaos`), a durable TF-INV-* checker (`internal/invariant`), and a manually invoked stress/soak CLI (`cmd/chaos`) — see "Phase 9: What's Implemented" below for exact campaigns, seeds, and the honest gap to the roadmap's multi-hour Stable bar |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -2168,6 +2182,319 @@ instance's own registry.
   test, run repeatedly.
 - **The full Phase 1-7 regression suite remains green**, including under
   `-race`, with no test's assertions weakened.
+
+## Phase 9: What's Implemented
+
+**Status: Hardening.** Phase 9 ([docs/roadmap.md](docs/roadmap.md)
+"Chaos, Load, and Failure Testing") adds no new feature — its entire
+purpose is adversarial evidence that every invariant proven in isolation
+by Phases 1-8 continues to hold when the documented failure classes in
+[docs/failure-model.md](docs/failure-model.md) are combined, under
+concurrency, with continuous durable-state checking rather than
+end-of-scenario assertions alone.
+
+### Implemented now
+
+- **`internal/invariant`** — a durable-state invariant checker
+  (`invariant.Checker`) that queries real PostgreSQL directly (never logs
+  or metrics) and reports every violation of TF-INV-002/005/006/007/008/
+  009/012/014/016 it can find as a point-in-time snapshot, plus
+  `CheckJobsExist` for the harness-tracked half of TF-INV-001 ("every job
+  ever acknowledged as submitted still has a durable row"). Each
+  violation carries the invariant ID, the concrete job/workflow-node
+  subject, and a human-readable detail — enough to start debugging
+  without re-running anything. TF-INV-003/004/010/011/013/015 are
+  invariants *about a rejected or correctly-timed write*, not a durable
+  snapshot property; those remain proven by the existing Phase 1-8
+  scenario suite (SF-002/003/007/008/012/013/014/016/017) and, for
+  TF-INV-002/014 specifically, are *also* re-verified structurally by the
+  checker's lease-generation-monotonicity check (a stale write that had
+  wrongly succeeded would show up there as a reused generation). The
+  package has its own direct unit tests
+  (`internal/invariant/invariant_test.go`), each constructing one
+  concrete violation via raw SQL bypassing `internal/store`'s fenced API
+  entirely (the only way to reach most of these states at all) and
+  asserting the checker reports it under the correct invariant ID — a
+  "no false positives" baseline against clean, store-produced state, plus
+  one check per detector. Writing that suite surfaced a genuine,
+  previously-undocumented-in-this-README fact about the schema: migration
+  0001's `jobs_attempt_count_check` CHECK constraint
+  (`attempt_count <= max_attempts OR state = 'DEAD_LETTERED'`) is a
+  *second*, schema-level enforcement layer for TF-INV-006, independent of
+  `internal/store`'s own logic — it rejects `attempt_count > max_attempts`
+  outright for any non-`DEAD_LETTERED` job, and deliberately relaxes only
+  for the one terminal state where a corrupted count is merely a
+  bookkeeping/debugging concern, not a live retry-budget bypass. This is
+  not a defect; it is documented here because discovering it required
+  attempting the corruption directly, which no prior phase's test suite
+  had done.
+- **`internal/chaos`** — deterministic, seed-reproducible fault-injection
+  primitives operating at real PostgreSQL boundaries, never a mock and
+  never a production-only crash hook: `chaos.Rand` (a concurrency-safe
+  seeded action-picker, mirroring `internal/retry.Rand`'s shape),
+  `ForceExpireLease`/`ForceExpireAllRunningLeases`/`ForceSetEligibleAt`/
+  `ForceAllEligibleNow` (deterministic DB-time manipulation, the same
+  technique Phase 2/5's own tests use, exported for reuse), `PoisonAttemptInsert`/
+  `UnpoisonAttemptInserts` (forces a real UNIQUE-constraint rollback at
+  the claim boundary — the same mechanism
+  `TestClaim_RollbackOnAttemptConflictLeavesJobRowUnchanged` uses),
+  and `BackendPID`/`TerminateBackend` (a real, forcibly severed
+  PostgreSQL connection via `pg_terminate_backend`, not a simulated
+  error — for connection-interruption campaigns).
+- **`internal/chaos`'s own CI-safe seeded test suite** — every campaign
+  below runs as an ordinary `go test`, bounded and deterministic, as part
+  of the normal `make test`/`make test-race` suite (no separate tooling
+  or opt-in flag required):
+  - **Worker-crash campaigns** (adversarial campaign items 1-4): crash
+    point varied around claim/execution/pre-completion, across seeded
+    batches of jobs, followed by mass reclaim and a proof that every
+    stale first-wave owner's completion attempt is rejected
+    (TF-INV-003/014) no matter which crash point produced it —
+    `TestChaos_WorkerCrashCampaign_SeededVariedCrashPoints`.
+  - **Lease/fencing chaos** (item 5): a heartbeat racing a reclaim,
+    seeded per job, both orderings resolving deterministically —
+    `TestChaos_HeartbeatRacesReclaim_Seeded`.
+  - **Database failure injection** (items 6, 17, 18): a poisoned
+    claim-transaction rollback proven to leave the row untouched and the
+    job still genuinely claimable afterward
+    (`TestChaos_DatabaseRollback_ClaimAndRetryTransitionsSurviveInjectedFailure`);
+    a real terminated-backend connection mid-transaction
+    (`TestChaos_ConnectionInterruption_TerminatedBackendDoesNotCorruptState`);
+    a connection pool deliberately smaller than the worker count combined
+    with simultaneous crash pressure
+    (`TestChaos_ConstrainedConnectionPool_ClaimProgressesUnderChaos`).
+  - **Retry storm** (items 7, 8): a hundred jobs with seeded-random
+    `max_attempts` and failure counts driven through many concurrent
+    claim/resolve rounds, proving `attempt_count` never exceeds
+    `max_attempts` and every job dead-letters or succeeds exactly per its
+    own script —
+    `TestChaos_RetryStorm_SeededManyJobsUnderContention`.
+  - **Idempotency under failure** (items 9, 10): many logical submissions
+    each retried 2-9 times concurrently, all resolving to one job_id
+    (`TestChaos_ResponseLossDuplicateSubmission_SeededConcurrentRetries`);
+    SF-004's crash-after-side-effect sequence replayed across 30 jobs,
+    proving the raw side effect doubles while a `job_id`-keyed dedup
+    table stays exactly-once
+    (`TestChaos_DuplicateLogicalEffectAfterReclaim_IdempotentDownstreamDedupes`).
+  - **Scheduling/cancellation/timeout chaos** (items 11-13): a scheduled,
+    idempotency-keyed batch surviving a simulated full fleet restart
+    (`TestChaos_ScheduledJobSurvivesSimulatedFleetRestart`); cancellation
+    racing claim and racing in-flight execution, seeded per job
+    (`TestChaos_CancellationRacesClaimAndExecution_Seeded`); an
+    uncooperative handler that ignores `ctx.Done()`, proving the
+    execution-timeout report still fires and correctly exhausts the
+    retry budget
+    (`TestChaos_TimeoutRacesLeaseAndHeartbeat`).
+  - **Workflow chaos** (items 14-16): two predecessors of a shared
+    fan-in node completing at the same instant across 15 seeded diamond
+    DAGs, D activated exactly once either way
+    (`TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded`); a
+    predecessor's seeded-random retry cycles never unblocking its
+    dependent
+    (`TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent`); a
+    stale, post-reclaim workflow-node completion (both a stale success
+    and a stale failure) proven unable to unblock or cancel dependents
+    (`TestChaos_StaleWorkflowNodeCompletion_NeverUnblocksOrCancelsDependents`).
+  - **Observability during failure** (item 20): every documented
+    fault-driven metric (reclaim, retry, dead-letter, cancellation,
+    timeout, stale-rejection) proven to increment
+    (`TestChaos_ObservabilityDuringFailure_MetricsReflectEveryFaultClass`);
+    cardinality proven bounded under 200 jobs across 4 job_types, with no
+    job_id/idempotency_key label
+    (`TestChaos_ObservabilityDuringFailure_CardinalityBoundedUnderManyJobs`);
+    concurrent metric recording proven race-safe under real chaos load,
+    run under `-race`
+    (`TestChaos_ObservabilityDuringFailure_ConcurrentRecordingRaceSafe`).
+  - **The flagship combined campaign** (item 19, plus "all invariants
+    simultaneously"): a full simulated multi-worker-instance fleet
+    restart mid-flight, no job lost or double-processed
+    (`TestChaos_MultipleWorkerInstancesRestart_Seeded`); and one seeded,
+    property-style campaign combining plain jobs, scheduled jobs,
+    duplicate idempotent submissions, and diamond workflows, driven
+    through up to 60 rounds of concurrent claim + seeded-random
+    resolution (success/retry/permanent-failure/crash/cancel/timeout),
+    with a simulated mid-campaign fleet restart and the **full durable
+    invariant suite re-checked after every single round**, not just at
+    the end — `TestChaos_CombinedCampaign_AllInvariantsSimultaneously_Seeded`.
+- **`cmd/chaos`** — the manually invoked, heavier counterpart: a CLI
+  accepting `-seed`, `-jobs`, `-workflows`, `-idem-groups`, `-workers`,
+  `-pool-size`, `-duration`, and `-mode=stress|soak`, requiring an
+  explicit `-db-url` (or `TASKFORGE_DATABASE_URL`/
+  `TASKFORGE_TEST_DATABASE_URL`) pointing at a disposable/test database.
+  It submits the same mixed workload as the flagship combined campaign at
+  configurable scale, resolves claims via a weighted seeded outcome mix,
+  checks the full invariant suite on a timer while the campaign is in
+  flight (not just at the end), prints a report (submitted/succeeded/
+  dead-lettered/cancelled/retried/timed-out/crashed counts, elapsed time,
+  throughput, harness errors, invariant violations), and returns a
+  nonzero exit code the instant a violation is found — every run prints
+  its seed and workload flags first, specifically so a failing run's
+  exact command can be copied verbatim to reproduce it. `-mode=soak`
+  repeats bounded campaigns back to back for the full `-duration`,
+  deriving a distinct deterministic seed per iteration and stopping
+  immediately (rather than continuing and obscuring which seed failed)
+  the moment one iteration finds a violation.
+
+### How to run the chaos suite
+
+```sh
+# CI-safe: bounded, deterministic, part of the normal suite already.
+make test        # go test -p 1 ./...            (includes internal/chaos)
+make test-race   # go test -race -p 1 ./...
+
+# The Phase 9 suite specifically, verbose, with seeds visible:
+go test -p 1 -v ./internal/chaos/...
+
+# The invariant checker's own direct unit tests (one forged violation
+# per detector, plus a clean-state baseline):
+go test -p 1 -v ./internal/invariant/...
+
+# Reproduce one failing seed exactly as printed in a failure's t.Logf line:
+go test -p 1 -v ./internal/chaos/... -run TestChaos_RetryStorm_SeededManyJobsUnderContention/seed_51
+
+# Manual stress: a single bounded campaign against a real database.
+go run ./cmd/chaos -mode=stress -seed=42 -jobs=500 -workflows=20 -workers=25 -duration=60s \
+  -db-url="postgres://postgres:postgres@localhost:5432/taskforge?sslmode=disable"
+
+# Manual soak: repeated bounded campaigns for a longer wall-clock budget.
+go run ./cmd/chaos -mode=soak -seed=42 -jobs=150 -workflows=15 -workers=20 -duration=10m \
+  -db-url="postgres://postgres:postgres@localhost:5432/taskforge?sslmode=disable"
+```
+
+`docker compose up -d` (see "How to run locally" above) provides a
+throwaway PostgreSQL instance suitable for `cmd/chaos` — never point it
+at a database with data you care about: it creates real, permanent
+`jobs`/`job_attempts`/`workflow_*` rows and does not clean up after
+itself.
+
+### Results actually obtained
+
+- **CI-safe suite**: every test named above passed, repeatedly (`-count=2`
+  and `-count=3`) and under `-race`, with zero invariant violations and
+  zero detected data races, during this phase's implementation.
+- **Invariant-checker unit tests**: all 12 tests in
+  `internal/invariant/invariant_test.go` passed, repeatedly and under
+  `-race`, including 8 tests that each forge one concrete violation via
+  raw SQL and assert the checker reports it under the correct invariant
+  ID, and one clean-state baseline proving no false positives against
+  ordinary store-produced durable state.
+- **Manual stress**: several short (5-10s) runs against a real,
+  disposable PostgreSQL instance (500+ mixed jobs/workflows/duplicate
+  submissions, 10-25 workers), zero invariant violations, zero harness
+  errors.
+- **Manual soak**: one 4-minute run (`-mode=soak -seed=20260908 -jobs=150
+  -workflows=15 -idem-groups=15 -workers=20`) against a real, disposable
+  PostgreSQL instance: 254 jobs submitted, 197 reached a terminal outcome
+  (156 succeeded, 29 dead-lettered, 12 cancelled) with 56 intermediate
+  retryable outcomes, 15 timeouts, and 17 simulated crashes recovered via
+  reclaim — **zero invariant violations**. This is **not** the "multi-hour
+  chaos run" docs/roadmap.md's Stable quality gate for this phase
+  requires — it is one 4-minute run, on one developer machine, and is
+  reported honestly as exactly that, not extrapolated into a stronger
+  claim. The observed ~0.8 terminal-outcomes/sec throughput reflects this
+  run's specific (deliberately small, mostly front-loaded) workload size
+  relative to its 4-minute duration, not a measured performance ceiling —
+  see "Environment dependence" below.
+
+### Defects found
+
+Every defect found while building this phase's test suite was in the
+**test harness itself**, not in the product code under
+`internal/store`/`internal/worker`/`internal/api`:
+
+1. Two chaos tests assumed a specific caller-chosen worker name would
+   determine *which* simultaneously-eligible workflow node (`Claim`
+   returns whichever eligible row PostgreSQL's `FOR UPDATE SKIP LOCKED`
+   happens to return first, not a caller-targeted one) or *which* batch
+   entry a reclaiming goroutine would land on. Fixed by identifying each
+   claimed job by its returned ID after the fact, never by an assumed
+   correspondence to the goroutine/worker name that requested it — now
+   the tests themselves, exactly as written, are the regression coverage
+   for this class of chaos-harness bug.
+2. A workflow-predecessor-retry test tried to prove "B is not claimable"
+   by calling `Claim` generically — but since the test's own retryable
+   failure used a zero backoff delay, that call could legitimately
+   re-claim A itself (immediately eligible again) rather than proving
+   anything about B. Fixed by asserting B's own durable row
+   (`state='QUEUED'`, `attempt_count=0`) directly instead of racing a
+   shared-pool `Claim` call.
+3. The flagship combined campaign's "advance time" step between rounds
+   used an unbounded `eligible_at > now()` fast-forward, which — because
+   a dependency-blocked workflow node is durably `QUEUED` with
+   `eligible_at` set to the far-future sentinel `internal/store` uses to
+   keep it unclaimable — would have silently defeated TF-INV-012's
+   gating rather than merely simulating time passing. The durable
+   invariant checker caught this immediately (`TF-INV-012: job ... was
+   claimed despite an unsatisfied predecessor dependency`) the first time
+   the combined campaign ran. Fixed by bounding the fast-forward to
+   `eligible_at < now() + interval '1 hour'`, which still reaches every
+   real backoff/schedule window in the workload but never the blocked
+   sentinel.
+
+No defect required a code change outside `internal/chaos`'s own test
+files — this is exactly the outcome docs/roadmap.md's "Defect Handling"
+section anticipates for a harness bug ("identify whether it is product
+code or test harness ... fix the root cause") when the root cause turns
+out to be in the test's own assumptions about a nondeterministic,
+`SKIP LOCKED`-based claim query, not in the query itself.
+
+### Environment dependence
+
+No throughput/latency number in this section is a performance claim
+about TaskForge in general. Every number above was measured on one
+developer machine, against `embedded-postgres` (see "How to run tests"
+under Phase 1), with no tuning of PostgreSQL's configuration, connection
+pool sizing, or host resources. Different hardware, a real (non-embedded)
+PostgreSQL instance, different `-workers`/`-pool-size` values, or a
+different workload shape would all change these numbers, likely
+substantially. Publish a throughput/latency claim only alongside the
+exact environment and command that produced it, per docs/roadmap.md's
+"no fabricated benchmarks — numbers are only published once actually
+measured."
+
+### Not implemented / not exercised
+
+- **No multi-hour chaos run.** The longest run actually executed during
+  this phase's implementation was 4 minutes. docs/roadmap.md's Stable
+  quality gate for Phase 9 ("zero invariant violations across a
+  multi-hour chaos run") is not yet met — see "Proposed maturity label"
+  below.
+- **No true multi-process chaos.** Every campaign here (including the
+  "multiple workers/process-like instances restart" one) runs multiple
+  goroutines and `*store.Store`/`*worker.Worker` instances within a
+  single Go process against a real, shared PostgreSQL database — the
+  same "no in-memory state, only durable state" argument Phase 1's SF-018
+  established, but it is not the same as literally killing and restarting
+  separate OS processes.
+- **No network-level partition simulation** (e.g. `iptables`/network
+  namespaces) — connection interruption is exercised via
+  `pg_terminate_backend` (a real severed connection) and via a
+  constrained connection pool, not via a simulated network partition
+  between a worker host and the database host.
+- **No PostgreSQL primary failure/failover simulation** — consistent
+  with docs/failure-model.md's explicit "Out of Scope for v1" list, this
+  phase does not attempt to test HA/failover of PostgreSQL itself.
+- **No fuzz testing** of the HTTP API surface — docs/testing-strategy.md
+  lists this as a still-not-implemented category; Phase 9's scope is
+  chaos/load against the durable job/workflow engine, not input fuzzing.
+- **Load numbers are illustrative, not benchmarks** — see "Environment
+  dependence" above.
+
+### Proposed maturity label
+
+docs/roadmap.md sets Phase 9's maturity as **Stable** on completion, with
+an explicit quality gate: "Zero invariant violations across a multi-hour
+chaos run." Every campaign this phase's test suite and manual harness
+actually ran found zero invariant violations — but "multi-hour" is a
+literal duration requirement, and the longest run actually executed here
+was 4 minutes. This README therefore keeps Phase 9 at **Hardening**:
+every invariant has real, seeded, reproducible, combined-fault test
+coverage (the substance of "chaos testing," per this phase's own scope),
+but the specific multi-hour duration the roadmap's Stable bar names has
+not yet been run. Promotion to Stable is a mechanical follow-up once a
+genuine multi-hour `cmd/chaos -mode=soak` run (or an extended CI job) has
+actually executed and is reported here with its real results, not a
+judgment call to make preemptively.
 
 ## Documentation Map
 
