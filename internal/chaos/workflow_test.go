@@ -69,7 +69,7 @@ func TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded(t *testing.T
 				require.NoError(t, err)
 
 				a := nodeByKey(inst, "A")
-				claimedA, ok, err := s.Claim(ctx, "wf-fanin-a")
+				claimedA, ok, err := claimUntilResolved(t, ctx, s, "wf-fanin-a")
 				require.NoError(t, err)
 				require.True(t, ok)
 				require.Equal(t, a.JobID, claimedA.ID)
@@ -85,10 +85,10 @@ func TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded(t *testing.T
 				// back to b.JobID/c.JobID, rather than assuming a
 				// caller-chosen worker name determines which node is
 				// returned.
-				firstClaim, ok, err := s.Claim(ctx, "wf-fanin-1")
+				firstClaim, ok, err := claimUntilResolved(t, ctx, s, "wf-fanin-1")
 				require.NoError(t, err)
 				require.True(t, ok)
-				secondClaim, ok, err := s.Claim(ctx, "wf-fanin-2")
+				secondClaim, ok, err := claimUntilResolved(t, ctx, s, "wf-fanin-2")
 				require.NoError(t, err)
 				require.True(t, ok)
 
@@ -136,7 +136,7 @@ func TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded(t *testing.T
 				wg.Wait()
 
 				d := nodeByKey(inst, "D")
-				claimedD, ok, err := s.Claim(ctx, "wf-fanin-d")
+				claimedD, ok, err := claimUntilResolved(t, ctx, s, "wf-fanin-d")
 				require.NoError(t, err)
 				require.True(t, ok, "workflow %s: D must become eligible exactly once B and C have both succeeded, however the race resolved", inst.ID)
 				require.Equal(t, d.JobID, claimedD.ID)
@@ -191,7 +191,7 @@ func TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent(t *testing.T) {
 
 				failures := rng.Intn(4) // 0..3 retryable failures before success, always < max_attempts=6
 				for f := 0; f < failures; f++ {
-					claimed, ok, err := s.Claim(ctx, "wf-predretry-a")
+					claimed, ok, err := claimUntilResolved(t, ctx, s, "wf-predretry-a")
 					require.NoError(t, err)
 					require.True(t, ok)
 					require.Equal(t, a.JobID, claimed.ID, "only A should ever be eligible while B remains dependency-blocked")
@@ -212,13 +212,13 @@ func TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent(t *testing.T) {
 					require.Equal(t, 0, gotB.AttemptCount, "workflow %s: B must never have been claimed while A is still RETRY_WAIT", inst.ID)
 				}
 
-				claimed, ok, err := s.Claim(ctx, "wf-predretry-a-final")
+				claimed, ok, err := claimUntilResolved(t, ctx, s, "wf-predretry-a-final")
 				require.NoError(t, err)
 				require.True(t, ok)
 				_, err = s.CompleteSuccess(ctx, claimed.ID, "wf-predretry-a-final", claimed.LeaseGeneration, nil)
 				require.NoError(t, err)
 
-				claimedB, ok, err := s.Claim(ctx, "wf-predretry-b")
+				claimedB, ok, err := claimUntilResolved(t, ctx, s, "wf-predretry-b")
 				require.NoError(t, err)
 				require.True(t, ok, "workflow %s: B must become eligible once A's retry actually succeeds", inst.ID)
 				require.Equal(t, b.JobID, claimedB.ID)
@@ -252,14 +252,14 @@ func TestChaos_StaleWorkflowNodeCompletion_NeverUnblocksOrCancelsDependents(t *t
 		require.NoError(t, err)
 
 		a := nodeByKey(inst, "A")
-		claimedA, ok, err := s.Claim(ctx, "wf-stale-a1")
+		claimedA, ok, err := claimUntilResolved(t, ctx, s, "wf-stale-a1")
 		require.NoError(t, err)
 		require.True(t, ok)
 
 		staleOwner, staleGen := "wf-stale-a1", claimedA.LeaseGeneration
 		require.NoError(t, chaos.ForceExpireLease(ctx, db, a.JobID))
 
-		reclaimedA, ok, err := s.Claim(ctx, "wf-stale-a2")
+		reclaimedA, ok, err := claimUntilResolved(t, ctx, s, "wf-stale-a2")
 		require.NoError(t, err)
 		require.True(t, ok)
 		require.Equal(t, staleGen+1, reclaimedA.LeaseGeneration)
@@ -293,10 +293,10 @@ func TestChaos_StaleWorkflowNodeCompletion_NeverUnblocksOrCancelsDependents(t *t
 			// twice and identify each result by job ID, exactly as
 			// TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded
 			// does, rather than assuming claim order.
-			firstClaim, ok, err := s.Claim(ctx, "wf-stale-1")
+			firstClaim, ok, err := claimUntilResolved(t, ctx, s, "wf-stale-1")
 			require.NoError(t, err)
 			require.True(t, ok, "workflow %s: B and C must both be eligible after A's genuine success", inst.ID)
-			secondClaim, ok, err := s.Claim(ctx, "wf-stale-2")
+			secondClaim, ok, err := claimUntilResolved(t, ctx, s, "wf-stale-2")
 			require.NoError(t, err)
 			require.True(t, ok)
 			require.ElementsMatch(t, []uuid.UUID{b.JobID, c.JobID}, []uuid.UUID{firstClaim.ID, secondClaim.ID})

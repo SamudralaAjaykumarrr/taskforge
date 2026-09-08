@@ -499,7 +499,11 @@ func resolveDependent(ctx context.Context, tx *sql.Tx, dep dependentNode) (casca
 	case failed:
 		res, err := tx.ExecContext(ctx, `
 			UPDATE jobs
-			SET state = 'CANCELLED', terminal_at = now(), updated_at = now(), version = version + 1
+			SET state = 'CANCELLED',
+				terminal_at = now(),
+				terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
+				updated_at = now(),
+				version = version + 1
 			WHERE id = $1 AND state = 'QUEUED'`, dep.jobID)
 		if err != nil {
 			return false, fmt.Errorf("resolve dependent %s: cancel: %w", dep.jobID, err)

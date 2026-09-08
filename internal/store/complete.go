@@ -40,6 +40,7 @@ func (s *Store) CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner st
 			lease_expires_at = NULL,
 			result_metadata = $4,
 			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'
@@ -103,6 +104,7 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 			last_error = $4,
 			last_error_class = $5,
 			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'

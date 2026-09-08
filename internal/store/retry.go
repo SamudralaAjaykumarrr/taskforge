@@ -148,6 +148,10 @@ func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leas
 			last_error = $4,
 			last_error_class = $6,
 			terminal_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
+			terminal_attempt_count = CASE
+				WHEN attempt_count >= max_attempts THEN COALESCE(terminal_attempt_count, attempt_count)
+				ELSE terminal_attempt_count
+			END,
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING'

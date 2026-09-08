@@ -291,6 +291,7 @@ func (s *Store) sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) ([]
 			last_error = COALESCE(last_error, 'lease expired, retry budget exhausted'),
 			last_error_class = 'LEASE_EXPIRED',
 			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
 		WHERE state = 'RUNNING'
