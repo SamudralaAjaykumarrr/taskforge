@@ -119,12 +119,19 @@ func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Phase 8: the idempotency key itself is never logged (only whether
+	// one was supplied) -- docs/roadmap.md's Idempotency Observability
+	// guidance: "Never emit the raw idempotency key into metrics labels.
+	// Avoid logging it unless docs explicitly permit safe
+	// redaction/hashing," which docs/idempotency.md does not.
 	if idemKey != nil {
 		if created {
-			h.logger.Info("new idempotent submission", "job_id", j.ID.String(), "job_type", j.JobType, "idempotency_key", *idemKey)
+			h.logger.Info("new idempotent submission", "event", "submission", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
 		} else {
-			h.logger.Info("duplicate submission detected; returning existing job", "job_id", j.ID.String(), "job_type", j.JobType, "idempotency_key", *idemKey)
+			h.logger.Info("duplicate submission detected; returning existing job", "event", "duplicate_submission_hit", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
 		}
+	} else {
+		h.logger.Info("job submitted", "event", "submission", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", false)
 	}
 
 	writeJSON(w, http.StatusCreated, toJobResponse(j))
@@ -248,14 +255,23 @@ func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Phase 8: which branch of this cascade resolved the request is
+	// itself diagnostically useful (docs/observability.md: "Cancellation
+	// requested / cancellation race outcome (which side won)") --
+	// path distinguishes an uncontested pre-claim cancellation from a
+	// request pending a running worker's acknowledgement from a no-op
+	// against an already-terminal (or nonexistent) job.
+	path := "direct"
 	j, err := h.store.CancelQueuedOrRetryWait(r.Context(), id)
 	if errors.Is(err, store.ErrStaleTransition) {
+		path = "requested_pending_worker"
 		j, err = h.store.RequestCancellation(r.Context(), id)
 	}
 	if errors.Is(err, store.ErrStaleTransition) {
 		// Neither QUEUED/RETRY_WAIT nor RUNNING matched: the job is
 		// already terminal (or does not exist at all) — report reality
 		// rather than a generic rejection, per the documented contract.
+		path = "already_terminal"
 		j, err = h.store.GetByID(r.Context(), id)
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "job not found")
@@ -267,6 +283,8 @@ func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to cancel job")
 		return
 	}
+	h.logger.Info("cancellation requested", "event", "cancellation_requested",
+		"job_id", id.String(), "job_type", j.JobType, "state", string(j.State), "path", path)
 
 	writeJSON(w, http.StatusOK, toJobResponse(j))
 }

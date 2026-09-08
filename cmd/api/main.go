@@ -14,10 +14,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 )
@@ -52,9 +55,18 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	st := store.New(db)
+	// Phase 8: m is shared between the Store (every metric it records --
+	// see internal/store) and this process's /metrics endpoint below. A
+	// fresh, private registry per process (never
+	// prometheus.DefaultRegisterer) -- see internal/metrics.New's doc
+	// comment.
+	m := metrics.New()
+	st := store.New(db, store.WithMetrics(m), store.WithLogger(logger))
+	m.Registry.MustRegister(metrics.NewStateCollector(st, cfg.ActiveWorkerWindow, logger))
+
 	handlers := api.NewHandlers(st, logger)
 	router := api.NewRouter(handlers)
+	router.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

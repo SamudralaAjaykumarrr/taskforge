@@ -3,12 +3,15 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 )
 
 // CompleteSuccess fences on (id, leaseOwner, leaseGeneration, state =
@@ -44,23 +47,33 @@ func (s *Store) CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner st
 		id, leaseOwner, leaseGeneration, resultMetadata,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStaleTransition) {
+			s.metrics.StaleCompletionRejectionsTotal.Inc()
+		}
 		return nil, err
 	}
 
-	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeSucceeded, "", ""); err != nil {
+	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeSucceeded, "", "")
+	if err != nil {
 		return nil, fmt.Errorf("store: complete success: record attempt outcome: %w", err)
 	}
 
 	// Phase 7: if id is a workflow node's underlying job, this SUCCEEDED
 	// transition may satisfy dependents' dependency conditions -- see
 	// internal/store/workflow.go. A no-op for an ordinary standalone job.
-	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Succeeded); err != nil {
+	workflowID, finalState, err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Succeeded)
+	if err != nil {
 		return nil, fmt.Errorf("store: complete success: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete success: commit: %w", err)
 	}
+	s.logWorkflowFinalized(workflowID, finalState)
+
+	s.metrics.JobsCompletedTotal.WithLabelValues(j.JobType, metrics.OutcomeSucceeded).Inc()
+	s.metrics.ExecutionDurationSeconds.WithLabelValues(j.JobType, metrics.OutcomeSucceeded).Observe(j.UpdatedAt.Sub(startedAt).Seconds())
+	s.metrics.RetryCount.WithLabelValues(j.JobType).Observe(float64(j.AttemptCount))
 	return j, nil
 }
 
@@ -97,23 +110,34 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 		id, leaseOwner, leaseGeneration, errMessage, errClass,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStaleTransition) {
+			s.metrics.StaleCompletionRejectionsTotal.Inc()
+		}
 		return nil, err
 	}
 
-	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeFailedPermanent, errClass, errMessage); err != nil {
+	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeFailedPermanent, errClass, errMessage)
+	if err != nil {
 		return nil, fmt.Errorf("store: complete failure: record attempt outcome: %w", err)
 	}
 
 	// Phase 7: a permanently-failed workflow node's dependents are
 	// cancelled by default (docs/workflows.md's Failure Propagation
 	// table) -- a no-op for an ordinary standalone job.
-	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered); err != nil {
+	workflowID, finalState, err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered)
+	if err != nil {
 		return nil, fmt.Errorf("store: complete failure: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete failure: commit: %w", err)
 	}
+	s.logWorkflowFinalized(workflowID, finalState)
+
+	s.metrics.JobsCompletedTotal.WithLabelValues(j.JobType, metrics.OutcomeFailedPermanent).Inc()
+	s.metrics.JobsDeadLetteredTotal.WithLabelValues(j.JobType).Inc()
+	s.metrics.ExecutionDurationSeconds.WithLabelValues(j.JobType, metrics.OutcomeFailedPermanent).Observe(j.UpdatedAt.Sub(startedAt).Seconds())
+	s.metrics.RetryCount.WithLabelValues(j.JobType).Observe(float64(j.AttemptCount))
 	return j, nil
 }
 
@@ -125,15 +149,22 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 // presents), so keying on it here is both precise and an extra
 // belt-and-braces check: it can only ever finalize the attempt this exact
 // completion call is fenced against, never a different one.
-func finalizeOpenAttemptForGeneration(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, leaseGeneration int64, outcome, errClass, errMessage string) error {
-	_, err := tx.ExecContext(ctx, `
+//
+// Phase 8: returns the finalized attempt's started_at, so callers can
+// compute taskforge_execution_duration_seconds as their own transition's
+// updated_at (already fetched via jobColumns, same-transaction now())
+// minus started_at, with no additional query.
+func finalizeOpenAttemptForGeneration(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, leaseGeneration int64, outcome, errClass, errMessage string) (time.Time, error) {
+	var startedAt time.Time
+	err := tx.QueryRowContext(ctx, `
 		UPDATE job_attempts
 		SET finished_at = now(),
 			outcome = $3,
 			error_class = NULLIF($4, ''),
 			error_message = NULLIF($5, '')
-		WHERE job_id = $1 AND lease_generation = $2 AND finished_at IS NULL`,
+		WHERE job_id = $1 AND lease_generation = $2 AND finished_at IS NULL
+		RETURNING started_at`,
 		jobID, leaseGeneration, outcome, errClass, errMessage,
-	)
-	return err
+	).Scan(&startedAt)
+	return startedAt, err
 }

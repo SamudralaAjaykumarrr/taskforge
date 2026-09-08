@@ -397,6 +397,82 @@ and `internal/api/workflow_handlers.go` was
 to include the two new workflow tables (which now also reference `jobs`
 via a foreign key, exactly as `job_attempts` already did).
 
+As of Phase 8 ("Observability", [roadmap.md](roadmap.md)), the following
+additional category is now executable — **metric-assertion tests
+attached to existing scenarios**, per that phase's exact required-tests
+wording ("Metric-assertion tests attached to existing scenarios rather
+than a new scenario set"). No new scenario IDs were introduced; the
+following existing scenarios each gained a companion test asserting the
+[observability.md](observability.md) metrics/logs their own event
+sequence must produce, all in `internal/store/observability_test.go`
+unless noted:
+
+- **SF-001** (normal success): `TestMetrics_SF001_NormalSuccess` —
+  `taskforge_jobs_submitted_total`, `taskforge_claim_latency_seconds`/
+  `taskforge_queue_age_seconds`,
+  `taskforge_jobs_completed_total{outcome="succeeded"}`,
+  `taskforge_execution_duration_seconds`, `taskforge_retry_count`.
+- **SF-005** (duplicate submission, same idempotency key):
+  `TestMetrics_SF005_IdempotentDuplicateSubmission` —
+  `taskforge_jobs_submitted_total` increments on every call,
+  `taskforge_idempotent_submission_hits_total` only on the duplicate.
+- **SF-007** (lease expires and job is reclaimed):
+  `TestMetrics_SF007_LeaseExpiresAndJobIsReclaimed` —
+  `taskforge_lease_expirations_total` and
+  `taskforge_jobs_completed_total{outcome="lease_expired"}` increment
+  exactly once, only for the genuine reclaim.
+- **SF-008** (stale worker completion rejected):
+  `TestMetrics_SF008_StaleCompletionRejected` —
+  `taskforge_stale_completion_rejections_total` increments for both a
+  stale `CompleteSuccess` and a stale `Heartbeat` call;
+  `taskforge_heartbeats_total` counts the call regardless of rejection.
+- **SF-009/SF-010** (retryable failure eventually succeeds / retries
+  exhausted): `TestMetrics_SF009_RetryableFailureEventuallySucceeds`,
+  `TestMetrics_SF010_RetriesExhaustedDeadLetters` — every attempt counts
+  toward `taskforge_jobs_completed_total{outcome="failed_retryable"}`;
+  `taskforge_jobs_dead_lettered_total`/`taskforge_retry_count` fire
+  exactly once, at the terminal transition.
+- **SF-011/SF-012** (cancellation before claim / cancellation races
+  completion): `TestMetrics_SF011_CancellationBeforeClaim`,
+  `TestMetrics_SF012_CancelCommitsFirst_CompletionRejected` — a pre-claim
+  cancellation contributes to `taskforge_retry_count` but not
+  `taskforge_jobs_completed_total` (no attempt exists); a worker's
+  completion call that loses the cancellation race is rejected as stale
+  and never recorded as a genuine success.
+- **Regression test for a defect this phase's implementation found**:
+  `TestMetrics_ReclaimVsRetry_LeaseExpirationsNotConflatedWithBackoffRetry`
+  — see [observability.md](observability.md)'s Implementation Notes for
+  the full description (an ordinary post-backoff `RETRY_WAIT` claim was
+  at risk of being mislabeled a lease-expiry reclaim).
+
+Also new this phase, not tied to a single named scenario:
+`internal/metrics/metrics_test.go` (isolated-instance registry
+guarantees, exact documented-metric-set registration, the
+`StateCollector`'s fresh-query-per-scrape behavior and scrape-failure
+safety against a fake `StateQuerier` double — no database required for
+this package's own tests); `TestJobStateCounts`,
+`TestJobStateCounts_ReflectsRestartAcrossFreshStoreInstance`,
+`TestActiveWorkerCount` (the two durable-state gauges, including
+restart-survival); `TestCardinality_ManyUniqueJobsDoNotCreateNewMetricSeries`,
+`TestCardinality_NoMetricLabelIsIdempotencyKeyOrJobID` (the cardinality
+audit); `TestMetrics_ConcurrentRecording_RaceSafe` (many goroutines
+recording through real concurrent `Claim`/`CompleteSuccess` calls,
+run under `-race`); `TestWorkflowMetrics_CreateWorkflow_SubmitsOneJobPerNode`,
+`TestWorkflowLogging_FinalizedExactlyOnceOnSuccess`,
+`TestWorkflowLogging_FinalizedOnceOnCascadeFailure`
+(`internal/store/workflow_observability_test.go`); and, at the HTTP
+boundary, `TestSubmissionLogging_RawIdempotencyKeyNeverLogged`,
+`TestSubmissionLogging_CorrelationFieldsPresent`,
+`TestCancellationLogging_RequestedEventLogged`
+(`internal/api/observability_test.go`).
+
+The full pre-existing Phase 1-7 regression suite remains green, including
+under `-race` (`go test -race -p 1 ./...`), and this phase's own
+concurrency-sensitive tests were run repeatedly under `-race`
+(`go test -race -p 1 -count=3 ./internal/store/... -run
+'TestStress|TestMetrics_ConcurrentRecording_RaceSafe|ConcurrentFanIn|MultiWorker_FanOut|StaleGeneration'`)
+with zero failures and zero detected data races.
+
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1
 and Phase 2 sections for exactly which invariants each phase is

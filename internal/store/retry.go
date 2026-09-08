@@ -27,6 +27,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 )
 
 // CompleteRetryableFailure fences on (id, leaseOwner, leaseGeneration,
@@ -153,10 +155,14 @@ func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leas
 		id, leaseOwner, leaseGeneration, errMessage, delay.Seconds(), errorClass,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStaleTransition) {
+			s.metrics.StaleCompletionRejectionsTotal.Inc()
+		}
 		return nil, fmt.Errorf("store: complete retryable outcome: %w", err)
 	}
 
-	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcome, errorClass, errMessage); err != nil {
+	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcome, errorClass, errMessage)
+	if err != nil {
 		return nil, fmt.Errorf("store: complete retryable outcome: record attempt outcome: %w", err)
 	}
 
@@ -168,14 +174,34 @@ func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leas
 	// predecessor reaches a terminal state. A retrying predecessor is not
 	// treated as failed."). A no-op for an ordinary standalone job either
 	// way.
+	var workflowID uuid.UUID
+	var finalState string
 	if j.State == jobstate.DeadLettered {
-		if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered); err != nil {
+		workflowID, finalState, err = s.propagateWorkflowTransition(ctx, tx, id, jobstate.DeadLettered)
+		if err != nil {
 			return nil, fmt.Errorf("store: complete retryable outcome: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete retryable outcome: commit: %w", err)
+	}
+	s.logWorkflowFinalized(workflowID, finalState)
+
+	// attemptOutcome (FAILED_RETRYABLE/TIMED_OUT) IS the
+	// taskforge_jobs_completed_total outcome label for THIS attempt,
+	// regardless of which job-level state (RETRY_WAIT or DEAD_LETTERED)
+	// it landed on -- docs/observability.md: "Attempt-level outcome
+	// volume — maps directly to job_attempts.outcome."
+	completedOutcome := metrics.OutcomeFailedRetryable
+	if attemptOutcome == attemptOutcomeTimedOut {
+		completedOutcome = metrics.OutcomeTimedOut
+	}
+	s.metrics.JobsCompletedTotal.WithLabelValues(j.JobType, completedOutcome).Inc()
+	s.metrics.ExecutionDurationSeconds.WithLabelValues(j.JobType, completedOutcome).Observe(j.UpdatedAt.Sub(startedAt).Seconds())
+	if j.State == jobstate.DeadLettered {
+		s.metrics.JobsDeadLetteredTotal.WithLabelValues(j.JobType).Inc()
+		s.metrics.RetryCount.WithLabelValues(j.JobType).Observe(float64(j.AttemptCount))
 	}
 	return j, nil
 }
