@@ -182,7 +182,7 @@ func TestChaos_CancellationRacesClaimAndExecution_Seeded(t *testing.T) {
 
 				// Race cancellation against an in-flight RUNNING
 				// completion: TF-INV-010's "first durable write wins" rule.
-				claimed, ok, err := s.Claim(ctx, fmt.Sprintf("cancelrace-runner-%d", i))
+				claimed, ok, err := claimUntilResolved(t, ctx, s, fmt.Sprintf("cancelrace-runner-%d", i))
 				require.NoError(t, err)
 				require.True(t, ok)
 

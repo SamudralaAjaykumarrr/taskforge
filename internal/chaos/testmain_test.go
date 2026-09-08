@@ -38,6 +38,39 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/worker"
 )
 
+// claimUntilResolved retries s.Claim until it returns either a claimed job
+// (ok=true) or a definitive error (err != nil). Claim's own contract
+// documents ok=false/err=nil ("nothing eligible right now") as a normal,
+// valid outcome, never a failure -- so a test asserting against a single
+// Claim call's result must not assume a freshly-eligible job (or a job
+// just made eligible by a predecessor's completion, a workflow-dependency
+// activation, or a chaos.Force* helper) is necessarily selected by the
+// very first call. docs/failure-model.md's Clock Model explicitly permits
+// "NTP-slew style bounded correction" of PostgreSQL's own clock; such a
+// correction landing between the transaction that set eligible_at (via
+// now()) and a subsequent Claim's own now() can make the row appear
+// briefly (single-digit-to-tens of milliseconds) in the future -- a
+// transient, benign delay, not a lost or stuck job. This loop is bounded
+// well beyond any such correction so a genuine "nothing will ever be
+// eligible" bug still fails the test promptly, not silently. Used at
+// every call site in this package where a single Claim is expected to
+// immediately return a specific just-made-eligible job; drain-style loops
+// that already tolerate ok=false as "queue exhausted" do not need it.
+func claimUntilResolved(t *testing.T, ctx context.Context, s *store.Store, workerID string) (*job.Job, bool, error) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		j, ok, err := s.Claim(ctx, workerID)
+		if ok || err != nil {
+			return j, ok, err
+		}
+		if time.Now().After(deadline) {
+			return j, ok, err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestMain(m *testing.M) { testutil.RunMain(m) }
 
 // discardLogger silences structured log output during chaos runs -- the

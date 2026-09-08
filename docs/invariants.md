@@ -154,11 +154,80 @@ clause, so a transition attempt against an already-terminal row affects zero
 rows; (c) fencing (TF-INV-003) prevents a stale worker from even attempting
 a transition with valid credentials.
 
+**Durable proof, independent of the code paths above**: `internal/invariant`
+proves this property directly against durable state (not just "the code
+looks right") via two independent, wall-clock-free checks, both under this
+same TF-INV-005 ID:
+
+1. **Currently reopened**: `jobs.terminal_at IS NOT NULL` but the job's
+   CURRENT `state` is not `SUCCEEDED`/`CANCELLED`/`DEAD_LETTERED`. `terminal_at`
+   is written to non-NULL only in the same statement that also sets `state`
+   to one of those three, so a stale `terminal_at` next to a non-terminal
+   `state` is exactly the artifact a buggy reclaim of an already-terminal row
+   would leave behind — a same-row, same-statement comparison that needs no
+   cross-transaction time ordering.
+2. **Historically reopened**: a `job_attempts` row exists whose
+   `attempt_number` is greater than `jobs.terminal_attempt_count` (see the
+   `terminal_attempt_count` column, [data-model.md](data-model.md), added by
+   migration 0004). Case 1 alone misses a job that was terminalized,
+   illegitimately reclaimed, and then reached a terminal state a SECOND
+   time — at that point `state` reads terminal again and `terminal_at` has
+   been overwritten with the second terminalization's own timestamp, so
+   case 1 sees nothing wrong. `terminal_attempt_count` is captured exactly
+   once, on the transition that FIRST made the job terminal, and is never
+   written again, so any `job_attempts.attempt_number` found above it is
+   proof a new attempt was opened after the job had already, durably,
+   reached a terminal state at least once — regardless of what
+   `state`/`terminal_at` read now. This covers all three terminal states
+   uniformly, including `CANCELLED` reached with zero `job_attempts` rows at
+   all (e.g. `CancelQueuedOrRetryWait`, or a workflow's cascade-cancel of an
+   unclaimed dependent): `terminal_attempt_count` is still captured as `0`
+   on that transition, so any later `attempt_number > 0` is caught the same
+   way.
+
+Neither check ever compares a wall-clock timestamp written by one
+transaction against one written by a different transaction — both compare
+durable integer/enum columns on rows serialized by PostgreSQL's own
+row-level locking. An earlier version of this check instead compared
+`job_attempts.started_at` against `jobs.terminal_at` across two different
+transactions/rows and produced real false positives under sustained load
+(PostgreSQL's `now()` is not guaranteed strictly monotonic across an
+NTP-slew-style bounded correction — see the Clock Model in
+[failure-model.md](failure-model.md)); this is exactly why case 1/2 above
+compare only columns written together, in the same statement, on the same
+row.
+
+**Marker self-validation**: because `terminal_attempt_count` is
+correctness-critical to case 2, this same check also reports the marker's
+own state being malformed, independent of whether anything is currently
+reopened — a terminal row with `terminal_attempt_count IS NULL` (case 2
+silently disabled for that row), a negative `terminal_attempt_count`, or a
+`terminal_attempt_count` exceeding the job's current `attempt_count` are
+all durably impossible under every current terminalization path and are
+reported the moment they are found, rather than being silently trusted.
+See `internal/invariant/invariant.go`'s `checkNoAttemptAfterTerminal` doc
+comment for exactly which malformed shapes this covers, and why no
+database `CHECK` constraint enforces them instead (migration 0004's own
+comment).
+
+**Migration 0004 limitation**: a job row that was already illegitimately
+reopened *before* migration 0004 ran cannot have its true original
+`attempt_count` reconstructed from existing durable data — the migration's
+backfill can only record "`attempt_count` as of the backfill," not the
+provably-true first-terminalization value, for any row terminalized before
+the column existed. Every row terminalized after the migration gets the
+full, race-free guarantee described above.
+
 **Test strategy**: State-machine table test enumerating all
 `(from_state, to_state)` pairs and asserting the transition function rejects
-every pair not in the allowed table. See
+every pair not in the allowed table (see
 [testing-strategy.md](testing-strategy.md) "state-machine table tests,"
-scenario SF-015.
+scenario SF-015), plus `internal/invariant`'s durable-state checks above,
+proven directly against a real PostgreSQL instance by
+`internal/invariant/invariant_test.go` (reopening, reopen-then-re-terminalize,
+the clock-skew false-positive regression, and each malformed-marker shape)
+and exercised continuously by every seeded chaos campaign in
+`internal/chaos`.
 
 ---
 

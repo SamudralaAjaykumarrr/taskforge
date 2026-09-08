@@ -1,0 +1,77 @@
+-- Phase 9 chaos hardening: TF-INV-005 ("terminal states never become
+-- non-terminal") needs an immutable, durable marker of "how many
+-- job_attempts existed the FIRST time this job became terminal", because
+-- jobs.terminal_at itself is NOT safe for this: every terminal-write site
+-- unconditionally overwrites it with now() (see cancellation.go,
+-- claim.go's sweep, complete.go, retry.go, workflow.go's
+-- resolveDependent), so a job that is illegitimately reclaimed after
+-- reaching a terminal state and then reaches a terminal state a second
+-- time leaves NO durable trace in terminal_at of the first terminalization
+-- -- terminal_at simply reads as "terminal, as of the second time."
+--
+-- terminal_attempt_count is written by the exact same statements, but
+-- guarded with COALESCE(jobs.terminal_attempt_count, jobs.attempt_count)
+-- so it is captured ONCE, on the transition that first makes the job
+-- terminal, and is a permanent fact about that row from then on -- no
+-- code path ever assigns it a second time. Because job_attempts rows are
+-- append-only and gapless (TF-INV-007: attempt_number is unique, 1-based,
+-- and matches attempt_count exactly), "any job_attempts row with
+-- attempt_number > jobs.terminal_attempt_count" is then a pure,
+-- wall-clock-free proof that a new attempt was opened after this job had
+-- already, durably, reached a terminal state at least once -- regardless
+-- of what jobs.state/terminal_at read now. See
+-- internal/invariant/invariant.go's checkNoAttemptAfterTerminal for the
+-- check this enables and internal/invariant/invariant_test.go's
+-- TestCheckAll_DetectsTerminalStateReopenedThenReterminalized for the
+-- regression proof.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS terminal_attempt_count INTEGER NULL;
+
+-- Backfill for any terminal row that predates this migration. This can
+-- only record "attempt_count as of the backfill," not the true original
+-- value -- if a row was already illegitimately reopened before this
+-- migration ran, that history is unrecoverable from existing durable
+-- state (exactly the "existing persisted model genuinely cannot prove
+-- historical reopening" case for pre-migration data). Every row
+-- terminalized after this migration gets the real, race-free guarantee.
+UPDATE jobs
+SET terminal_attempt_count = attempt_count
+WHERE terminal_at IS NOT NULL AND terminal_attempt_count IS NULL;
+
+-- Deliberately NO CHECK constraints are added for this column, despite
+-- three candidates being safe for every write internal/store's fenced API
+-- ever legitimately performs:
+--   (a) terminal_at IS NULL OR terminal_attempt_count IS NOT NULL
+--   (b) terminal_attempt_count IS NULL OR terminal_attempt_count >= 0
+--   (c) terminal_attempt_count IS NULL OR terminal_attempt_count <= attempt_count
+-- Every real terminalization site sets terminal_at and terminal_attempt_count
+-- in the SAME UPDATE statement via COALESCE(jobs.terminal_attempt_count,
+-- jobs.attempt_count), so all three would always hold for legitimate
+-- writes -- unlike jobs_attempt_count_check (migration 0001), which has a
+-- genuine DEAD_LETTERED loophole a real code path can reach, there is no
+-- state internal/store's real API can ever legitimately produce that
+-- would violate (a), (b), or (c).
+--
+-- That "always safe" property is exactly why they are rejected here: a
+-- hard CHECK enforces (a)/(b)/(c) unconditionally, at every INSERT/UPDATE,
+-- with no per-session or per-transaction way to relax it in PostgreSQL
+-- (CHECK constraints, unlike FOREIGN KEY/UNIQUE, cannot be declared
+-- DEFERRABLE) -- so adding any of them would make the exact malformed
+-- states internal/invariant.checkNoAttemptAfterTerminal exists to
+-- independently detect (see that function's doc comment and
+-- internal/invariant/invariant_test.go's
+-- TestCheckAll_DetectsMissingTerminalAttemptCountMarker/
+-- TestCheckAll_DetectsNegativeTerminalAttemptCount/
+-- TestCheckAll_DetectsTerminalAttemptCountExceedsAttemptCount)
+-- permanently unreachable in a real PostgreSQL database, with no way to
+-- regression-test that Go-level detection logic against real durable
+-- state ever again. The invariant checker is this project's audit layer
+-- for corruption from ANY source -- a future code regression, a manual
+-- maintenance UPDATE, or a database that has not yet had this exact
+-- migration applied during a rolling upgrade -- and docs/testing-strategy.md
+-- requires every check in that package to be provable against real
+-- Postgres state, never asserted only in the abstract. Keeping
+-- terminal_attempt_count unconstrained at the schema level is what keeps
+-- that requirement satisfiable for these three cases; see
+-- internal/invariant/invariant.go's checkNoAttemptAfterTerminal doc
+-- comment for the corresponding application-level detection this
+-- decision relies on instead.

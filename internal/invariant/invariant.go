@@ -34,6 +34,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -306,19 +308,127 @@ func (c *Checker) checkDeadLetteredHasReason(ctx context.Context) ([]Violation, 
 	return out, rows.Err()
 }
 
-// checkNoAttemptAfterTerminal is a durable-state proxy for TF-INV-005
-// ("terminal states never become non-terminal"): if a job's terminal
-// state truly never reopened, no job_attempts row could ever have been
-// opened (started_at) after terminal_at was set, because opening a new
-// attempt requires a successful Claim, and Claim's WHERE clause can never
-// select an already-terminal row (see internal/store/claim.go). A row
-// here means some code path re-claimed a job after it was already
-// terminal -- direct, durable evidence of a reopened terminal state.
+// checkNoAttemptAfterTerminal proves TF-INV-005 ("terminal states never
+// become non-terminal", docs/invariants.md: "SUCCEEDED, CANCELLED, and
+// DEAD_LETTERED are terminal. No transition out of a terminal state
+// exists, in the state machine or in any code path."). It reports a
+// violation for either of two independent, durable facts -- either is
+// sufficient on its own:
+//
+//  1. CURRENTLY reopened: terminal_at IS NOT NULL but the job's CURRENT
+//     state is not SUCCEEDED/CANCELLED/DEAD_LETTERED. terminal_at is
+//     written to a non-NULL value ONLY in the same statement that also
+//     sets jobs.state to one of those three states (grep every
+//     "terminal_at = now()" site in internal/store: complete.go,
+//     cancellation.go, retry.go's exhaustion branch, claim.go's lazy
+//     sweep, workflow.go's cascade-cancel), and claimQuery's own reclaim
+//     UPDATE never touches terminal_at -- so a stale, non-cleared
+//     terminal_at next to a non-terminal state is exactly the artifact a
+//     buggy reclaim of an already-terminal row would leave behind, and
+//     comparing two columns on the same row/statement needs no
+//     cross-transaction ordering at all.
+//
+//  2. HISTORICALLY reopened, even after a second terminalization masked
+//     case 1: a job_attempts row exists whose attempt_number is greater
+//     than jobs.terminal_attempt_count (migration 0004). Case 1 alone
+//     misses a job that was terminalized, illegitimately reclaimed
+//     (reopening it), and then reached a terminal state a SECOND time --
+//     at that point jobs.state reads terminal again and jobs.terminal_at
+//     has been overwritten with the second terminalization's timestamp,
+//     so case 1's query sees nothing wrong. terminal_attempt_count closes
+//     this gap: every terminal_at-writing statement also sets it via
+//     `COALESCE(jobs.terminal_attempt_count, jobs.attempt_count)`, so it
+//     captures attempt_count exactly once -- on the transition that FIRST
+//     made the job terminal -- and no code path ever assigns it a second
+//     time. Because job_attempts is append-only and gapless
+//     (TF-INV-007: attempt_number is unique, 1-based, and matches
+//     attempt_count exactly), any attempt_number found above that frozen
+//     count is proof a new attempt was opened after the job had already,
+//     durably, reached a terminal state at least once -- regardless of
+//     what jobs.state/terminal_at read now. This covers all three
+//     terminal states uniformly, including CANCELLED reached with zero
+//     job_attempts rows at all (CancelQueuedOrRetryWait,
+//     resolveDependent's cascade-cancel): terminal_attempt_count is still
+//     captured (as 0) on that transition, so any later attempt_number > 0
+//     is caught the same way.
+//
+// Because terminal_attempt_count is now correctness-critical to case 2,
+// this same check ALSO reports malformed marker state directly, rather
+// than silently trusting it -- a future terminalization code path that
+// writes terminal_at/state but forgets terminal_attempt_count would
+// otherwise silently disable case 2's historical detection for that row,
+// with nothing here ever reporting why. Three durable shapes are
+// self-evidently invalid, independent of anything else on the row:
+//
+//   - MISSING: terminal_at IS NOT NULL but terminal_attempt_count IS
+//     NULL. After migration 0004 (which backfills every pre-existing
+//     terminal row), every supported terminalization path sets both
+//     columns in the same statement -- see complete.go, cancellation.go,
+//     retry.go's exhaustion branch, claim.go's sweep, and workflow.go's
+//     resolveDependent, all of which write
+//     `terminal_attempt_count = COALESCE(jobs.terminal_attempt_count,
+//     jobs.attempt_count)` in the identical UPDATE that sets terminal_at
+//     = now(). A terminal row with the marker still NULL is proof some
+//     write path bypassed that convention.
+//   - NEGATIVE: terminal_attempt_count < 0. attempt_count itself is never
+//     negative (it only ever increments), so a negative marker cannot be
+//     a legitimate snapshot of it.
+//   - EXCEEDS: terminal_attempt_count > attempt_count. The marker is
+//     defined as attempt_count captured on the FIRST terminalization, and
+//     attempt_count only ever increases afterward (every claim
+//     increments it, and job_attempts is append-only/gapless per
+//     TF-INV-007) -- so it can never durably exceed the job's current
+//     attempt_count.
+//
+// These are reported under TF-INV-005, not a new invariant ID: all three
+// are the marker's own durable meaning being contradicted, exactly the
+// same property (an untrustworthy or absent record of "was this job ever
+// terminal before") case 2 above depends on -- a separate invariant ID
+// would split one property across two IDs for no reader benefit. See
+// TestCheckAll_DetectsMissingTerminalAttemptCountMarker,
+// TestCheckAll_DetectsNegativeTerminalAttemptCount, and
+// TestCheckAll_DetectsTerminalAttemptCountExceedsAttemptCount for the
+// regression proofs.
+//
+// Both of the original two cases compare durable integer/enum columns on
+// rows serialized by PostgreSQL's own row-level locking (every write
+// above requires the same row's UPDATE lock) -- neither ever compares a
+// wall-clock timestamp written by one transaction against one written by
+// a different transaction. An earlier version of this check instead
+// compared
+// job_attempts.started_at (written by the transaction that opened an
+// attempt) against jobs.terminal_at (written by a LATER, causally
+// downstream transaction) and flagged started_at > terminal_at as a
+// reopening. That comparison was unsound: PostgreSQL's now() is fixed at
+// each transaction's own BEGIN from the OS wall clock, and the wall clock
+// is not guaranteed monotonic -- an NTP/hypervisor correction landing
+// between two transactions can make a causally-earlier transaction's
+// now() read LATER than a causally-later transaction's now(), even though
+// row-level locking strictly serialized them in the other order. This
+// produced real false positives under `go test -race` (observed as a
+// ~30-40ms backward wall-clock step approximately every 30s under
+// sustained load in this project's WSL2 CI/dev environment -- long
+// enough for a heavy chaos run to cross one). See
+// TestCheckAll_NoFalsePositiveOnClockSkewedAttemptTimestamp for that
+// regression proof, TestCheckAll_DetectsTerminalStateReopened for proof
+// case 1 still detects a currently-reopened terminal state, and
+// TestCheckAll_DetectsTerminalStateReopenedThenReterminalized for proof
+// case 2 detects a reopening masked by a second terminalization -- the
+// exact gap case 1 alone cannot see.
 func (c *Checker) checkNoAttemptAfterTerminal(ctx context.Context) ([]Violation, error) {
 	rows, err := c.db.QueryContext(ctx, `
-		SELECT j.id, a.id, a.attempt_number
-		FROM jobs j JOIN job_attempts a ON a.job_id = j.id
-		WHERE j.terminal_at IS NOT NULL AND a.started_at > j.terminal_at`)
+		SELECT j.id, j.state, j.terminal_at, j.terminal_attempt_count, j.attempt_count,
+			(SELECT COUNT(*) FROM job_attempts a WHERE a.job_id = j.id) AS attempt_rows,
+			(SELECT COALESCE(MAX(a.attempt_number), 0) FROM job_attempts a WHERE a.job_id = j.id) AS max_attempt_number
+		FROM jobs j
+		WHERE (j.terminal_at IS NOT NULL AND j.state NOT IN ('SUCCEEDED', 'CANCELLED', 'DEAD_LETTERED'))
+		   OR (j.terminal_attempt_count IS NOT NULL AND EXISTS (
+		         SELECT 1 FROM job_attempts a
+		         WHERE a.job_id = j.id AND a.attempt_number > j.terminal_attempt_count
+		       ))
+		   OR (j.terminal_at IS NOT NULL AND j.terminal_attempt_count IS NULL)
+		   OR (j.terminal_attempt_count IS NOT NULL AND j.terminal_attempt_count < 0)
+		   OR (j.terminal_attempt_count IS NOT NULL AND j.terminal_attempt_count > j.attempt_count)`)
 	if err != nil {
 		return nil, err
 	}
@@ -326,15 +436,57 @@ func (c *Checker) checkNoAttemptAfterTerminal(ctx context.Context) ([]Violation,
 
 	var out []Violation
 	for rows.Next() {
-		var jobID, attemptID uuid.UUID
-		var attemptNumber int
-		if err := rows.Scan(&jobID, &attemptID, &attemptNumber); err != nil {
+		var jobID uuid.UUID
+		var state string
+		var terminalAt sql.NullTime
+		var terminalAttemptCount sql.NullInt64
+		var attemptCount, attemptRows, maxAttemptNumber int
+		if err := rows.Scan(&jobID, &state, &terminalAt, &terminalAttemptCount, &attemptCount, &attemptRows, &maxAttemptNumber); err != nil {
 			return nil, err
 		}
+
+		currentlyReopened := terminalAt.Valid && state != "SUCCEEDED" && state != "CANCELLED" && state != "DEAD_LETTERED"
+		historicallyReopened := terminalAttemptCount.Valid && int64(maxAttemptNumber) > terminalAttemptCount.Int64
+		missingMarker := terminalAt.Valid && !terminalAttemptCount.Valid
+		negativeMarker := terminalAttemptCount.Valid && terminalAttemptCount.Int64 < 0
+		markerExceedsAttempts := terminalAttemptCount.Valid && terminalAttemptCount.Int64 > int64(attemptCount)
+
+		var reasons []string
+		if currentlyReopened {
+			reasons = append(reasons, fmt.Sprintf(
+				"terminal_at=%s is set but current state=%s is not terminal (SUCCEEDED/CANCELLED/DEAD_LETTERED) -- terminal state was reopened (%d job_attempts row(s) on record)",
+				terminalAt.Time.Format(time.RFC3339Nano), state, attemptRows))
+		}
+		if historicallyReopened {
+			reasons = append(reasons, fmt.Sprintf(
+				"job_attempts has attempt_number up to %d, beyond terminal_attempt_count=%d recorded when this job first became terminal (current state=%s) -- terminal state was reopened and then re-terminalized, masking current-state detection (%d job_attempts row(s) on record)",
+				maxAttemptNumber, terminalAttemptCount.Int64, state, attemptRows))
+		}
+		if missingMarker {
+			reasons = append(reasons, fmt.Sprintf(
+				"terminal_at=%s is set but terminal_attempt_count is NULL -- every supported terminalization path must capture it atomically (migration 0004); historical reopen detection is silently disabled for this row",
+				terminalAt.Time.Format(time.RFC3339Nano)))
+		}
+		if negativeMarker {
+			reasons = append(reasons, fmt.Sprintf(
+				"terminal_attempt_count=%d is negative -- attempt_count never decreases below 0, so this cannot be a legitimate first-terminalization snapshot",
+				terminalAttemptCount.Int64))
+		}
+		if markerExceedsAttempts {
+			reasons = append(reasons, fmt.Sprintf(
+				"terminal_attempt_count=%d exceeds current attempt_count=%d -- the marker can never durably exceed the count it was captured from",
+				terminalAttemptCount.Int64, attemptCount))
+		}
+		if len(reasons) == 0 {
+			// Unreachable: the WHERE clause above is the exact disjunction
+			// of the five conditions checked here.
+			continue
+		}
+
 		out = append(out, Violation{
 			InvariantID: "TF-INV-005",
 			Subject:     "job:" + jobID.String(),
-			Detail:      fmt.Sprintf("attempt %d (id=%s) started after the job's terminal_at -- terminal state was reopened", attemptNumber, attemptID),
+			Detail:      strings.Join(reasons, "; "),
 		})
 	}
 	return out, rows.Err()

@@ -52,7 +52,7 @@ func TestChaos_DatabaseRollback_ClaimAndRetryTransitionsSurviveInjectedFailure(t
 				// Poison this job's very first claim attempt (attempt_number=1).
 				require.NoError(t, chaos.PoisonAttemptInsert(ctx, db, created.ID, 1))
 
-				_, ok, err := s.Claim(ctx, fmt.Sprintf("rollback-worker-%d", i))
+				_, ok, err := claimUntilResolved(t, ctx, s, fmt.Sprintf("rollback-worker-%d", i))
 				require.Error(t, err, "a poisoned attempt insert must surface as an error, not silently succeed")
 				require.False(t, ok)
 
@@ -68,7 +68,7 @@ func TestChaos_DatabaseRollback_ClaimAndRetryTransitionsSurviveInjectedFailure(t
 				// seeded coin flip) either succeeds outright or is pushed
 				// through one retryable failure first, proving the store
 				// recovers cleanly from the injected failure either way.
-				claimed, ok, err := s.Claim(ctx, fmt.Sprintf("recovery-worker-%d", i))
+				claimed, ok, err := claimUntilResolved(t, ctx, s, fmt.Sprintf("recovery-worker-%d", i))
 				require.NoError(t, err)
 				require.True(t, ok)
 				require.Equal(t, int64(1), claimed.LeaseGeneration)
@@ -77,7 +77,7 @@ func TestChaos_DatabaseRollback_ClaimAndRetryTransitionsSurviveInjectedFailure(t
 					_, err = s.CompleteRetryableFailure(ctx, claimed.ID, fmt.Sprintf("recovery-worker-%d", i), claimed.LeaseGeneration, "transient", 0)
 					require.NoError(t, err)
 					require.NoError(t, chaos.ForceSetEligibleAt(ctx, db, claimed.ID, 0))
-					reclaimed, ok, err := s.Claim(ctx, fmt.Sprintf("recovery-worker-2-%d", i))
+					reclaimed, ok, err := claimUntilResolved(t, ctx, s, fmt.Sprintf("recovery-worker-2-%d", i))
 					require.NoError(t, err)
 					require.True(t, ok)
 					_, err = s.CompleteSuccess(ctx, reclaimed.ID, fmt.Sprintf("recovery-worker-2-%d", i), reclaimed.LeaseGeneration, nil)
@@ -110,7 +110,7 @@ func TestChaos_ConnectionInterruption_TerminatedBackendDoesNotCorruptState(t *te
 	for i := 0; i < numJobs; i++ {
 		created, err := s.Insert(ctx, newChaosParams("chaos.conninterrupt", 5))
 		require.NoError(t, err)
-		claimed, ok, err := s.Claim(ctx, fmt.Sprintf("conn-worker-%d", i))
+		claimed, ok, err := claimUntilResolved(t, ctx, s, fmt.Sprintf("conn-worker-%d", i))
 		require.NoError(t, err)
 		require.True(t, ok)
 

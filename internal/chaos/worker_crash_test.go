@@ -74,7 +74,7 @@ func TestChaos_WorkerCrashCampaign_SeededVariedCrashPoints(t *testing.T) {
 				require.NoError(t, err)
 
 				owner := fmt.Sprintf("crash-worker-%03d-%d", i, seed)
-				claimed, ok, err := s.Claim(ctx, owner)
+				claimed, ok, err := claimUntilResolved(t, ctx, s, owner)
 				require.NoError(t, err)
 				require.True(t, ok)
 

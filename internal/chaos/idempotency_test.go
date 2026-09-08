@@ -144,7 +144,7 @@ func TestChaos_DuplicateLogicalEffectAfterReclaim_IdempotentDownstreamDedupes(t 
 		id := created.ID.String()
 
 		firstOwner := fmt.Sprintf("dupeffect-first-%d", i)
-		claimed, ok, err := s.Claim(ctx, firstOwner)
+		claimed, ok, err := claimUntilResolved(t, ctx, s, firstOwner)
 		require.NoError(t, err)
 		require.True(t, ok)
 
