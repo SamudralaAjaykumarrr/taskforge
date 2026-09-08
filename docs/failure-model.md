@@ -107,3 +107,24 @@ handle them:
 Every "Yes" entry above must have a corresponding scenario in
 [scenario-corpus.md](scenario-corpus.md) and a corresponding row in the
 invariant-to-test matrix in [testing-strategy.md](testing-strategy.md).
+
+## Phase 9 Chaos Coverage
+
+[roadmap.md](roadmap.md)'s Phase 9 ("Chaos, Load, and Failure Testing")
+drives combinations of the "Yes" entries above through `internal/chaos`'s
+seeded campaigns and `cmd/chaos`'s manual stress/soak harness — see
+[testing-strategy.md](testing-strategy.md)'s Phase 9 section. Exercised in
+combination, at real PostgreSQL boundaries (never simulated/mocked): F1,
+F2, F5, F6 (via a real terminated backend connection and a constrained
+connection pool, not a simulated network partition), F7, F8, F10, F11,
+F12, F13, F14, F15, F16, F20. **Not** exercised by this phase's harness:
+F3/F18's "cannot reach PostgreSQL at all" half (degrades to F1/F2, which
+is exercised; the partial-network-failure framing itself is not
+separately simulated), F4 (API-process crash specifically — Phase 9's
+harness drives the store/worker layer directly, not a full HTTP-boundary
+process kill), F9 (covered indirectly via F11/F13, not as a distinct
+long-running-job scenario), F17 (already eliminated by design per the
+Clock Model above, not something chaos testing could newly falsify), and
+F19 (there is no separate scheduler process to restart). See README.md's
+"Phase 9: What's Implemented" — "Not implemented / not exercised" for the
+full, honest list of what this phase's harness does not cover.

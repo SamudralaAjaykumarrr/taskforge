@@ -473,6 +473,98 @@ concurrency-sensitive tests were run repeatedly under `-race`
 'TestStress|TestMetrics_ConcurrentRecording_RaceSafe|ConcurrentFanIn|MultiWorker_FanOut|StaleGeneration'`)
 with zero failures and zero detected data races.
 
+As of Phase 9 ("Chaos, Load, and Failure Testing", [roadmap.md](roadmap.md)),
+the following additional categories now have real, passing, executable
+tests — the **Load tests** and **Chaos tests** categories this document's
+own Test Categories table above named as "Phase 9" from the start:
+
+- **A durable-state invariant checker** (`internal/invariant`), used by
+  every campaign below: `Checker.CheckAll` queries real PostgreSQL
+  directly (never logs or metrics — "Durable state remains authoritative"
+  per [roadmap.md](roadmap.md)'s Phase 9 scope) and reports every
+  violation of TF-INV-002/005/006/007/008/009/012/014/016 it can detect
+  from a point-in-time snapshot; `CheckJobsExist` separately proves the
+  harness-tracked half of TF-INV-001. Invariants that are fundamentally
+  about a rejected or correctly-timed *write* rather than a durable
+  snapshot property (TF-INV-003/004/010/011/013/015) remain proven by the
+  existing scenario suite (SF-002/003/007/008/012/013/014/016/017); the
+  checker's TF-INV-002/014 check additionally re-verifies those
+  structurally (a stale write that had wrongly succeeded would appear as
+  a reused/non-monotonic `lease_generation`). The checker package has its
+  own direct unit tests (`internal/invariant/invariant_test.go`): a
+  clean-state baseline (no false positives against ordinary
+  store-produced durable state) plus one test per detector, each forging
+  the corresponding violation via raw SQL that bypasses
+  `internal/store`'s fenced API entirely — the only way to reach most of
+  these states at all. One of those tests discovered that migration
+  0001's `jobs_attempt_count_check` CHECK constraint is a second,
+  schema-level enforcement layer for TF-INV-006 (it rejects
+  `attempt_count > max_attempts` outright except for `DEAD_LETTERED`
+  jobs) — not a defect, but a fact about the schema this document had not
+  previously called out.
+- **Deterministic, seed-reproducible fault-injection primitives**
+  (`internal/chaos`): a concurrency-safe seeded action-picker
+  (`chaos.Rand`, mirroring `internal/retry.Rand`), DB-time manipulation
+  helpers exported for reuse (`ForceExpireLease`, `ForceSetEligibleAt`,
+  etc.), a real UNIQUE-constraint-collision rollback trigger
+  (`PoisonAttemptInsert`), and real, forcibly severed PostgreSQL
+  connections via `pg_terminate_backend` (`BackendPID`/`TerminateBackend`)
+  — every one operating at a real PostgreSQL boundary, never a mock and
+  never a production-only crash hook, per [roadmap.md](roadmap.md)'s
+  Phase 9 "Fault-Injection Design" guidance.
+- **A CI-safe, seeded, bounded adversarial suite** (`internal/chaos`'s
+  own `_test.go` files), covering every fault class in
+  [failure-model.md](failure-model.md)'s "handled in v1" list in
+  combination: worker-crash campaigns with varied crash points
+  (`TestChaos_WorkerCrashCampaign_SeededVariedCrashPoints`), heartbeat-vs-
+  reclaim races (`TestChaos_HeartbeatRacesReclaim_Seeded`), database
+  transaction rollback / connection interruption / constrained-pool
+  injection (`TestChaos_DatabaseRollback_*`,
+  `TestChaos_ConnectionInterruption_*`,
+  `TestChaos_ConstrainedConnectionPool_*`), a hundred-job retry storm
+  with randomized `max_attempts`/failure counts
+  (`TestChaos_RetryStorm_SeededManyJobsUnderContention`), duplicate
+  submission and duplicate-logical-effect-after-reclaim campaigns
+  (`TestChaos_ResponseLossDuplicateSubmission_*`,
+  `TestChaos_DuplicateLogicalEffectAfterReclaim_*`), scheduling/
+  cancellation/timeout chaos (`TestChaos_ScheduledJobSurvivesSimulatedFleetRestart`,
+  `TestChaos_CancellationRacesClaimAndExecution_Seeded`,
+  `TestChaos_TimeoutRacesLeaseAndHeartbeat`), workflow chaos
+  (`TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded`,
+  `TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent`,
+  `TestChaos_StaleWorkflowNodeCompletion_NeverUnblocksOrCancelsDependents`),
+  observability-under-failure (`TestChaos_ObservabilityDuringFailure_*`),
+  and the flagship combined campaign — a simulated multi-worker-instance
+  fleet restart plus one seeded property-style campaign mixing plain
+  jobs, scheduled jobs, duplicate idempotent submissions, and workflows
+  across up to 60 rounds, with the **full invariant suite re-checked
+  after every round**, not just at the end
+  (`TestChaos_MultipleWorkerInstancesRestart_Seeded`,
+  `TestChaos_CombinedCampaign_AllInvariantsSimultaneously_Seeded`). Every
+  test logs its seed (`t.Logf("chaos seed=%d", seed)`) before running, per
+  this document's determinism requirement below, extended explicitly to
+  chaos: "A test failure must report enough information to reproduce the
+  exact sequence" ([roadmap.md](roadmap.md)).
+- **A manually invoked stress/soak harness** (`cmd/chaos`), separate from
+  the CI-safe suite per [roadmap.md](roadmap.md)'s "CI vs Manual Stress"
+  requirement: accepts `-seed`, workload-size flags, and a bounded
+  `-duration`; `-mode=stress` runs one bounded campaign, `-mode=soak`
+  repeats bounded campaigns back to back for the full duration (deriving
+  a distinct deterministic seed per iteration) and stops immediately on
+  the first iteration that finds a violation; checks the full invariant
+  suite on a timer while a campaign is in flight, not only at the end;
+  and returns a nonzero exit code on any violation. See
+  README.md's "Phase 9: What's Implemented" for the exact commands,
+  results actually obtained, and the honest gap to
+  [roadmap.md](roadmap.md)'s multi-hour Stable quality gate.
+
+Every concurrency-sensitive test in `internal/chaos` was run repeatedly
+(`go test -p 1 -count=2 ./internal/chaos/...`) and under `-race`
+(`go test -race -p 1 ./internal/chaos/...`) with zero failures and zero
+detected data races during this phase's development. The full
+pre-existing Phase 1-8 regression suite remains green, including under
+`-race`, with no test's assertions weakened.
+
 The invariant-to-test matrix below is the full, multi-phase plan and is
 **not** rewritten per phase — see [docs/roadmap.md](roadmap.md)'s Phase 1
 and Phase 2 sections for exactly which invariants each phase is
