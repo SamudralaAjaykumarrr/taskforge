@@ -141,32 +141,40 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		return false, nil
 	}
 
+	// Phase 8: job_id/job_type/worker_id/attempt/lease_generation are the
+	// stable correlation fields docs/observability.md requires on every
+	// job-lifecycle log line (see internal/store's claim/reclaim/sweep
+	// logging for the base-vocabulary counterpart of this same event
+	// set). Claim's own outcome (a fresh claim vs. a genuine lease-expiry
+	// reclaim) is now logged by internal/store.Claim itself, which is
+	// the only place that actually knows the distinction -- see
+	// internal/store/claim.go's recordClaim doc comment for why the
+	// previous "lease_generation > 1" heuristic here was inaccurate as
+	// of Phase 3 (RETRY_WAIT claims also advance lease_generation).
 	log := w.logger.With(
 		"job_id", j.ID.String(),
 		"job_type", j.JobType,
+		"worker_id", w.ID,
 		"attempt", j.AttemptCount,
 		"lease_generation", j.LeaseGeneration,
 	)
-	if j.LeaseGeneration > 1 {
-		// Phase 2 has no RETRY_WAIT reclaim path yet (docs/roadmap.md
-		// non-goal), so lease_generation > 1 unambiguously means this
-		// claim came from the expired-lease reclaim branch, not a fresh
-		// QUEUED/RETRY_WAIT claim — log it distinctly so an operator can
-		// see crash recovery happening without having to infer it from
-		// the generation number alone.
-		log.Warn("job reclaimed after lease expiration", "previous_lease_generation", j.LeaseGeneration-1)
-	} else {
-		log.Info("job claimed")
-	}
 
 	h, found := w.registry.Lookup(j.JobType)
 	if !found {
-		log.Warn("no handler registered for job_type; dead-lettering")
+		log.Warn("no handler registered for job_type; dead-lettering", "event", "permanent_failure", "retryable", false)
 		errMsg := handler.ErrNoHandler{JobType: j.JobType}.Error()
-		_, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, errMsg, job.ErrorClassPermanent)
+		result, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, errMsg, job.ErrorClassPermanent)
+		if errors.Is(ferr, store.ErrStaleTransition) {
+			log.Warn("dead-letter report rejected: lease no longer current", "event", "stale_completion_rejected")
+			return true, nil
+		}
+		if ferr == nil {
+			log.Warn("job dead-lettered", "event", "dead_lettered", "state", string(result.State))
+		}
 		return true, ferr
 	}
 
+	log.Info("execution starting", "event", "execution_start")
 	result, execErr, disposition := w.runWithHeartbeat(ctx, log, j, h)
 
 	switch disposition {
@@ -177,7 +185,7 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		// no longer hold); skip it rather than making a call we already
 		// know is stale. This is the concrete "stop behaving as the
 		// authoritative owner" behavior docs/worker-protocol.md requires.
-		log.Warn("lease lost during execution; not attempting completion")
+		log.Warn("lease lost during execution; not attempting completion", "event", "lease_lost")
 		return true, nil
 	case dispositionCancelled:
 		// A cancellation request was durably observed during execution
@@ -202,11 +210,13 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		return true, w.reportFailure(ctx, log, j, execErr)
 	}
 
-	log.Info("job execution succeeded")
-	_, cerr := w.store.CompleteSuccess(ctx, j.ID, w.ID, j.LeaseGeneration, result.Metadata)
+	completed, cerr := w.store.CompleteSuccess(ctx, j.ID, w.ID, j.LeaseGeneration, result.Metadata)
 	if errors.Is(cerr, store.ErrStaleTransition) {
-		log.Warn("success report rejected: lease no longer current")
+		log.Warn("success report rejected: lease no longer current", "event", "stale_completion_rejected")
 		return true, nil
+	}
+	if cerr == nil {
+		log.Info("job execution succeeded", "event", "execution_success", "state", string(completed.State))
 	}
 	return true, cerr
 }
@@ -231,21 +241,27 @@ func (w *Worker) reportFailure(ctx context.Context, log *slog.Logger, j *job.Job
 	class, _ := handler.Classify(execErr)
 
 	if class == handler.ClassPermanent {
-		log.Info("permanent failure; dead-lettering", "error", execErr)
-		_, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), job.ErrorClassPermanent)
+		log.Info("permanent failure; dead-lettering", "event", "permanent_failure",
+			"error", execErr, "error_class", job.ErrorClassPermanent, "retryable", false)
+		result, ferr := w.store.CompleteFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), job.ErrorClassPermanent)
 		if errors.Is(ferr, store.ErrStaleTransition) {
-			log.Warn("failure report rejected: lease no longer current")
+			log.Warn("failure report rejected: lease no longer current", "event", "stale_completion_rejected")
 			return nil
+		}
+		if ferr == nil {
+			log.Warn("job dead-lettered", "event", "dead_lettered", "state", string(result.State))
 		}
 		return ferr
 	}
 
 	delay := retry.Delay(j.AttemptCount, w.retryConfig, w.rand)
-	log.Info("retryable failure", "error", execErr, "attempt_count", j.AttemptCount, "max_attempts", j.MaxAttempts)
+	log.Info("retryable failure", "event", "retryable_failure", "error", execErr,
+		"error_class", job.ErrorClassRetryable, "retryable", true,
+		"attempt_count", j.AttemptCount, "max_attempts", j.MaxAttempts)
 
 	result, ferr := w.store.CompleteRetryableFailure(ctx, j.ID, w.ID, j.LeaseGeneration, execErr.Error(), delay)
 	if errors.Is(ferr, store.ErrStaleTransition) {
-		log.Warn("retryable failure report rejected: lease no longer current")
+		log.Warn("retryable failure report rejected: lease no longer current", "event", "stale_completion_rejected")
 		return nil
 	}
 	if ferr != nil {
@@ -253,10 +269,10 @@ func (w *Worker) reportFailure(ctx context.Context, log *slog.Logger, j *job.Job
 	}
 
 	if result.State == jobstate.DeadLettered {
-		log.Warn("retries exhausted; job dead-lettered",
+		log.Warn("retries exhausted; job dead-lettered", "event", "dead_lettered", "state", string(result.State),
 			"attempt_count", result.AttemptCount, "max_attempts", result.MaxAttempts)
 	} else {
-		log.Info("retry scheduled",
+		log.Info("retry scheduled", "event", "retry_scheduled", "state", string(result.State),
 			"eligible_at", result.EligibleAt, "delay_seconds", delay.Seconds())
 	}
 	return nil
@@ -279,11 +295,15 @@ func (w *Worker) reportFailure(ctx context.Context, log *slog.Logger, j *job.Job
 // acknowledgement race) before this call landed — TF-INV-010's race
 // rule, not an error condition.
 func (w *Worker) reportCancelled(ctx context.Context, log *slog.Logger, j *job.Job) error {
-	log.Info("cancellation observed during execution; acknowledging")
-	_, cerr := w.store.CompleteCancelled(ctx, j.ID, w.ID, j.LeaseGeneration)
+	log.Info("cancellation observed during execution; acknowledging", "event", "cancellation_observed")
+	result, cerr := w.store.CompleteCancelled(ctx, j.ID, w.ID, j.LeaseGeneration)
 	if errors.Is(cerr, store.ErrStaleTransition) {
-		log.Warn("cancellation acknowledgement rejected: lease no longer current or job already resolved")
+		log.Warn("cancellation acknowledgement rejected: lease no longer current or job already resolved",
+			"event", "stale_completion_rejected")
 		return nil
+	}
+	if cerr == nil {
+		log.Info("cancellation acknowledged", "event", "cancellation_acknowledged", "state", string(result.State))
 	}
 	return cerr
 }
@@ -298,12 +318,13 @@ func (w *Worker) reportCancelled(ctx context.Context, log *slog.Logger, j *job.J
 // failure (TF-INV-006), through Store.CompleteTimeout.
 func (w *Worker) reportTimeout(ctx context.Context, log *slog.Logger, j *job.Job) error {
 	delay := retry.Delay(j.AttemptCount, w.retryConfig, w.rand)
-	log.Warn("execution timeout exceeded", "attempt_count", j.AttemptCount, "max_attempts", j.MaxAttempts,
+	log.Warn("execution timeout exceeded", "event", "execution_timeout", "retryable", true,
+		"attempt_count", j.AttemptCount, "max_attempts", j.MaxAttempts,
 		"execution_timeout_seconds", j.ExecutionTimeoutSeconds)
 
 	result, ferr := w.store.CompleteTimeout(ctx, j.ID, w.ID, j.LeaseGeneration, delay)
 	if errors.Is(ferr, store.ErrStaleTransition) {
-		log.Warn("timeout report rejected: lease no longer current")
+		log.Warn("timeout report rejected: lease no longer current", "event", "stale_completion_rejected")
 		return nil
 	}
 	if ferr != nil {
@@ -311,10 +332,10 @@ func (w *Worker) reportTimeout(ctx context.Context, log *slog.Logger, j *job.Job
 	}
 
 	if result.State == jobstate.DeadLettered {
-		log.Warn("retries exhausted after timeout; job dead-lettered",
+		log.Warn("retries exhausted after timeout; job dead-lettered", "event", "dead_lettered", "state", string(result.State),
 			"attempt_count", result.AttemptCount, "max_attempts", result.MaxAttempts)
 	} else {
-		log.Info("retry scheduled after timeout",
+		log.Info("retry scheduled after timeout", "event", "retry_scheduled", "state", string(result.State),
 			"eligible_at", result.EligibleAt, "delay_seconds", delay.Seconds())
 	}
 	return nil
@@ -430,9 +451,9 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 				hbJob, herr := w.store.Heartbeat(hbCtx, j.ID, w.ID, j.LeaseGeneration, leaseDuration)
 				hbCancel()
 				if herr == nil {
-					log.Debug("heartbeat renewed lease")
+					log.Debug("heartbeat renewed lease", "event", "heartbeat")
 					if hbJob.CancelRequested {
-						log.Info("cancellation observed via heartbeat; signalling handler to stop")
+						log.Info("cancellation observed via heartbeat; signalling handler to stop", "event", "cancellation_requested_observed")
 						mu.Lock()
 						cancelObserved = true
 						mu.Unlock()
@@ -442,7 +463,8 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 					continue
 				}
 				if errors.Is(herr, store.ErrStaleTransition) {
-					log.Warn("heartbeat rejected: lease lost to another worker or job reached a terminal state")
+					log.Warn("heartbeat rejected: lease lost to another worker or job reached a terminal state",
+						"event", "stale_completion_rejected")
 					mu.Lock()
 					leaseLost = true
 					mu.Unlock()

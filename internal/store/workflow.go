@@ -81,6 +81,20 @@ func parseUUIDArrayLiteral(s string) ([]uuid.UUID, error) {
 	return out, nil
 }
 
+// logWorkflowFinalized logs a workflow's terminal-state transition, per
+// propagateWorkflowTransition's doc comment: callers invoke this ONLY
+// after their own transaction (which is what actually finalized the
+// workflow) has committed. A no-op if finalState is "" (this call did
+// not finalize a workflow -- either it is not yet complete, or a
+// concurrent call already did).
+func (s *Store) logWorkflowFinalized(workflowID uuid.UUID, finalState string) {
+	if finalState == "" {
+		return
+	}
+	s.logger.Info("workflow finalized",
+		"event", "workflow_finalized", "workflow_id", workflowID.String(), "state", finalState)
+}
+
 // CreateWorkflow durably and atomically creates a workflow instance, every
 // one of its nodes' underlying jobs, and the workflow_nodes rows linking
 // them, per docs/workflows.md's model — all inside a single PostgreSQL
@@ -120,12 +134,14 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 		nodeIDs[n.NodeKey] = uuid.New()
 	}
 
+	jobTypes := make([]string, 0, len(g.Nodes))
 	for _, n := range g.Nodes {
 		jobID := uuid.New()
 		blocked := len(n.DependsOn) > 0
 		if err := insertWorkflowNodeJob(ctx, tx, jobID, n, blocked); err != nil {
 			return nil, fmt.Errorf("store: create workflow: insert node %q job: %w", n.NodeKey, err)
 		}
+		jobTypes = append(jobTypes, n.JobType)
 
 		depIDs := make([]uuid.UUID, 0, len(n.DependsOn))
 		for _, dep := range n.DependsOn {
@@ -144,6 +160,18 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: create workflow: commit: %w", err)
 	}
+
+	// Phase 8: each workflow node's underlying job is a submission like
+	// any other (docs/observability.md's taskforge_jobs_submitted_total),
+	// recorded only now that the whole atomic creation has actually
+	// committed. Workflow creation has no idempotency-key contract (see
+	// this file's package doc comment), so
+	// taskforge_idempotent_submission_hits_total never applies here.
+	for _, jt := range jobTypes {
+		s.metrics.JobsSubmittedTotal.WithLabelValues(jt).Inc()
+	}
+	s.logger.Info("workflow created",
+		"event", "workflow_created", "workflow_id", workflowID.String(), "node_count", len(g.Nodes))
 
 	return s.GetWorkflow(ctx, workflowID)
 }
@@ -288,7 +316,7 @@ func loadWorkflowNodes(ctx context.Context, q nodeQuerier, workflowID uuid.UUID)
 // reports the workflow's actual current state, mirroring
 // docs/worker-protocol.md's job-level cancel contract.
 func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error) {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET cancel_requested = true,
 			cancel_requested_at = COALESCE(cancel_requested_at, now()),
@@ -296,6 +324,9 @@ func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Ins
 		WHERE id = $1 AND state = 'RUNNING'`, id)
 	if err != nil {
 		return nil, fmt.Errorf("store: cancel workflow %s: record request: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		s.logger.Info("workflow cancellation requested", "event", "workflow_cancellation_requested", "workflow_id", id.String())
 	}
 
 	inst, err := s.GetWorkflow(ctx, id)
@@ -522,18 +553,32 @@ func resolveDependent(ctx context.Context, tx *sql.Tx, dep dependentNode) (casca
 // (see finalizeWorkflowIfComplete) — guarded so a workflow's terminal
 // state, once set, is never reopened (mirrors TF-INV-005's job-level
 // guarantee at the workflow level).
-func (s *Store) propagateWorkflowTransition(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, newState jobstate.State) error {
+//
+// Phase 8: returns the workflow's id and, if this call is what finalized
+// it, its resulting terminal state ("" otherwise) — every caller uses
+// this ONLY to log "workflow completed/failed/cancelled"
+// (event="workflow_finalized") after ITS OWN transaction has committed
+// (never from within this function, which runs mid-transaction: a log
+// line asserting a workflow finalized must not be emitted before that
+// fact is actually durable). Per-node activation/cascade-cancellation
+// events are not surfaced this way — see docs/observability.md's
+// "Implementation Notes" for why that finer-grained logging was left
+// out of Phase 8's scope (it would require threading a similar
+// commit-deferred event list through every one of this function's five
+// call sites for a purely diagnostic, non-metric benefit; per-node
+// history remains queryable via GET /workflows/{id} and job_attempts).
+func (s *Store) propagateWorkflowTransition(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, newState jobstate.State) (workflowID uuid.UUID, finalState string, err error) {
 	if newState != jobstate.Succeeded && newState != jobstate.DeadLettered && newState != jobstate.Cancelled {
-		return nil
+		return uuid.UUID{}, "", nil
 	}
 
-	var nodeID, workflowID uuid.UUID
-	err := tx.QueryRowContext(ctx, `SELECT id, workflow_instance_id FROM workflow_nodes WHERE job_id = $1`, jobID).Scan(&nodeID, &workflowID)
+	var nodeID uuid.UUID
+	err = tx.QueryRowContext(ctx, `SELECT id, workflow_instance_id FROM workflow_nodes WHERE job_id = $1`, jobID).Scan(&nodeID, &workflowID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return uuid.UUID{}, "", nil
 	}
 	if err != nil {
-		return fmt.Errorf("propagate workflow transition: lookup node for job %s: %w", jobID, err)
+		return uuid.UUID{}, "", fmt.Errorf("propagate workflow transition: lookup node for job %s: %w", jobID, err)
 	}
 
 	queue := []uuid.UUID{nodeID}
@@ -543,12 +588,12 @@ func (s *Store) propagateWorkflowTransition(ctx context.Context, tx *sql.Tx, job
 
 		deps, err := dependentsOf(ctx, tx, current)
 		if err != nil {
-			return fmt.Errorf("propagate workflow transition: %w", err)
+			return uuid.UUID{}, "", fmt.Errorf("propagate workflow transition: %w", err)
 		}
 		for _, d := range deps {
 			cascaded, err := resolveDependent(ctx, tx, d)
 			if err != nil {
-				return fmt.Errorf("propagate workflow transition: %w", err)
+				return uuid.UUID{}, "", fmt.Errorf("propagate workflow transition: %w", err)
 			}
 			if cascaded {
 				queue = append(queue, d.id)
@@ -556,10 +601,11 @@ func (s *Store) propagateWorkflowTransition(ctx context.Context, tx *sql.Tx, job
 		}
 	}
 
-	if err := finalizeWorkflowIfComplete(ctx, tx, workflowID); err != nil {
-		return fmt.Errorf("propagate workflow transition: %w", err)
+	finalState, err = finalizeWorkflowIfComplete(ctx, tx, workflowID)
+	if err != nil {
+		return uuid.UUID{}, "", fmt.Errorf("propagate workflow transition: %w", err)
 	}
-	return nil
+	return workflowID, finalState, nil
 }
 
 // finalizeWorkflowIfComplete sets workflow_instances.state to a terminal
@@ -579,7 +625,13 @@ func (s *Store) propagateWorkflowTransition(ctx context.Context, tx *sql.Tx, job
 // idempotent and, combined with the fact that no code path in this
 // package ever transitions workflow_instances out of a terminal state,
 // enforces that a workflow's terminal state, once set, is never reopened.
-func finalizeWorkflowIfComplete(ctx context.Context, tx *sql.Tx, workflowID uuid.UUID) error {
+//
+// Phase 8: returns the terminal state this call itself set ("" if the
+// workflow is not yet complete, or was already finalized by an earlier
+// call), so propagateWorkflowTransition's caller can log the event only
+// once, only by the call that actually caused it, and only after its own
+// transaction commits.
+func finalizeWorkflowIfComplete(ctx context.Context, tx *sql.Tx, workflowID uuid.UUID) (string, error) {
 	var total, nonTerminal, failedOrCancelled int
 	err := tx.QueryRowContext(ctx, `
 		SELECT
@@ -590,10 +642,10 @@ func finalizeWorkflowIfComplete(ctx context.Context, tx *sql.Tx, workflowID uuid
 		WHERE wn.workflow_instance_id = $1`, workflowID,
 	).Scan(&total, &nonTerminal, &failedOrCancelled)
 	if err != nil {
-		return fmt.Errorf("finalize workflow %s: %w", workflowID, err)
+		return "", fmt.Errorf("finalize workflow %s: %w", workflowID, err)
 	}
 	if total == 0 || nonTerminal > 0 {
-		return nil
+		return "", nil
 	}
 
 	// If literally every node SUCCEEDED, the workflow SUCCEEDED --
@@ -613,19 +665,29 @@ func finalizeWorkflowIfComplete(ctx context.Context, tx *sql.Tx, workflowID uuid
 
 		var cancelRequested bool
 		if err := tx.QueryRowContext(ctx, `SELECT cancel_requested FROM workflow_instances WHERE id = $1`, workflowID).Scan(&cancelRequested); err != nil {
-			return fmt.Errorf("finalize workflow %s: read cancel_requested: %w", workflowID, err)
+			return "", fmt.Errorf("finalize workflow %s: read cancel_requested: %w", workflowID, err)
 		}
 		if cancelRequested {
 			finalState = "CANCELLED"
 		}
 	}
 
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET state = $2, terminal_at = now(), updated_at = now()
 		WHERE id = $1 AND state = 'RUNNING'`, workflowID, finalState)
 	if err != nil {
-		return fmt.Errorf("finalize workflow %s: %w", workflowID, err)
+		return "", fmt.Errorf("finalize workflow %s: %w", workflowID, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("finalize workflow %s: rows affected: %w", workflowID, err)
+	}
+	if n == 0 {
+		// Already finalized by an earlier call (redundant invocation --
+		// e.g. two predecessors failing concurrently) -- not an error,
+		// just nothing new for this call to report.
+		return "", nil
+	}
+	return finalState, nil
 }

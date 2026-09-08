@@ -8,18 +8,23 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/handler"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/worker"
@@ -92,11 +97,39 @@ func run(logger *slog.Logger) error {
 	registry.Register("demo.echo", echoHandler{logger: logger})
 	registry.Register("demo.flaky", flakyHandler{logger: logger, failUntilAttempt: 3})
 
+	// Phase 8: m is shared between the Store (every metric it records --
+	// see internal/store) and this process's standalone /metrics HTTP
+	// listener below. A fresh, private registry per process -- see
+	// internal/metrics.New's doc comment.
+	m := metrics.New()
+	st := store.New(db, store.WithMetrics(m), store.WithLogger(logger))
+	m.Registry.MustRegister(metrics.NewStateCollector(st, cfg.ActiveWorkerWindow, logger))
+
 	workerID := fmt.Sprintf("worker-%d-%s", os.Getpid(), hostname())
-	w := worker.New(workerID, store.New(db), registry, cfg.WorkerPollInterval, logger)
+	w := worker.New(workerID, st, registry, cfg.WorkerPollInterval, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.MetricsAddr != "" {
+		metricsSrv := &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Info("worker metrics endpoint listening", "addr", cfg.MetricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("worker metrics endpoint exited with error", "error", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+	}
 
 	logger.Info("worker starting", "worker_id", workerID, "poll_interval", cfg.WorkerPollInterval)
 	err = w.Run(ctx)

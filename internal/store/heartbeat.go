@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,7 +28,9 @@ import (
 // the caller "must abort execution immediately" on this error — see
 // internal/worker's heartbeat loop.
 func (s *Store) Heartbeat(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, extension time.Duration) (*job.Job, error) {
-	return s.transition(ctx, s.db, jobstate.Running, jobstate.Running, `
+	s.metrics.HeartbeatsTotal.Inc()
+
+	j, err := s.transition(ctx, s.db, jobstate.Running, jobstate.Running, `
 		UPDATE jobs
 		SET lease_expires_at = now() + make_interval(secs => $4::double precision),
 			heartbeat_at = now(),
@@ -36,4 +39,8 @@ func (s *Store) Heartbeat(ctx context.Context, id uuid.UUID, leaseOwner string, 
 		RETURNING `+jobColumns,
 		id, leaseOwner, leaseGeneration, extension.Seconds(),
 	)
+	if errors.Is(err, ErrStaleTransition) {
+		s.metrics.StaleCompletionRejectionsTotal.Inc()
+	}
+	return j, err
 }

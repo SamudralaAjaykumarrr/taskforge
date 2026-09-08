@@ -119,6 +119,7 @@ func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job
 	)
 	j, err := scanJob(row)
 	if err == nil {
+		s.metrics.JobsSubmittedTotal.WithLabelValues(p.JobType).Inc()
 		return j, true, nil
 	}
 	if p.IdempotencyKey == nil || !isIdempotencyKeyViolation(err) {
@@ -129,6 +130,8 @@ func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job
 	if gerr != nil {
 		return nil, false, fmt.Errorf("store: insert job: idempotency conflict, re-read failed: %w", gerr)
 	}
+	s.metrics.JobsSubmittedTotal.WithLabelValues(p.JobType).Inc()
+	s.metrics.IdempotentSubmissionHitsTotal.Inc()
 	return existing, false, nil
 }
 

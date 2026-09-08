@@ -11,22 +11,65 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 )
 
 // Store is a PostgreSQL-backed job repository.
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	metrics *metrics.Metrics
+	logger  *slog.Logger
+}
+
+// Option configures optional Store dependencies. See WithMetrics and
+// WithLogger.
+type Option func(*Store)
+
+// WithMetrics attaches m as the Store's metrics recorder (Phase 8, per
+// docs/observability.md). Every metric recorded by internal/store is
+// recorded against m -- production wiring (cmd/api, cmd/worker) shares
+// one *metrics.Metrics instance across the Store and the process's
+// /metrics HTTP endpoint; tests pass an isolated metrics.New() to assert
+// against without cross-test interference. If never supplied, New
+// attaches a private, unregistered-anywhere metrics.New() instance, so
+// every Store is always metrics-safe (no nil check needed at any call
+// site) even in the many existing tests that call store.New(db) alone.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(s *Store) { s.metrics = m }
+}
+
+// WithLogger attaches l as the Store's structured logger (Phase 8), used
+// only for the handful of lifecycle events Store uniquely observes and
+// no caller can reconstruct: a genuine lease-expiry reclaim (as opposed
+// to an ordinary post-backoff retry claim, which advances
+// lease_generation identically -- see Claim's doc comment) and the lazy
+// dead-letter sweep's silent DEAD_LETTERED transitions (which have no
+// worker "claim" to attribute them to at all). Every other lifecycle
+// event is logged by internal/worker and internal/api, which have
+// handler-execution context Store does not. Defaults to slog.Default()
+// if never supplied.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Store) { s.logger = l }
 }
 
 // New wraps an already-open *sql.DB. The caller owns the DB's lifecycle
-// (including running migrations before first use).
-func New(db *sql.DB) *Store {
-	return &Store{db: db}
+// (including running migrations before first use). opts configures
+// optional Phase 8 observability dependencies (WithMetrics, WithLogger);
+// omitting them yields a fully functional Store with private,
+// unregistered defaults -- every existing store.New(db) call site
+// continues to compile and behave identically.
+func New(db *sql.DB, opts ...Option) *Store {
+	s := &Store{db: db, metrics: metrics.New(), logger: slog.Default()}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // jobColumns is table-qualified because Claim's RETURNING clause runs in

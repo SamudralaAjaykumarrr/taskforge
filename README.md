@@ -3,12 +3,15 @@
 **Status: Experimental (Phase 1 — Single-Node Durable Job Engine, Phase 2 —
 Worker Leases and Heartbeats, Phase 3 — Retries, Backoff, DLQ, Phase 4 —
 Idempotency, Phase 5 — Concurrency Hardening, Phase 6 — Scheduling,
-Cancellation, Timeouts, and Phase 7 — Workflow/DAG Execution — all
-complete; see "Proposed maturity label" under "Phase 7: What's
-Implemented" below for why this README labels workflow/DAG execution
-Experimental even though the underlying single-job engine it is built on
-has passing coverage for Hardening/Stable-level guarantees).**
-Phases 1 through 7 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
+Cancellation, Timeouts, Phase 7 — Workflow/DAG Execution, and Phase 8 —
+Observability — all complete; see "Proposed maturity label" under "Phase
+7: What's Implemented" below for why this README labels workflow/DAG
+execution Experimental even though the underlying single-job engine it is
+built on has passing coverage for Hardening/Stable-level guarantees; Phase
+8 is Stable per its own roadmap maturity label — see "Phase 8: What's
+Implemented" below — since it adds no new correctness surface for that
+label to qualify).**
+Phases 1 through 8 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication and optional
 `scheduled_at` future-execution requests), multiple concurrent worker
@@ -28,7 +31,7 @@ single-job engine, with dependency-gated eligibility, fan-out/fan-in,
 failure/cancellation propagation, and workflow-level cancellation — see
 "Phase 7: What's Implemented" below. It is **not** distributed beyond a
 single PostgreSQL instance — see "Phase 1: What's Implemented" through
-"Phase 7: What's Implemented" below for the exact boundary. Everything else
+"Phase 8: What's Implemented" below for the exact boundary. Everything else
 described in this README past those sections remains a design target for
 later phases, not a demonstrated capability. TaskForge guarantees
 **at-least-once** execution, never exactly-once for arbitrary external side
@@ -54,7 +57,13 @@ underlying job is an ordinary job row, reusing every guarantee above
 unchanged; see "Phase 7: What's Implemented" below for the dependency-gating
 mechanism and its own explicit limitations (no OR/any-of fan-in, no
 compensation/rollback edges, no dynamic workflow modification, no
-workflow-submission idempotency contract).
+workflow-submission idempotency contract). Phase 8 adds Prometheus-compatible
+metrics, structured event/correlation logging, and durable-state gauges on
+top of every phase above, changing no correctness behavior anywhere —
+observability is diagnostic only, never authoritative; see "Phase 8:
+What's Implemented" below for the exact metric/log surface and its
+explicit non-goals (no tracing, no vendor-specific dashboards or alerting
+rules).
 
 ## The Problem
 
@@ -153,8 +162,8 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
 | Scheduling | **Phase 6 done**: `scheduled_at`/`eligible_at` future-execution semantics, PostgreSQL-authoritative eligibility (no in-memory scheduler), survives full process/fleet restart — see "Phase 6: What's Implemented" below |
 | Cancellation / timeouts | **Phase 6 done**: `POST /jobs/{id}/cancel`, deterministic cancel-vs-completion race resolution (TF-INV-010), a real `execution_timeout` ceiling distinct from lease TTL, cooperative cancellation observation via heartbeat — see "Phase 6: What's Implemented" below for the explicit, documented limits (cooperative only, no forced termination of uncooperative handler code) |
 | Workflow / DAG execution | **Phase 7 done**: `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel`; dependency-gated eligibility, fan-out, fan-in (including concurrent completion), retry/dead-letter/cancellation propagation, workflow-level cancellation, atomic workflow creation — see "Phase 7: What's Implemented" below |
-| Observability | Not started beyond structured logs (claim, reclaim, heartbeat rejection, stale-completion rejection, retry scheduled, retries exhausted, permanent-failure dead-letter, new/duplicate idempotent submission, cancellation observed/acknowledged, and execution timeout are all logged — see "Phase 2", "Phase 3", "Phase 4", and "Phase 6: What's Implemented") |
-| Test suite (unit/integration/concurrency/chaos) | **Phase 7 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), and DAG scenario coverage SF-019 through SF-030 (Phase 7); sustained multi-hour chaos/load testing remains Phase 9 |
+| Observability | **Phase 8 done**: every metric in [docs/observability.md](docs/observability.md) implemented (Prometheus-compatible, `GET /metrics`), structured event/correlation logging across submission/claim/reclaim/retry/dead-letter/cancellation/timeout/workflow, durable-state gauges computed at scrape time (no drift across restart) — see "Phase 8: What's Implemented" below. Tracing not implemented (explicit, documented deferral — see that section) |
+| Test suite (unit/integration/concurrency/chaos) | **Phase 8 subset done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), DAG scenario coverage SF-019 through SF-030 (Phase 7), and metric-assertion tests attached to SF-001/SF-005/SF-007 through SF-012 plus a cardinality/race audit (Phase 8); sustained multi-hour chaos/load testing remains Phase 9 |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
 Phase 1 (single-node durable job engine) through Phase 10 (external-review
@@ -1971,6 +1980,194 @@ promotion beyond Experimental requires surviving repeated CI runs of this
 project's actual pipeline post-merge, which has not yet happened for this
 code. This README keeps Phase 7, and the overall project status, at
 **Experimental**, consistent with every prior phase.
+
+## Phase 8: What's Implemented
+
+**Status: Stable** — per [docs/roadmap.md](docs/roadmap.md)'s Phase 8
+maturity label. Unlike Phase 7, observability introduces no new
+correctness surface (no new invariant, no new state, no new claiming or
+completion path), so Stable does not require the same kind of
+adversarial-scenario proof the job/workflow engine's own Stable label
+does — it requires only that every documented metric/log is faithfully,
+correctly, and safely emitted, which this phase's test suite verifies
+directly.
+
+Phase 8 ([docs/roadmap.md](docs/roadmap.md) "Observability") implements
+[docs/observability.md](docs/observability.md) in full: every documented
+metric, structured event/correlation logging across every job and
+workflow lifecycle transition, and durable-state gauges computed fresh
+from PostgreSQL at scrape time — without changing any correctness
+behavior anywhere in Phases 1-7.
+
+### Implemented now
+
+- **Prometheus-compatible metrics** (`internal/metrics`), exactly the 11
+  named in [docs/observability.md](docs/observability.md)'s table —
+  `taskforge_jobs_submitted_total`, `taskforge_jobs_completed_total`,
+  `taskforge_jobs_by_state`, `taskforge_jobs_dead_lettered_total`,
+  `taskforge_claim_latency_seconds`, `taskforge_queue_age_seconds`,
+  `taskforge_execution_duration_seconds`,
+  `taskforge_lease_expirations_total`,
+  `taskforge_stale_completion_rejections_total`, `taskforge_retry_count`,
+  `taskforge_active_workers`, `taskforge_heartbeats_total`,
+  `taskforge_idempotent_submission_hits_total` — no metric beyond this
+  documented set was added. Every label is a small, bounded vocabulary
+  (`job_type`, `outcome`, `state`); `job_id`, `workflow_id`,
+  `idempotency_key`, and `worker_id` are never metric labels, audited by
+  a dedicated test (`TestCardinality_NoMetricLabelIsIdempotencyKeyOrJobID`).
+- **`GET /metrics`**: served on the API server's existing listen address
+  (no separate port), and on the worker process's own address
+  (`TASKFORGE_METRICS_ADDR`, default `:9090`, since a worker process has
+  no other HTTP server) — both optional; TaskForge runs identically with
+  no Prometheus/collector present, and the test suite requires none.
+- **Metrics recorded entirely inside `internal/store`** — the same
+  single choke point every durable transition already runs through
+  (`Store.Claim`, every `Complete*` method, `Heartbeat`,
+  `InsertIdempotent`) — always *after* the relevant transaction has
+  committed, never before, so a metric can never reflect a transition
+  that was subsequently rolled back. A metric recording call is a
+  synchronous in-memory counter/histogram update: it cannot fail, block
+  on a network call, or hold a database transaction open, so it
+  introduces no new failure mode on any correctness path.
+- **`taskforge_jobs_by_state` / `taskforge_active_workers`** computed
+  fresh from PostgreSQL at every scrape (`Store.JobStateCounts`,
+  `Store.ActiveWorkerCount`), never from in-memory bookkeeping — proven
+  not to drift across a simulated process restart
+  (`TestJobStateCounts_ReflectsRestartAcrossFreshStoreInstance`).
+- **Structured, correlated logging** across submission, claim, reclaim,
+  execution start/success, retryable/permanent failure, retry scheduled,
+  dead-letter, cancellation requested/observed/acknowledged, execution
+  timeout, stale completion/heartbeat rejection, and workflow
+  created/cancellation-requested/finalized — every line carries the
+  applicable subset of `event`, `job_id`, `job_type`, `worker_id`,
+  `attempt`, `lease_generation`, `state`, `error_class`, `retryable`,
+  `workflow_id`. The raw `Idempotency-Key` value is never logged (only
+  whether one was supplied) — see
+  [docs/idempotency.md](docs/idempotency.md)'s "Implementation Notes"
+  cross-reference in [docs/observability.md](docs/observability.md) for
+  why this reading was chosen deliberately.
+- **A real defect found and fixed during this phase**: prior to Phase 8,
+  a claimed job's log line used `lease_generation > 1` as a proxy for "a
+  worker crashed and this job was reclaimed" — wrong as of Phase 3, since
+  an ordinary `RETRY_WAIT` claim after backoff also advances
+  `lease_generation`, with no crash involved at all. `Store.Claim` now
+  surfaces the exact signal it already computes internally (the claim
+  query's own expired-lease branch), so `taskforge_lease_expirations_total`
+  and the "job reclaimed" log line fire only for a genuine crash-recovery
+  claim — see [docs/observability.md](docs/observability.md)'s
+  Implementation Notes and
+  `TestMetrics_ReclaimVsRetry_LeaseExpirationsNotConflatedWithBackoffRetry`.
+- **Cardinality-safe by construction and by test**: 100 uniquely-`job_id`d
+  jobs of one `job_type` produce a bounded number of metric series, not
+  one per job
+  (`TestCardinality_ManyUniqueJobsDoNotCreateNewMetricSeries`); no
+  registered metric family ever carries a `job_id`/`workflow_id`/
+  `idempotency_key`/`worker_id` label
+  (`TestCardinality_NoMetricLabelIsIdempotencyKeyOrJobID`).
+- **Race-safe under concurrent load**: metrics recording was run through
+  this project's existing concurrency-stress harness and a dedicated new
+  test (`TestMetrics_ConcurrentRecording_RaceSafe`, many goroutines racing
+  real `Claim`/`CompleteSuccess` calls) under `-race`, repeatedly, with
+  zero detected data races — unsurprising, since `prometheus`'s
+  counter/histogram types are safe for concurrent use by design, but
+  verified directly rather than assumed.
+- **Telemetry-failure safety**: a scrape-time database error in the two
+  `StateCollector` queries is logged and simply omits that scrape's
+  affected series — it never panics, blocks, or touches any job's
+  durable state (`TestStateCollector_QueryFailureDoesNotPanicOrBlock`).
+
+### Not implemented yet
+
+- **Distributed tracing** — explicit, deliberate deferral, not an
+  oversight. [docs/observability.md](docs/observability.md) frames
+  tracing as conditional ("if distributed tracing is introduced") and
+  chooses no vendor; this phase's actual completion criteria (answering
+  "how many jobs are dead-lettered" / "what is our claim latency" without
+  querying the database) are metrics-and-logging questions. The
+  correlation objective tracing would serve is met today via structured
+  log correlation on `job_id` instead.
+- **Vendor-specific dashboards or alerting rules** — explicit
+  [docs/roadmap.md](docs/roadmap.md) Phase 8 non-goal: this phase
+  produces the instrumentation, not an opinionated ops runbook.
+- **Per-node workflow activation/cascade-cancellation logging** — only
+  workflow-instance-level events (`workflow_created`,
+  `workflow_cancellation_requested`, `workflow_finalized`) are logged;
+  per-node detail remains queryable via `GET /workflows/{id}` and
+  `job_attempts`, not separately logged — see
+  [docs/observability.md](docs/observability.md)'s Implementation Notes
+  for why this was left out of scope.
+- **Health/readiness endpoints** — not required by
+  [docs/observability.md](docs/observability.md) or
+  [docs/roadmap.md](docs/roadmap.md)'s Phase 8 entry, so none was added;
+  not invented as an undocumented contract.
+- Sustained chaos/load testing (Phase 9) — unchanged deferral from every
+  prior phase's section above.
+
+### How to view metrics and logs
+
+```sh
+docker compose up -d
+cp .env.example .env && set -a && source .env && set +a
+go run ./cmd/api &
+go run ./cmd/worker &
+
+curl -X POST localhost:8080/jobs -d '{"job_type":"demo.echo","payload":{}}'
+
+# Prometheus-format metrics from the API process:
+curl localhost:8080/metrics | grep ^taskforge_
+
+# Prometheus-format metrics from the worker process (separate listener):
+curl localhost:9090/metrics | grep ^taskforge_
+
+# Structured JSON logs (both cmd/api and cmd/worker log to stdout):
+#   {"event":"submission", "job_id":"...", "job_type":"demo.echo", "state":"QUEUED", ...}
+#   {"event":"job_claimed", "job_id":"...", "worker_id":"...", "attempt":1, ...}
+#   {"event":"execution_success", "job_id":"...", "state":"SUCCEEDED", ...}
+```
+
+### How to run tests
+
+```sh
+make test        # go test -p 1 ./...
+make test-race   # go test -race -p 1 ./...
+
+# The new Phase 8 tests specifically, verbose:
+go test -v ./internal/metrics/...
+go test -p 1 -v ./internal/store/... -run 'TestMetrics_|TestJobStateCounts|TestActiveWorkerCount|TestCardinality_|TestWorkflowMetrics_|TestWorkflowLogging_'
+go test -p 1 -v ./internal/api/... -run 'TestSubmissionLogging|TestCancellationLogging'
+
+# Repeated, race-detected runs of the concurrency-sensitive new test:
+go test -race -p 1 -count=3 ./internal/store/... -run 'TestMetrics_ConcurrentRecording_RaceSafe'
+```
+
+Same PostgreSQL requirement and `-p 1` constraint as every prior phase.
+No external Prometheus/collector is required for any test — every
+assertion reads directly from an isolated, per-test `*metrics.Metrics`
+instance's own registry.
+
+### Phase 8 guarantees
+
+- **Every documented metric is emitted and independently verified
+  against at least one scenario** (this phase's own roadmap quality
+  gate): SF-001, SF-005, SF-007 through SF-012 each have a companion
+  metric-assertion test — see
+  [docs/testing-strategy.md](docs/testing-strategy.md)'s Phase 8 section
+  for the full list.
+- **Observability never determines durable correctness**: no metric or
+  log call sits on a code path required for a job's own state
+  transition; every call happens after the transition's own transaction
+  has already committed.
+- **No secret/sensitive payload leakage**: the raw `Idempotency-Key`
+  value, request payload bodies, and raw error text are never logged or
+  used as a metric label.
+- **No high-cardinality label**: audited directly, not just by
+  inspection — see the Cardinality-safe bullet above.
+- **State-gauge correctness across restart**: `taskforge_jobs_by_state`
+  is proven not to drift across a simulated process restart.
+- **`-race` clean**, including a dedicated concurrent-metrics-recording
+  test, run repeatedly.
+- **The full Phase 1-7 regression suite remains green**, including under
+  `-race`, with no test's assertions weakened.
 
 ## Documentation Map
 

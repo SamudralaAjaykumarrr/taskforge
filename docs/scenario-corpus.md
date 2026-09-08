@@ -349,6 +349,16 @@ full list with descriptions, and [README.md](../README.md)'s "Phase 7:
 What's Implemented" for how these map to invariants and what quality gate
 they satisfy.
 
+Phase 8 ("Observability", [roadmap.md](roadmap.md)) introduces no new
+scenario IDs, per that phase's own explicit scope ("Required tests:
+Metric-assertion tests attached to existing scenarios rather than a new
+scenario set"). SF-001, SF-005, SF-007, SF-008, SF-009, SF-010, SF-011,
+and SF-012 each gained a companion metric-assertion test proving the
+[observability.md](observability.md) metrics/logs their own documented
+event sequence must produce — see
+[testing-strategy.md](testing-strategy.md)'s Phase 8 section for the full
+list.
+
 ---
 
 ### SF-001 — Normal success

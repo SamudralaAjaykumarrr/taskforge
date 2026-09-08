@@ -38,12 +38,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 )
 
 // attemptOutcomeCancelled is the job_attempts.outcome value recorded when
@@ -100,13 +102,22 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 	// CANCELLED (docs/workflows.md's Failure Propagation table treats
 	// CANCELLED the same as DEAD_LETTERED regardless of which API path
 	// produced it). A no-op for an ordinary standalone job.
-	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled); err != nil {
+	workflowID, finalState, err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled)
+	if err != nil {
 		return nil, fmt.Errorf("store: cancel queued/retry_wait job: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: cancel queued/retry_wait job: commit: %w", err)
 	}
+	s.logWorkflowFinalized(workflowID, finalState)
+
+	// No job_attempts row exists for a job cancelled before ever being
+	// claimed, so there is no attempt-level outcome to record in
+	// taskforge_jobs_completed_total/taskforge_execution_duration_seconds
+	// (docs/observability.md scopes both to job_attempts.outcome) --
+	// only the terminal-state retry-count distribution applies here.
+	s.metrics.RetryCount.WithLabelValues(j.JobType).Observe(float64(j.AttemptCount))
 	return j, nil
 }
 
@@ -204,22 +215,32 @@ func (s *Store) CompleteCancelled(ctx context.Context, id uuid.UUID, leaseOwner 
 		id, leaseOwner, leaseGeneration,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStaleTransition) {
+			s.metrics.StaleCompletionRejectionsTotal.Inc()
+		}
 		return nil, err
 	}
 
-	if err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeCancelled, "", ""); err != nil {
+	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeCancelled, "", "")
+	if err != nil {
 		return nil, fmt.Errorf("store: complete cancelled: record attempt outcome: %w", err)
 	}
 
 	// Phase 7: a cancelled workflow node's dependents are cancelled by
 	// default, exactly like a dead-lettered one -- a no-op for an
 	// ordinary standalone job.
-	if err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled); err != nil {
+	workflowID, finalState, err := s.propagateWorkflowTransition(ctx, tx, id, jobstate.Cancelled)
+	if err != nil {
 		return nil, fmt.Errorf("store: complete cancelled: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: complete cancelled: commit: %w", err)
 	}
+	s.logWorkflowFinalized(workflowID, finalState)
+
+	s.metrics.JobsCompletedTotal.WithLabelValues(j.JobType, metrics.OutcomeCancelled).Inc()
+	s.metrics.ExecutionDurationSeconds.WithLabelValues(j.JobType, metrics.OutcomeCancelled).Observe(j.UpdatedAt.Sub(startedAt).Seconds())
+	s.metrics.RetryCount.WithLabelValues(j.JobType).Observe(float64(j.AttemptCount))
 	return j, nil
 }
