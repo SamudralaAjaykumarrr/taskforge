@@ -108,6 +108,14 @@ want understated:
 
 ## 3. Enterprise Blockers (P0 — would stop a serious enterprise adoption conversation immediately)
 
+These are evaluated against the **Enterprise Deployment Profile** defined in
+[security-model.md](security-model.md) — a multi-principal API/control
+plane, a *trusted first-party worker fleet*, a PostgreSQL HA cluster,
+single-region initially, with no hostile-third-party-worker-code guarantee
+and no multi-region guarantee. A gap that is only a blocker *outside* that
+profile (e.g., running untrusted third-party worker code) is named as such
+below rather than listed as an unconditional P0.
+
 1. **No authentication or authorization of any kind.** Confirmed by direct
    code search: zero auth middleware, zero API key/token/JWT validation, no
    principal/identity concept anywhere in `internal/` or `cmd/`. `POST /jobs`,
@@ -121,17 +129,14 @@ want understated:
    a substring match on "TTLs" in a test comment, not a real reference). All
    traffic (API, worker-to-Postgres, any future admin surface) is assumed to
    run over a trusted network today.
-3. **No worker identity/trust model.** `lease_owner` is an arbitrary
-   caller-supplied string; failure-model.md explicitly declares "malicious
-   workers" and "a worker that intentionally forges its lease_owner/
-   lease_generation" as out of scope for v1, on the stated assumption that
-   "workers are trusted internal processes, not arbitrary untrusted
-   clients." True today; not true the moment a customer wants to run
-   third-party or less-trusted worker code.
-4. **No multi-tenancy of any kind.** No tenant column, no per-tenant
+3. **No multi-tenancy of any kind.** No tenant column, no per-tenant
    isolation, no per-tenant quota. A single noisy or malicious job submitter
-   can flood the shared `jobs` table for every caller.
-5. **No workload governance: queues, priorities, concurrency limits, or
+   can flood the shared `jobs` table for every caller. Note: once a tenant
+   concept is introduced, TaskForge's submission-idempotency uniqueness
+   constraint must also become tenant-scoped — see
+   [security-model.md](security-model.md) §7 — or two tenants choosing the
+   same `job_type`/`Idempotency-Key` would collide.
+4. **No workload governance: queues, priorities, concurrency limits, or
    rate limiting.** `priority` exists as a schema column
    ([data-model.md](data-model.md)) and is used for claim ordering, but there
    is no concept of a named queue, no per-queue or per-job-type concurrency
@@ -139,18 +144,18 @@ want understated:
    an over-eager caller beyond ordinary HTTP error codes if the database
    itself falls over. Phase 5 explicitly disclaims proving "strict FIFO
    fairness across priorities/ages under adversarial scheduling."
-6. **No PostgreSQL HA, backup, PITR, or disaster-recovery evidence.**
+5. **No PostgreSQL HA, backup, PITR, or disaster-recovery evidence.**
    failure-model.md explicitly places "PostgreSQL primary failure/failover"
    out of scope for v1 ("If the database is down, TaskForge is down for
    writes"). There is no documented backup/restore procedure, no tested PITR
    runbook, and no failover drill anywhere in the repository.
-7. **No supply-chain hardening.** No SBOM, no dependency vulnerability
+6. **No supply-chain hardening.** No SBOM, no dependency vulnerability
    scanning (no `govulncheck`, Trivy, Snyk, or CodeQL step), no artifact
    signing/provenance/attestation, no Dockerfile (only a `docker-compose.yml`
    for a stock local Postgres). CI (`.github/workflows/ci.yml`) runs
    `gofmt`/`go vet`/`go build`/`go test`/`go test -race` only — five checks,
    no security gate.
-8. **No upgrade/version-compatibility guarantees of any kind.** There is no
+7. **No upgrade/version-compatibility guarantees of any kind.** There is no
    documented policy for rolling server upgrades, old-worker/new-server or
    new-worker/old-server compatibility, job payload schema evolution, or
    workflow-definition versioning. Only 3 migrations exist across all 9
@@ -159,6 +164,23 @@ want understated:
 
 ## 4. Operational Blockers (P1 — would stop a production rollout, once P0s are addressed)
 
+- **No worker identity/trust model, beyond a trusted first-party worker
+  fleet.** `lease_owner` is an arbitrary caller-supplied string;
+  failure-model.md explicitly declares "malicious workers" and "a worker
+  that intentionally forges its lease_owner/lease_generation" as out of
+  scope for v1, on the stated assumption that "workers are trusted internal
+  processes, not arbitrary untrusted clients." **This is not an unconditional
+  P0**: within the Enterprise Deployment Profile this review recommends
+  (trusted first-party worker fleet), it is an accepted, documented
+  boundary, not a blocker. It becomes a P0 the moment a deployment intends
+  to run third-party or otherwise untrusted worker code, and would then
+  require an architectural change this review has not designed (a
+  worker-facing gateway or a stored-function boundary that avoids granting
+  workers direct table access) — see [security-model.md](security-model.md)
+  §2 for the honest deferral. Phase 12 does add separate least-privilege
+  PostgreSQL roles for API vs. worker processes, which bounds a compromised
+  worker's blast radius but does not by itself make untrusted worker code
+  safe to run.
 - **No distributed tracing.** Explicitly and deliberately deferred in
   [observability.md](observability.md) ("This is an explicit deferral, not
   an oversight"). Structured logs correlate on `job_id`, which is usable but

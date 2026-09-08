@@ -31,6 +31,39 @@ exist as a designed concept anywhere in the codebase:
 Every arrow above is, today, an implicitly-trusted channel. This document
 threat-models each one.
 
+## Enterprise Deployment Profile (Assumed)
+
+The severities below are not evaluated against an unbounded threat model
+("assume every component is hostile"). They are evaluated against the
+deployment profile this review recommends TaskForge target first —
+[enterprise-roadmap.md](enterprise-roadmap.md) Phase 12 is scoped to this
+profile, not to a zero-trust worker fleet:
+
+- **Multi-principal API/control plane**: more than one caller/tenant can
+  reach the API concurrently, and callers are not assumed to trust each
+  other.
+- **Trusted first-party worker fleet**: worker processes run code the
+  operator controls and deploys; TaskForge does not, in this profile,
+  defend against a worker process that is itself malicious or runs
+  arbitrary third-party code.
+- **PostgreSQL HA cluster**: the database is deployed with replication/
+  failover per [enterprise-roadmap.md](enterprise-roadmap.md) Phase 15, not
+  a single unreplicated instance.
+- **Single-region initially**: no multi-region durability or cross-region
+  read-after-write guarantee is claimed.
+- **No hostile third-party worker-code guarantee**: running worker code
+  supplied by an untrusted third party is explicitly **not** a supported
+  configuration of this profile (see "Worker Trust" below for what would
+  need to change if it became one).
+- **No multi-region guarantee**: consistent with [vision.md](vision.md)'s
+  existing non-goals.
+
+A severity marked P0 below is P0 **within this profile** unless stated
+otherwise. Where a threat is only P0 outside this profile (e.g., a fully
+untrusted/third-party worker fleet), that condition is stated explicitly —
+conflating "not yet built" with "blocks the supported profile" would
+misprioritize [enterprise-roadmap.md](enterprise-roadmap.md).
+
 ## 1. Application Security (client → API server)
 
 | Threat | Description | Status today | Severity if unaddressed |
@@ -43,13 +76,56 @@ threat-models each one.
 | **Unauthorized job inspection** | `GET /jobs/{id}` returns full job state, payload, and error detail to any caller who knows or guesses a UUID. | No authorization check exists. UUIDv4-style IDs make guessing impractical, but "impractical to guess" is not an access control. | P0 if payloads or error messages ever contain sensitive data |
 | **Unauthorized cancellation** | `POST /jobs/{id}/cancel` and `POST /workflows/{id}/cancel` are reachable by any caller who knows the ID, with no ownership check. | No authorization check exists. | P0 — a caller can cancel another caller's work |
 
+**Avoid unnecessary existence disclosure**: once Phase 12 adds ownership
+checks, `GET /jobs/{id}` and `POST /jobs/{id}/cancel` should return the same
+response (e.g., `404`) for "does not exist" and "exists but you don't own
+it." Returning a distinguishing `403` for the latter would let a caller
+enumerate which UUIDs belong to other tenants' real jobs — a narrower but
+real information-disclosure variant of "Unauthorized job inspection" above.
+
+### API Key Design Requirements (for Phase 12)
+
+Whatever authentication mechanism Phase 12 ships must, at minimum:
+
+- Never store a raw credential — store only a hash or HMAC of it.
+- Support a non-secret key identifier, so a specific key can be looked up,
+  rotated, or revoked without scanning by comparing raw secrets.
+- Support rotation with an overlap window (old and new key both valid for a
+  bounded period), so rotation does not require a synchronized cutover.
+- Support revocation that takes effect without a full redeploy (a lookup
+  table, not a hardcoded value).
+- Compare secrets in constant time on any path that ever compares a raw
+  secret directly (not applicable if only a hash/HMAC digest is compared,
+  but load-bearing if any raw-secret comparison path exists).
+- Never let a raw credential enter a metric label, log field, or trace
+  attribute — the same cardinality/sensitivity discipline
+  [observability.md](observability.md) already applies to `job_id` and
+  `Idempotency-Key` extends to credentials.
+
 ## 2. Worker Trust
 
 | Threat | Description | Status today | Severity |
 |---|---|---|---|
 | **Forged worker identity** | `lease_owner` is an arbitrary, unauthenticated string supplied by whatever process calls the claim query. Nothing cryptographically binds a `lease_owner` value to a specific process or credential. | Explicitly declared out of scope in [failure-model.md](failure-model.md): "A worker that intentionally forges its `lease_owner`/`lease_generation` to bypass fencing is not defended against in v1; workers are assumed to be trusted internal processes." | P0 the instant TaskForge runs third-party or less-trusted worker code; P3 (accepted, documented) for a fully first-party worker fleet |
-| **Compromised worker** | A compromised worker process has direct database credentials and can read/write any job row, including other jobs' payloads, or claim jobs outside its intended `job_type` set (no `job_type`-scoped worker credential exists). | No worker-scoping mechanism exists. Workers connect with one shared, presumably admin-or-near-admin-level database role. | P0 for any environment where worker code provenance/trust is not fully controlled |
+| **Compromised worker** | A compromised worker process has direct database credentials and can read/write any job row, including other jobs' payloads, or claim jobs outside its intended `job_type` set (no `job_type`-scoped worker credential exists, and no separate least-privilege PostgreSQL role distinguishes API-server access from worker access). | No worker-scoping mechanism exists. Workers connect with one shared, presumably admin-or-near-admin-level database role. | P0 the moment worker code provenance/trust is not fully controlled by the operator (i.e., outside the Enterprise Deployment Profile above); **within** the assumed trusted-first-party-worker-fleet profile, this is a P2 hardening item (least-privilege roles), not a blocker — see note below |
 | **Replayed requests** | A captured, valid API request (e.g., a cancel call) could be replayed by an attacker with network visibility, since there is no request signing, nonce, or freshness check beyond the already-idempotent nature of the underlying operations. | Idempotency (TF-INV-008) actually *helps* here for `POST /jobs` — a replayed identical submission is a safe no-op by design — but `POST /jobs/{id}/cancel` has no such protection and none is needed for its own idempotence, only for authorization. | P1, secondary to the missing authZ layer above |
+
+**Least-privilege roles, and what they do and do not buy**: Phase 12
+should distinguish API-caller identity from worker identity, and provision
+**separate PostgreSQL roles for the API server and for worker processes**
+where practical, each granted only the statements/tables it actually needs
+(e.g., workers do not need `DELETE` on `jobs` if Phase 13's retention
+cleanup runs under its own, narrower-scoped role). A different password
+alone does **not** bound a compromised worker if both roles still hold
+broad raw-table `SELECT`/`UPDATE`/`DELETE` privileges — the containment
+value comes entirely from the privilege difference, not the credential
+difference, and this document does not claim otherwise. Fully isolating
+untrusted worker code (so a compromised worker cannot read other tenants'
+payloads at all) would require an architectural boundary this review has
+not designed — e.g., a worker-facing gateway service, or a PostgreSQL
+stored-function API that grants workers `EXECUTE` but no direct table
+access — and is explicitly **deferred**, not claimed as solved by Phase
+12's least-privilege roles.
 
 ## 3. Database Trust
 
@@ -68,6 +144,16 @@ threat-models each one.
 | **Plaintext PostgreSQL connections** | No `sslmode=require`/`verify-full` configuration was found; `pgx`'s default connection behavior depends entirely on the connection string supplied via `internal/config`, which is not itself enforced to request TLS. | Not enforced in code; entirely a deployment-time/operator responsibility today, with no TaskForge-level guardrail or warning. | P0 for any deployment where the API/worker-to-database network path is not fully trusted |
 | **No mTLS between workers and the API/database** | Workers authenticate to PostgreSQL with whatever credential the deployment configures; there is no TaskForge-specific worker certificate or mTLS scheme. | Same root cause as "forged worker identity" above. | P1, coupled to the worker-trust gap |
 
+**Enterprise reference deployment requirement**: `sslmode=require` alone
+verifies only that the connection is encrypted — it does **not** verify
+server identity, so it does not defend against a network-level
+man-in-the-middle presenting a different PostgreSQL server. For the
+enterprise reference deployment, [enterprise-roadmap.md](enterprise-roadmap.md)
+Phase 12 requires `sslmode=verify-full` (plus a trusted CA and hostname
+validation), not merely `sslmode=require`. Simpler development/local
+profiles (e.g., `sslmode=require` against a same-host database) may remain
+as documented, lower-assurance defaults for that context only.
+
 ## 5. Operational Security
 
 | Threat | Description | Status today | Severity |
@@ -84,6 +170,28 @@ threat-models each one.
 | **Artifact tampering** | No build provenance or artifact signing exists — there is no CI step producing a signed, attestable build artifact (e.g. via GitHub Artifact Attestations/SLSA), and no container image is built at all (only a local-dev `docker-compose.yml`, no `Dockerfile`). | Confirmed absent. | P1 — no current release/distribution mechanism to attest, but a blocker the moment one exists |
 | **No SBOM** | No CycloneDX/SPDX file exists anywhere in the repository. | Confirmed absent by file search. | P1 |
 | **Small, reputable direct dependency surface** | Direct dependencies are `pgx/v5`, `google/uuid`, `prometheus/client_golang`, `prometheus/client_model`, `stretchr/testify` (test-only), and `fergusstrange/embedded-postgres` (test-only). No web framework, no auth library, no third-party observability SDK. | This is a genuine mitigating factor — a small, well-known dependency surface has less attack surface than a sprawling one, independent of whether scanning exists. | Positive finding, does not offset the missing scanning/SBOM/attestation gaps above |
+
+## 7. Tenant / Idempotency Interaction
+
+Once Phase 12 introduces a principal/tenant concept, TaskForge's existing
+submission-idempotency contract (`UNIQUE(job_type, idempotency_key)`,
+TF-INV-016) must be re-examined, not assumed to still hold as-is:
+
+| Threat | Description | Status today | Severity |
+|---|---|---|---|
+| **Cross-tenant idempotency-key collision** | Two different tenants that happen to choose the same `job_type` and the same `Idempotency-Key` value would collide on today's global `UNIQUE(job_type, idempotency_key)` constraint — tenant B's submission could be silently treated as a duplicate of tenant A's, or incorrectly rejected/short-circuited. | Not yet a risk today only because there is no tenant concept to collide *between*; this becomes a real, confirmed gap the moment Phase 12 ships principals. | P0 for Phase 12/13, not applicable before either ships |
+| **Workflow/replay ownership scope** | The same reasoning applies to any future workflow-level idempotency key and to DLQ-replay operations (Phase 16): a replay or resubmission keyed only by `job_type`/`idempotency_key`/`job_id`, without a tenant scope, could cross a tenant boundary. | Workflows have no idempotency key today (explicit deferral, [workflows.md](workflows.md)); DLQ replay does not exist yet (Phase 16). | Design requirement for both, before either ships |
+
+**Required contract**: the uniqueness constraint must become
+tenant/principal-scoped — e.g., `UNIQUE(principal_id, job_type,
+idempotency_key)`, not `UNIQUE(job_type, idempotency_key)` alone — once
+principals exist. [enterprise-roadmap.md](enterprise-roadmap.md) Phase 12
+must land this scoping change together with the principal concept itself,
+not as a follow-up: shipping principals first and re-scoping idempotency
+second would leave a real cross-tenant collision window open in production.
+The same ownership scoping must be designed into any future workflow-level
+idempotency key and into Phase 16's DLQ-replay `retried_from` linkage,
+before either ships.
 
 ## Summary by Category
 

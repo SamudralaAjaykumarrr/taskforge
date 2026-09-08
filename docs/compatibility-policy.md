@@ -51,23 +51,47 @@ rather than under incident pressure.
   than altering `jobs`. This has never been stress-tested against a
   concurrently-running old server version still writing to the old schema
   shape.
+- **PROPOSED primary model: expand / migrate / contract**, not a universal
+  "every migration must have a working down migration" rule. Concretely:
+  1. **Expand** — ship an additive schema change (new nullable column, new
+     table, new default) that both the old and new binary can coexist
+     with.
+  2. **Migrate** — backfill/migrate data if required, with old and new
+     binaries both still running against the expanded schema.
+  3. **Contract** — only in a later, separate release, once every reader/
+     writer of the old shape has been confirmed stopped, remove/alter the
+     old shape.
+  This is the same rolling-compatible sequencing the two forward-
+  compatibility rules below already imply; expand/migrate/contract names it
+  as the general policy rather than restating it per-rule.
 - PROPOSED rule: every migration must be forward-compatible with the
   immediately-preceding server version for the duration of a rolling
   deployment — i.e., a migration that adds a column must give it a
   default or allow `NULL`, so an old server binary that does not know
   about the column can still write the row; a migration that removes a
   column must first ship a server version that stops reading it, deployed
-  and confirmed live, before a later migration drops it.
+  and confirmed live, before a later migration drops it (this is exactly
+  the "expand" then "contract" split above).
 - PROPOSED rule: no migration may lock the `jobs` or `job_attempts` tables
   for a duration incompatible with continuous claim-query traffic (e.g., a
   full-table `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT` rewrite on a
   large table). This has not been tested at any table size beyond Phase
   9's soak run scale (hundreds of rows).
-- PROPOSED rule: every new migration must include and test its down
-  migration, and CI must run both directions, mirroring the existing
-  discipline visible in `migrations/000N_*.up.sql`/`.down.sql` pairs today
-  — this pairing already exists structurally but there is no evidence the
-  down migrations are exercised by any test today.
+- PROPOSED rule (replaces a universal down-migration requirement): a
+  **down migration is required only where rollback is genuinely
+  data-safe** — i.e., where reversing it cannot destroy information already
+  written under the new shape (a purely additive column with no writes yet
+  migrated into it, for example). A migration that is not genuinely
+  data-safe to reverse (e.g., one that drops a column, or one where new
+  rows have already been written in a shape the old schema cannot
+  represent) should be **forward-fixed** by a new, later migration rather
+  than reversed — a down migration cannot honestly reconstruct data it
+  never had. CI should run down migrations only for the subset marked
+  data-safe-reversible, and that subset must be explicitly labeled as such
+  in the migration file itself, not assumed. A blanket "every migration
+  must have a tested down migration" rule is actively misleading for
+  destructive changes, because it implies a recoverability property the
+  down migration cannot actually deliver.
 
 ## PROPOSED: Rolling Server Upgrades
 
@@ -79,7 +103,18 @@ migrate), but "structurally favorable" is not the same claim as "proven."
 - PROPOSED requirement before this can be claimed as a real guarantee: an
   integration test that runs two different binary versions of `cmd/api`
   (or `cmd/worker`) concurrently against the same database and asserts
-  correct behavior throughout.
+  correct behavior throughout, for the full duration of the expand/migrate/
+  contract window (not just at the two endpoints of a migration).
+- PROPOSED requirement: a documented, operator-facing graceful-drain
+  procedure (SIGTERM stops accepting new claims/requests, waits for
+  in-flight work up to a timeout) is part of this guarantee, not a separate
+  concern — a rolling upgrade that kills in-flight work mid-deploy is not
+  actually a safe rolling upgrade. This formalizes, at the operator-process
+  level, what Phase 5's `TestStress_WorkerPoolGracefulShutdown_*` already
+  proves at the goroutine level. See
+  [enterprise-roadmap.md](enterprise-roadmap.md) Phase 14, where both the
+  mixed-version proof and this drain procedure are scheduled to land
+  together.
 
 ## PROPOSED: Old Worker / New Server and New Worker / Old Server Compatibility
 
