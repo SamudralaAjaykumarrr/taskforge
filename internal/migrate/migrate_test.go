@@ -3,8 +3,10 @@ package migrate_test
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
@@ -196,7 +198,7 @@ func TestUp_UpgradesPhase1SchemaToPhase2(t *testing.T) {
 		migratedVersions = append(migratedVersions, v)
 	}
 	require.NoError(t, rows.Err())
-	require.Equal(t, []int{1, 2, 3}, migratedVersions)
+	require.Equal(t, []int{1, 2, 3, 4}, migratedVersions)
 }
 
 // TestUp_UpgradesPhase6SchemaToPhase7 is Phase 7's analogue: starting from
@@ -240,11 +242,146 @@ func TestUp_UpgradesPhase6SchemaToPhase7(t *testing.T) {
 	require.Equal(t, 3, version)
 }
 
-// TestFiles_ExactlyThreeMigrationsEmbedded is a light guard against a
+// TestMigration0004_BackfillsTerminalAttemptCount proves migration 0004's
+// actual data semantics (internal/invariant's checkNoAttemptAfterTerminal
+// depends on this column being backfilled correctly for every
+// pre-existing terminal row -- see that package's doc comment), not just
+// that the migration count/version bumped. Starting from a pre-0004
+// schema/data state built the same way this file's other Upgrade tests
+// do (drop what a later migration added, delete its schema_migrations
+// row, insert data as if it predated that migration), this applies
+// migration 0004 through the real migrate.Up mechanism and asserts its
+// exact backfill contract:
+//
+//   - a terminal row with attempt_count > 0 backfills to that same value
+//   - a terminal row with attempt_count = 0 (the zero-attempt
+//     cancellation shape) backfills to 0, not left NULL
+//   - a non-terminal row is left NULL, not backfilled to anything
+//
+// It also proves migrate.Up (and therefore migration 0004 specifically)
+// remains safe to run twice in a row, per TestUp_IsIdempotent's existing
+// contract, and separately runs the actual embedded 0004 down.sql content
+// to prove it removes the column -- using the same embedded migrations.Files
+// this package already depends on, not a new migration-down framework
+// (this project's migrate.Up has no corresponding Down function to call;
+// see this test's second half for why the down SQL is applied directly).
+func TestMigration0004_BackfillsTerminalAttemptCount(t *testing.T) {
+	db := testutil.DB(t) // starts fully migrated; rolled back to pre-0004 below
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `ALTER TABLE jobs DROP COLUMN IF EXISTS terminal_attempt_count`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 4`)
+	require.NoError(t, err)
+
+	terminalWithAttempts := uuid.New()
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO jobs (id, job_type, payload, state, attempt_count, max_attempts, execution_timeout_seconds, terminal_at, last_error, last_error_class)
+		VALUES ($1, 'test.migration0004.terminal_with_attempts', '{}', 'SUCCEEDED', 3, 5, 30, now(), NULL, NULL)`,
+		terminalWithAttempts)
+	require.NoError(t, err)
+
+	terminalZeroAttempts := uuid.New()
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO jobs (id, job_type, payload, state, attempt_count, max_attempts, execution_timeout_seconds, terminal_at)
+		VALUES ($1, 'test.migration0004.terminal_zero_attempts', '{}', 'CANCELLED', 0, 5, 30, now())`,
+		terminalZeroAttempts)
+	require.NoError(t, err)
+
+	nonTerminal := uuid.New()
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO jobs (id, job_type, payload, state, attempt_count, max_attempts, execution_timeout_seconds)
+		VALUES ($1, 'test.migration0004.nonterminal', '{}', 'QUEUED', 0, 5, 30)`,
+		nonTerminal)
+	require.NoError(t, err)
+
+	// This is the actual upgrade under test.
+	require.NoError(t, migrate.Up(ctx, db))
+
+	var columnExists bool
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'jobs' AND column_name = 'terminal_attempt_count')`,
+	).Scan(&columnExists))
+	require.True(t, columnExists, "migration 0004 must add jobs.terminal_attempt_count")
+
+	assertTerminalAttemptCount := func(id uuid.UUID, want sql.NullInt64, msg string) {
+		t.Helper()
+		var got sql.NullInt64
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT terminal_attempt_count FROM jobs WHERE id = $1`, id).Scan(&got))
+		require.Equal(t, want, got, msg)
+	}
+	assertTerminalAttemptCount(terminalWithAttempts, sql.NullInt64{Int64: 3, Valid: true},
+		"a terminal row with attempt_count=3 must backfill terminal_attempt_count to 3")
+	assertTerminalAttemptCount(terminalZeroAttempts, sql.NullInt64{Int64: 0, Valid: true},
+		"a terminal row with attempt_count=0 (zero-attempt cancellation) must backfill terminal_attempt_count to 0, not leave it NULL")
+	assertTerminalAttemptCount(nonTerminal, sql.NullInt64{},
+		"a non-terminal row must NOT be backfilled -- terminal_attempt_count stays NULL until this job actually becomes terminal")
+
+	var version int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT version FROM schema_migrations WHERE version = 4`).Scan(&version))
+	require.Equal(t, 4, version, "migration 0004 must be recorded in schema_migrations")
+
+	// Idempotency: re-running Up (as every cmd/api and cmd/worker startup
+	// does) must not error and must not re-backfill or duplicate the
+	// schema_migrations row -- migration 0004's own backfill UPDATE is
+	// itself already guarded by `WHERE terminal_attempt_count IS NULL`,
+	// but this proves the whole Up path, not just that one WHERE clause.
+	require.NoError(t, migrate.Up(ctx, db))
+	var version4Count int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = 4`).Scan(&version4Count))
+	require.Equal(t, 1, version4Count, "migration 4 must be recorded exactly once even after Up runs multiple times")
+	assertTerminalAttemptCount(terminalWithAttempts, sql.NullInt64{Int64: 3, Valid: true},
+		"re-running Up must not disturb an already-backfilled value")
+
+	// Documented limitation (must not be contradicted by this test): a
+	// terminal row that was ALREADY illegitimately reopened before this
+	// migration ran cannot have its true original attempt_count
+	// reconstructed from existing durable data -- the backfill above can
+	// only record "attempt_count as of the backfill," which is exactly
+	// what terminalWithAttempts's assertion above proves it does, not
+	// some reconstructed historical value. No further assertion is
+	// possible for that case; it is a genuine, permanent limitation of
+	// migrating pre-existing data, not a bug in the backfill.
+
+	// Prove the embedded 0004 down.sql content actually removes the
+	// column -- applied directly (this project's migrate package has no
+	// Down function to call; see this test's doc comment). This is run
+	// against db, which per docs/testing-strategy.md may be a real,
+	// PERSISTENT, cross-package-shared PostgreSQL instance (whenever
+	// TASKFORGE_TEST_DATABASE_URL is set -- e.g. in CI), not a disposable
+	// one scoped to this test alone -- so the drop below MUST be undone
+	// before this test returns, via t.Cleanup registered before the drop
+	// runs (so it still fires even if a later assertion in this block
+	// fails t.FailNow()). Leaving the column dropped while
+	// schema_migrations still records version 4 as applied would silently
+	// break every other package's tests for the rest of this process
+	// (migrate.Up sees version 4 already recorded and never reapplies
+	// 0004's up.sql to restore it) -- exactly the failure mode this
+	// comment exists to prevent a future edit from reintroducing.
+	t.Cleanup(func() {
+		upSQL, err := migrations.Files.ReadFile("0004_add_terminal_attempt_count.up.sql")
+		require.NoError(t, err)
+		_, err = db.ExecContext(context.Background(), string(upSQL))
+		require.NoError(t, err, "must restore jobs.terminal_attempt_count for every other test sharing this database")
+	})
+
+	downSQL, err := migrations.Files.ReadFile("0004_add_terminal_attempt_count.down.sql")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, string(downSQL))
+	require.NoError(t, err)
+
+	var columnExistsAfterDown bool
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'jobs' AND column_name = 'terminal_attempt_count')`,
+	).Scan(&columnExistsAfterDown))
+	require.False(t, columnExistsAfterDown, "0004's down migration must remove jobs.terminal_attempt_count")
+}
+
+// TestFiles_ExactlyFourMigrationsEmbedded is a light guard against a
 // migration file being accidentally left out of, or duplicated in, the
 // embedded set — mostly useful as a canary if migrations/embed.go's glob
 // pattern is ever changed.
-func TestFiles_ExactlyThreeMigrationsEmbedded(t *testing.T) {
+func TestFiles_ExactlyFourMigrationsEmbedded(t *testing.T) {
 	entries, err := migrations.Files.ReadDir(".")
 	require.NoError(t, err)
 
@@ -254,5 +391,5 @@ func TestFiles_ExactlyThreeMigrationsEmbedded(t *testing.T) {
 			upFiles++
 		}
 	}
-	require.Equal(t, 3, upFiles)
+	require.Equal(t, 4, upFiles)
 }

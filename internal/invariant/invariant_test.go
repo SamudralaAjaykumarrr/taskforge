@@ -17,6 +17,7 @@ package invariant_test
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/google/uuid"
@@ -47,6 +48,24 @@ func findViolation(t *testing.T, vs []invariant.Violation, id string) invariant.
 		}
 	}
 	t.Fatalf("no violation with InvariantID %q found among %d violation(s): %v", id, len(vs), vs)
+	return invariant.Violation{}
+}
+
+// findViolationForSubject returns the violation in vs matching both id and
+// subject, or fails the test if none does. Unlike findViolation, this is
+// safe to use from a subtest that shares its parent's *testutil.DB (and
+// therefore CheckAll's full, whole-database result set) with sibling
+// subtests that deliberately leave their own TF-INV-005 violations behind
+// -- findViolation alone would silently match an earlier sibling's
+// violation instead of this subtest's own job.
+func findViolationForSubject(t *testing.T, vs []invariant.Violation, id, subject string) invariant.Violation {
+	t.Helper()
+	for _, v := range vs {
+		if v.InvariantID == id && v.Subject == subject {
+			return v
+		}
+	}
+	t.Fatalf("no violation with InvariantID %q and Subject %q found among %d violation(s): %v", id, subject, len(vs), vs)
 	return invariant.Violation{}
 }
 
@@ -259,10 +278,16 @@ func TestCheckAll_DetectsDeadLetteredWithoutReason(t *testing.T) {
 	require.Equal(t, "job:"+created.ID.String(), v.Subject)
 }
 
-// TestCheckAll_DetectsAttemptAfterTerminal proves the TF-INV-005 proxy
-// check: a job_attempts row forged with started_at after the job's own
-// terminal_at -- direct evidence a terminal job was somehow reclaimed.
-func TestCheckAll_DetectsAttemptAfterTerminal(t *testing.T) {
+// TestCheckAll_DetectsTerminalStateReopened proves TF-INV-005 detection:
+// a terminal job's state forced back to RUNNING while terminal_at is left
+// stuck at its original value -- exactly the durable artifact any real
+// Claim-level bug would leave behind (claim.go's UPDATE always writes
+// state = 'RUNNING' in the same statement as any job_attempts insert, but
+// never touches terminal_at), and the only state this checker's rewritten
+// query can actually observe (see checkNoAttemptAfterTerminal's doc
+// comment for why comparing state to terminal_at replaced the earlier
+// cross-transaction timestamp comparison).
+func TestCheckAll_DetectsTerminalStateReopened(t *testing.T) {
 	db := testutil.DB(t)
 	s := store.New(db)
 	ctx := context.Background()
@@ -276,9 +301,14 @@ func TestCheckAll_DetectsAttemptAfterTerminal(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
 	require.NoError(t, err)
 
+	// Mirror exactly what claim.go's claimQuery UPDATE writes on a
+	// (buggy) reclaim: state -> RUNNING, a new job_attempts row inserted,
+	// terminal_at left untouched from the original completion above.
+	_, err = db.ExecContext(ctx, `UPDATE jobs SET state = 'RUNNING', lease_owner = 'forged-reopener', lease_generation = 2 WHERE id = $1`, created.ID)
+	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO job_attempts (id, job_id, attempt_number, lease_generation, worker_id, started_at)
-		VALUES ($1, $2, 2, 2, 'forged-reopener', now() + interval '1 hour')`,
+		VALUES ($1, $2, 2, 2, 'forged-reopener', now())`,
 		uuid.New(), created.ID)
 	require.NoError(t, err)
 
@@ -286,6 +316,527 @@ func TestCheckAll_DetectsAttemptAfterTerminal(t *testing.T) {
 	require.NoError(t, err)
 	v := findViolation(t, violations, "TF-INV-005")
 	require.Equal(t, "job:"+created.ID.String(), v.Subject)
+}
+
+// TestCheckAll_DetectsTerminalStateReopenedThenReterminalized is the
+// regression proof for the gap TestCheckAll_DetectsTerminalStateReopened
+// alone cannot cover: a job that reached a terminal state, was
+// illegitimately reclaimed (reopening it), and then reached a terminal
+// state a SECOND time -- so by the time CheckAll runs, jobs.state reads
+// terminal again and jobs.terminal_at has been overwritten with the
+// second terminalization's own timestamp. A checker that only compares
+// jobs.state against jobs.terminal_at (case 1 in
+// checkNoAttemptAfterTerminal's doc comment) sees nothing wrong here: both
+// columns agree, and the entire first terminalization -- and the illegal
+// reopening in between -- has been erased from jobs.terminal_at. Only
+// terminal_attempt_count (case 2, frozen at the FIRST terminalization via
+// COALESCE and never written again) still proves it happened.
+//
+// This is run for all three terminal states -- SUCCEEDED, CANCELLED, and
+// DEAD_LETTERED -- as required by TF-INV-005's scope, each as its own
+// subtest so a regression in any single terminal state's coverage is
+// individually visible.
+//
+// Every write here mirrors the EXACT durable effects the corresponding
+// real internal/store code path performs (job_attempts insert with
+// attempt_number = old attempt_count + 1, matching UPDATE ... SET
+// state = 'RUNNING', attempt_count = attempt_count + 1,
+// lease_generation = lease_generation + 1 for the illegal reclaim --
+// terminal_at/terminal_attempt_count deliberately left untouched, exactly
+// as claim.go's real claimQuery leaves them; then the same
+// finalize-attempt + terminal_at/terminal_attempt_count write shape the
+// real Complete*/sweep paths use for the second terminalization), so this
+// is a faithful stand-in for what a hypothetical claimQuery WHERE-clause
+// bug (or equivalent direct-SQL corruption) would leave behind -- not a
+// state internal/store's own fenced API can currently produce, since
+// claimQuery's WHERE clause (state IN ('QUEUED','RETRY_WAIT') OR
+// (state='RUNNING' AND lease_expires_at < now())) already excludes every
+// terminal state by construction. That exclusion is exactly the
+// application-level guarantee this checker exists to independently, and
+// durably, verify never silently breaks.
+func TestCheckAll_DetectsTerminalStateReopenedThenReterminalized(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+	checker := invariant.New(db)
+
+	t.Run("SUCCEEDED", func(t *testing.T) {
+		created, err := s.Insert(ctx, newParams("invtest.reopened.reterm.succeeded"))
+		require.NoError(t, err)
+		claimed, ok, err := s.Claim(ctx, "w1")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, created.ID, claimed.ID)
+		_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
+		require.NoError(t, err)
+
+		// Prove the CURRENT rewritten checker (case 1 alone) would in fact
+		// miss this once the forged reopening below is re-terminalized --
+		// this is the "prove it fails first" step the task requires.
+		reopenThenReterminalize(t, ctx, db, created.ID, "forged-reopener-succeeded", "SUCCEEDED")
+
+		violations, err := checker.CheckAll(ctx)
+		require.NoError(t, err)
+		findViolationForSubject(t, violations, "TF-INV-005", "job:"+created.ID.String())
+	})
+
+	t.Run("CANCELLED", func(t *testing.T) {
+		created, err := s.Insert(ctx, newParams("invtest.reopened.reterm.cancelled"))
+		require.NoError(t, err)
+		// CancelQueuedOrRetryWait: reaches CANCELLED with ZERO job_attempts
+		// rows -- the case terminal_attempt_count exists specifically to
+		// still cover (see checkNoAttemptAfterTerminal's doc comment).
+		_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+		require.NoError(t, err)
+
+		reopenThenReterminalize(t, ctx, db, created.ID, "forged-reopener-cancelled", "CANCELLED")
+
+		violations, err := checker.CheckAll(ctx)
+		require.NoError(t, err)
+		findViolationForSubject(t, violations, "TF-INV-005", "job:"+created.ID.String())
+	})
+
+	t.Run("DEAD_LETTERED", func(t *testing.T) {
+		created, err := s.Insert(ctx, newParams("invtest.reopened.reterm.deadlettered"))
+		require.NoError(t, err)
+		claimed, ok, err := s.Claim(ctx, "w1")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, created.ID, claimed.ID)
+		_, err = s.CompleteFailure(ctx, claimed.ID, "w1", claimed.LeaseGeneration, "boom", job.ErrorClassPermanent)
+		require.NoError(t, err)
+
+		reopenThenReterminalize(t, ctx, db, created.ID, "forged-reopener-deadlettered", "DEAD_LETTERED")
+
+		violations, err := checker.CheckAll(ctx)
+		require.NoError(t, err)
+		findViolationForSubject(t, violations, "TF-INV-005", "job:"+created.ID.String())
+	})
+}
+
+// reopenThenReterminalize forges, via raw SQL, the exact durable effects
+// of (a) an illegitimate reclaim of jobID after it already reached a
+// terminal state (mirroring claim.go's claimQuery UPDATE + job_attempts
+// INSERT verbatim, minus the WHERE-clause guard that makes this
+// unreachable through the real fenced API) and then (b) a second,
+// legitimate-shaped terminalization back to finalState (mirroring the
+// finalize-attempt + terminal_at/terminal_attempt_count write shape every
+// real Complete*/sweep path uses). It asserts, as a precondition, that
+// checkNoAttemptAfterTerminal's case-1-only predecessor (current state
+// vs. terminal_at) would NOT catch this once step (b) has run --
+// confirming the gap this test exists to close is real before relying on
+// terminal_attempt_count to close it.
+func reopenThenReterminalize(t *testing.T, ctx context.Context, db *sql.DB, jobID uuid.UUID, forgedOwner, finalState string) {
+	t.Helper()
+
+	var attemptCount int64
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT attempt_count FROM jobs WHERE id = $1`, jobID).Scan(&attemptCount))
+	newAttemptNumber := attemptCount + 1
+
+	// (a) illegal reclaim: exactly claimQuery's SET list, minus the WHERE
+	// guard that would normally reject a terminal row.
+	res, err := db.ExecContext(ctx, `
+		UPDATE jobs
+		SET state = 'RUNNING',
+			lease_owner = $2,
+			lease_generation = lease_generation + 1,
+			lease_expires_at = now() + interval '30 seconds',
+			heartbeat_at = now(),
+			attempt_count = attempt_count + 1,
+			updated_at = now(),
+			cancel_requested = false,
+			cancel_requested_at = NULL,
+			version = version + 1
+		WHERE id = $1`, jobID, forgedOwner)
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "forged reclaim must affect exactly the target row")
+
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO job_attempts (id, job_id, attempt_number, lease_generation, worker_id, started_at)
+		VALUES ($1, $2, $3, (SELECT lease_generation FROM jobs WHERE id = $2), $4, now())`,
+		uuid.New(), jobID, newAttemptNumber, forgedOwner)
+	require.NoError(t, err)
+
+	// Precondition: at this point (reopened, not yet re-terminalized), the
+	// PRE-fix checker's exact case-1 predicate (state vs terminal_at) DOES
+	// see this -- confirming the forged reopen is durably a case-1 shape
+	// before we mask it below.
+	var stillFlaggedByCase1 bool
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE id = $1 AND terminal_at IS NOT NULL AND state NOT IN ('SUCCEEDED', 'CANCELLED', 'DEAD_LETTERED')
+		)`, jobID).Scan(&stillFlaggedByCase1))
+	require.True(t, stillFlaggedByCase1, "test setup: the forged reopen must be case-1-visible before re-terminalization masks it")
+
+	// (b) re-terminalize: finalize the forged attempt and set
+	// terminal_at/terminal_attempt_count exactly like a real completion
+	// path would (terminal_attempt_count via the same
+	// COALESCE(jobs.terminal_attempt_count, jobs.attempt_count) every real
+	// site uses -- here a no-op since it is already non-NULL from the
+	// job's real, original terminalization, which is exactly the point).
+	var errMsg, errClass any
+	if finalState == "DEAD_LETTERED" {
+		errMsg, errClass = "forged re-terminalization", "PERMANENT"
+	}
+	_, err = db.ExecContext(ctx, `
+		UPDATE jobs
+		SET state = $2,
+			lease_owner = NULL,
+			lease_expires_at = NULL,
+			last_error = COALESCE($3, last_error),
+			last_error_class = COALESCE($4, last_error_class),
+			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
+			updated_at = now(),
+			version = version + 1
+		WHERE id = $1`, jobID, finalState, errMsg, errClass)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `
+		UPDATE job_attempts
+		SET finished_at = now(), outcome = $2
+		WHERE job_id = $1 AND finished_at IS NULL`, jobID, attemptOutcomeForFinalState(finalState))
+	require.NoError(t, err)
+
+	// Confirm the precondition this whole test is proving: case 1 alone
+	// (current state vs. terminal_at) is now BLIND to the reopening --
+	// state and terminal_at agree again, exactly as they would after any
+	// ordinary, legitimate single terminalization.
+	var stillFlaggedByCase1AfterReterm bool
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE id = $1 AND terminal_at IS NOT NULL AND state NOT IN ('SUCCEEDED', 'CANCELLED', 'DEAD_LETTERED')
+		)`, jobID).Scan(&stillFlaggedByCase1AfterReterm))
+	require.False(t, stillFlaggedByCase1AfterReterm, "test setup: re-terminalization must mask case 1 -- that is the exact gap this test proves case 2 closes")
+}
+
+func attemptOutcomeForFinalState(finalState string) string {
+	switch finalState {
+	case "SUCCEEDED":
+		return "SUCCEEDED"
+	case "CANCELLED":
+		return "CANCELLED"
+	default:
+		return "FAILED_PERMANENT"
+	}
+}
+
+// TestCheckAll_NoFalsePositiveOnClockSkewedAttemptTimestamp is the
+// regression proof for the bug checkNoAttemptAfterTerminal's rewrite
+// fixes: a job_attempts row whose started_at wall-clock value ended up
+// AFTER the job's own terminal_at (simulating exactly the kind of
+// backward NTP/hypervisor wall-clock correction observed landing between
+// two causally-ordered transactions under `go test -race`), while the
+// job's CURRENT state correctly remains SUCCEEDED the whole time -- i.e.
+// state was never actually reopened, only the wall-clock timestamps on
+// two different rows/transactions ended up out of order. The old
+// started_at-vs-terminal_at comparison flagged this as a TF-INV-005
+// violation; it must not.
+func TestCheckAll_NoFalsePositiveOnClockSkewedAttemptTimestamp(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+	checker := invariant.New(db)
+
+	created, err := s.Insert(ctx, newParams("invtest.clockskew"))
+	require.NoError(t, err)
+	claimed, ok, err := s.Claim(ctx, "w1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
+	require.NoError(t, err)
+
+	// The job's own (real) attempt 1 row now has finished_at/outcome set
+	// by CompleteSuccess above; forge ITS started_at backward past the
+	// job's terminal_at -- a legitimate row, an illegitimate (skewed)
+	// wall-clock value, and critically: jobs.state was never touched, so
+	// it is still, correctly, SUCCEEDED.
+	res, err := db.ExecContext(ctx, `UPDATE job_attempts SET started_at = now() + interval '1 hour' WHERE job_id = $1 AND attempt_number = 1`, created.ID)
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+
+	violations, err := checker.CheckAll(ctx)
+	require.NoError(t, err)
+	for _, v := range violations {
+		require.NotEqual(t, "TF-INV-005", v.InvariantID, "a clock-skewed but otherwise-consistent attempt timestamp must not be reported as a reopened terminal state: %v", v)
+	}
+}
+
+// TestCheckAll_DetectsMissingTerminalAttemptCountMarker proves
+// checkNoAttemptAfterTerminal's case A: a row that reached a terminal
+// state (terminal_at set) but whose terminal_attempt_count was never
+// captured. This is exactly the shape a future terminalization code path
+// that writes terminal_at/state but forgets terminal_attempt_count would
+// leave behind -- unreachable via every CURRENT internal/store call site
+// (each sets both columns in the same UPDATE), so it is forged directly
+// via SQL, mirroring this file's established pattern for states the real
+// fenced API cannot produce.
+func TestCheckAll_DetectsMissingTerminalAttemptCountMarker(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+	checker := invariant.New(db)
+
+	created, err := s.Insert(ctx, newParams("invtest.missingmarker"))
+	require.NoError(t, err)
+	claimed, ok, err := s.Claim(ctx, "w1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `UPDATE jobs SET terminal_attempt_count = NULL WHERE id = $1`, created.ID)
+	require.NoError(t, err)
+
+	violations, err := checker.CheckAll(ctx)
+	require.NoError(t, err)
+	v := findViolation(t, violations, "TF-INV-005")
+	require.Equal(t, "job:"+created.ID.String(), v.Subject)
+	require.Contains(t, v.Detail, "terminal_attempt_count is NULL")
+}
+
+// TestCheckAll_DetectsNegativeTerminalAttemptCount proves
+// checkNoAttemptAfterTerminal's case B: terminal_attempt_count < 0 can
+// never be a legitimate snapshot of attempt_count (which never goes
+// negative), so it is reported regardless of anything else on the row.
+func TestCheckAll_DetectsNegativeTerminalAttemptCount(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+	checker := invariant.New(db)
+
+	created, err := s.Insert(ctx, newParams("invtest.negativemarker"))
+	require.NoError(t, err)
+	claimed, ok, err := s.Claim(ctx, "w1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `UPDATE jobs SET terminal_attempt_count = -1 WHERE id = $1`, created.ID)
+	require.NoError(t, err)
+
+	violations, err := checker.CheckAll(ctx)
+	require.NoError(t, err)
+	v := findViolation(t, violations, "TF-INV-005")
+	require.Equal(t, "job:"+created.ID.String(), v.Subject)
+	require.Contains(t, v.Detail, "is negative")
+}
+
+// TestCheckAll_DetectsTerminalAttemptCountExceedsAttemptCount proves
+// checkNoAttemptAfterTerminal's case C: terminal_attempt_count can never
+// durably exceed the job's current attempt_count, since the marker is
+// defined as a snapshot of attempt_count taken at (and never after) first
+// terminalization, and attempt_count only ever increases afterward.
+func TestCheckAll_DetectsTerminalAttemptCountExceedsAttemptCount(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+	checker := invariant.New(db)
+
+	created, err := s.Insert(ctx, newParams("invtest.excessmarker"))
+	require.NoError(t, err)
+	claimed, ok, err := s.Claim(ctx, "w1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = s.CompleteSuccess(ctx, claimed.ID, "w1", claimed.LeaseGeneration, nil)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `UPDATE jobs SET terminal_attempt_count = attempt_count + 5 WHERE id = $1`, created.ID)
+	require.NoError(t, err)
+
+	violations, err := checker.CheckAll(ctx)
+	require.NoError(t, err)
+	v := findViolation(t, violations, "TF-INV-005")
+	require.Equal(t, "job:"+created.ID.String(), v.Subject)
+	require.Contains(t, v.Detail, "exceeds current attempt_count")
+}
+
+// TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily proves
+// item 2's requirement directly: every current terminalization family
+// leaves terminal_attempt_count == attempt_count at the moment it FIRST
+// makes a job terminal -- including the zero-attempt cancellation case,
+// which never opens a job_attempts row at all. Each row of the table
+// drives one job through the real internal/store fenced API for that
+// specific family and asserts the marker directly (not merely "the
+// checker reports no violation" -- a marker that failed to write at all
+// would still, on its own, pass CheckAll if nothing else touched the row,
+// so this asserts terminal_attempt_count itself, not just the absence of
+// a TF-INV-005 finding).
+func TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+
+	type tc struct {
+		name      string
+		terminate func(t *testing.T, jobID uuid.UUID) string // returns expected terminal state
+	}
+
+	cases := []tc{
+		{
+			name: "CompleteSuccess",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				claimed, ok, err := s.Claim(ctx, "w-success")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, jobID, claimed.ID)
+				_, err = s.CompleteSuccess(ctx, claimed.ID, "w-success", claimed.LeaseGeneration, nil)
+				require.NoError(t, err)
+				return "SUCCEEDED"
+			},
+		},
+		{
+			name: "CompleteFailure",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				claimed, ok, err := s.Claim(ctx, "w-failure")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, jobID, claimed.ID)
+				_, err = s.CompleteFailure(ctx, claimed.ID, "w-failure", claimed.LeaseGeneration, "boom", job.ErrorClassPermanent)
+				require.NoError(t, err)
+				return "DEAD_LETTERED"
+			},
+		},
+		{
+			name: "CancelQueuedOrRetryWait_ZeroAttempts",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				// Never claimed -- attempt_count is 0 the whole time, and
+				// no job_attempts row is ever opened. Exactly the "zero
+				// attempt cancellation case" item 2 calls out.
+				_, err := s.CancelQueuedOrRetryWait(ctx, jobID)
+				require.NoError(t, err)
+				return "CANCELLED"
+			},
+		},
+		{
+			name: "CompleteCancelled",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				claimed, ok, err := s.Claim(ctx, "w-cancel")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, jobID, claimed.ID)
+				_, err = s.RequestCancellation(ctx, claimed.ID)
+				require.NoError(t, err)
+				_, err = s.CompleteCancelled(ctx, claimed.ID, "w-cancel", claimed.LeaseGeneration)
+				require.NoError(t, err)
+				return "CANCELLED"
+			},
+		},
+		{
+			name: "RetryExhaustion_DeadLettered",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				// maxAttempts=1: the first retryable failure already
+				// exhausts the budget, landing straight on DEAD_LETTERED.
+				claimed, ok, err := s.Claim(ctx, "w-exhaust")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, jobID, claimed.ID)
+				j, err := s.CompleteRetryableFailure(ctx, claimed.ID, "w-exhaust", claimed.LeaseGeneration, "transient", 0)
+				require.NoError(t, err)
+				require.Equal(t, "DEAD_LETTERED", string(j.State), "test setup: maxAttempts=1 must exhaust on the first retryable failure")
+				return "DEAD_LETTERED"
+			},
+		},
+		{
+			name: "ExpiredLeaseExhaustion_LazySweep",
+			terminate: func(t *testing.T, jobID uuid.UUID) string {
+				// maxAttempts=1: claim it, then force its lease to expire
+				// (mirroring a crashed worker) so the next Claim call's
+				// Lazy Dead-Letter Sweep dead-letters it directly, never
+				// via any Complete* call.
+				claimed, ok, err := s.Claim(ctx, "w-sweep-victim")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, jobID, claimed.ID)
+				_, err = db.ExecContext(ctx, `UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1`, jobID)
+				require.NoError(t, err)
+
+				// The Lazy Dead-Letter Sweep runs unconditionally at the
+				// top of every Claim, regardless of what (if anything)
+				// that Claim call itself goes on to find -- no decoy job
+				// is needed for it to catch jobID.
+				_, _, err = s.Claim(ctx, "w-sweep-trigger")
+				require.NoError(t, err)
+
+				return "DEAD_LETTERED"
+			},
+		},
+		{
+			// jobID for this family is node B's job (see the special-cased
+			// setup below): cancelling predecessor node A's job via
+			// CompleteFailure cascades B to CANCELLED through
+			// resolveDependent -- with zero job_attempts rows for B, the
+			// same zero-attempt shape as CancelQueuedOrRetryWait above,
+			// but reached through the workflow cascade path instead. Its
+			// setup differs enough (two jobs, not one) that it is driven
+			// directly in the loop below rather than through the
+			// terminate func every other family shares.
+			name:      "WorkflowCascadeCancellation",
+			terminate: nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var jobID uuid.UUID
+			var wantState string
+
+			if c.name == "WorkflowCascadeCancellation" {
+				prefix := "invtest.family.cascade." + c.name
+				inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+					{NodeKey: "A", JobType: prefix + ".a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
+					{NodeKey: "B", JobType: prefix + ".b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
+				}})
+				require.NoError(t, err)
+				var aJobID, bJobID uuid.UUID
+				for _, n := range inst.Nodes {
+					if n.NodeKey == "A" {
+						aJobID = n.JobID
+					}
+					if n.NodeKey == "B" {
+						bJobID = n.JobID
+					}
+				}
+				claimedA, ok, err := s.Claim(ctx, "w-cascade")
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, aJobID, claimedA.ID)
+				_, err = s.CompleteFailure(ctx, claimedA.ID, "w-cascade", claimedA.LeaseGeneration, "boom", job.ErrorClassPermanent)
+				require.NoError(t, err)
+				jobID, wantState = bJobID, "CANCELLED"
+			} else {
+				maxAttempts := 5
+				if c.name == "RetryExhaustion_DeadLettered" || c.name == "ExpiredLeaseExhaustion_LazySweep" {
+					maxAttempts = 1
+				}
+				created, err := s.Insert(ctx, job.NewParams{
+					JobType: "invtest.family." + c.name, Payload: []byte(`{}`), MaxAttempts: maxAttempts, ExecutionTimeoutSeconds: 30,
+				})
+				require.NoError(t, err)
+				jobID = created.ID
+				wantState = c.terminate(t, jobID)
+			}
+
+			var state string
+			var attemptCount int
+			var terminalAttemptCount sql.NullInt64
+			require.NoError(t, db.QueryRowContext(ctx,
+				`SELECT state, attempt_count, terminal_attempt_count FROM jobs WHERE id = $1`, jobID,
+			).Scan(&state, &attemptCount, &terminalAttemptCount))
+
+			require.Equal(t, wantState, state, "test setup: %s must land on the expected terminal state", c.name)
+			require.True(t, terminalAttemptCount.Valid, "%s: terminal_attempt_count must be captured on first terminalization", c.name)
+			require.Equal(t, int64(attemptCount), terminalAttemptCount.Int64,
+				"%s: terminal_attempt_count must equal attempt_count at first terminalization", c.name)
+		})
+	}
 }
 
 // TestCheckAll_IdempotencyCheck_NoFalsePositiveOnManyNullKeys proves

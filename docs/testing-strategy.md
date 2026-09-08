@@ -604,7 +604,7 @@ scenario from [scenario-corpus.md](scenario-corpus.md).
 | TF-INV-002 | Concurrency tests | SF-006 |
 | TF-INV-003 | Stale-worker fencing tests | SF-008 |
 | TF-INV-004 | Worker crash tests, lease-expiration tests | SF-002, SF-003, SF-007 |
-| TF-INV-005 | State-machine table tests | SF-015 |
+| TF-INV-005 | State-machine table tests; durable-state invariant checks (`internal/invariant`, incl. historical reopen detection and marker self-validation) | SF-015 |
 | TF-INV-006 | Property tests | SF-010 |
 | TF-INV-007 | Integration tests (append-only assertions) | SF-009, SF-010 |
 | TF-INV-008 | Idempotency tests (concurrency) | SF-005 |

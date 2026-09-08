@@ -85,6 +85,7 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 		UPDATE jobs
 		SET state = 'CANCELLED',
 			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND state IN ('QUEUED', 'RETRY_WAIT')
@@ -208,6 +209,7 @@ func (s *Store) CompleteCancelled(ctx context.Context, id uuid.UUID, leaseOwner 
 			lease_owner = NULL,
 			lease_expires_at = NULL,
 			terminal_at = now(),
+			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
 		WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND state = 'RUNNING' AND cancel_requested = true

@@ -11,12 +11,15 @@ package chaos_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/chaos"
@@ -81,7 +84,10 @@ func TestChaos_MultipleWorkerInstancesRestart_Seeded(t *testing.T) {
 			// Anything generation 1 left RUNNING is exactly the
 			// "in-flight when the fleet died" case -- force-expire so
 			// generation 2 can reclaim it, precisely mirroring
-			// SF-002/SF-007's mechanism at fleet scale.
+			// SF-002/SF-007's mechanism at fleet scale. This first pass
+			// handles the common case; see the sweeper goroutine below
+			// for why a single point-in-time sweep is not sufficient by
+			// itself.
 			_, err := chaos.ForceExpireAllRunningLeases(ctx, db)
 			require.NoError(t, err)
 
@@ -102,12 +108,138 @@ func TestChaos_MultipleWorkerInstancesRestart_Seeded(t *testing.T) {
 				}(w)
 			}
 
-			require.Eventually(t, func() bool {
+			// Keep re-sweeping generation 1's rows for a bounded window
+			// instead of trusting the single pass above: database/sql's
+			// own Tx.Commit contract is "Commit will return an error if
+			// the context provided to BeginTx is canceled" -- but a
+			// cancellation landing while the commit's network round trip
+			// is already in flight can make the CLIENT see that error
+			// even though the COMMIT already reached and was applied by
+			// PostgreSQL. Concretely: a gen1 worker's Claim() can durably
+			// commit a job to RUNNING under a fresh, full
+			// (execution_timeout_seconds-long) lease while gen1Cancel()
+			// racing that same commit makes Worker.Run observe an error
+			// and exit -- so wg1.Wait() returns believing gen1 is fully
+			// stopped while this specific commit is still landing on the
+			// server, after the single sweep above already ran and missed
+			// it. Nothing else would ever touch that row again: generation
+			// 2's Claim requires an EXPIRED lease, and this job's is fresh
+			// for the next execution_timeout_seconds (30s here) -- longer
+			// than this test's own convergence budget below. Directly
+			// observed under `go test -race` in this project's dev/CI
+			// environment (see the final report for this investigation).
+			//
+			// Scoped to rows still owned by a gen1 worker of THIS
+			// scenario specifically (job_type = 'chaos.fleetrestart' AND
+			// lease_owner LIKE 'fleet-gen1-%'), never a blanket "every
+			// RUNNING row": gen1 is fully stopped (wg1.Wait() already
+			// returned), so ANY row still under a gen1 owner is safe to
+			// force-expire unconditionally -- there is no legitimate
+			// "gen1 still working on it" case left. The job_type filter is
+			// additional, deliberate defense-in-depth on top of the owner
+			// pattern: "fleet-gen1-%" is only a naming convention, not a
+			// database-enforced scope, so pinning to this scenario's own
+			// job_type keeps the sweep from ever being able to touch a
+			// same-process row it has no business seeing even if some
+			// other owner name were ever chosen to coincidentally match
+			// the same LIKE pattern. A blanket sweep across ALL running
+			// rows was tried first and is wrong: under enough scheduling
+			// delay it also force-expires generation 2's own genuinely
+			// in-flight claims before their rightful owner can complete
+			// them, repeatedly stealing the same job from itself and
+			// burning through its whole attempt budget into a bogus
+			// DEAD_LETTERED (observed directly under artificial CPU
+			// contention while validating this fix).
+			sweepCtx, sweepCancel := context.WithTimeout(ctx, 5*time.Second)
+			var sweepWG sync.WaitGroup
+			var sweepErrMu sync.Mutex
+			var sweepErr error
+			sweepWG.Add(1)
+			go func() {
+				defer sweepWG.Done()
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-sweepCtx.Done():
+						return
+					case <-ticker.C:
+						// sweepCtx (not the test's own ctx) bounds this
+						// call so the 5-second sweep window is real even
+						// while a statement is in flight against the
+						// database -- an ExecContext blocked on the
+						// network/server past sweepCtx's deadline is
+						// cancelled and returns promptly instead of
+						// outliving the window it is supposed to be
+						// bounded by.
+						_, err := db.ExecContext(sweepCtx, `
+							UPDATE jobs SET lease_expires_at = now() - interval '1 second'
+							WHERE state = 'RUNNING' AND job_type = 'chaos.fleetrestart' AND lease_owner LIKE 'fleet-gen1-%'`)
+						// context.Canceled/DeadlineExceeded here just means
+						// sweepCtx's own window closed mid-statement --
+						// expected, not a real database error. Anything
+						// else (a genuine connection/driver/SQL failure)
+						// must not be silently discarded: capture the
+						// FIRST one and stop sweeping, then let the test's
+						// own goroutine (never this background one) fail
+						// the test via the deferred require.NoError below
+						// -- calling a require/FailNow-family assertion
+						// from this goroutine directly would be unsafe
+						// (testing.T's FailNow contract requires it run on
+						// the test's own goroutine).
+						if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+							sweepErrMu.Lock()
+							if sweepErr == nil {
+								sweepErr = err
+							}
+							sweepErrMu.Unlock()
+							return
+						}
+					}
+				}
+			}()
+			defer func() {
+				sweepCancel()
+				sweepWG.Wait()
+				sweepErrMu.Lock()
+				err := sweepErr
+				sweepErrMu.Unlock()
+				require.NoError(t, err, "fleet-gen1 lease-expiry sweeper hit an unexpected database error")
+			}()
+
+			// assert (not require) here on purpose: a failure to converge
+			// is diagnosed below with each non-SUCCEEDED row's full durable
+			// state before the test actually fails, per docs/roadmap.md's
+			// "a test failure must report enough information to reproduce
+			// the exact sequence" -- exactly what let this file's own
+			// gen1/gen2 race (see the sweeper above) be root-caused in the
+			// first place, rather than debugged blind from the bare
+			// "condition never satisfied" message alone.
+			converged := assert.Eventually(t, func() bool {
 				var n int
 				row := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE job_type = 'chaos.fleetrestart' AND state = 'SUCCEEDED'`)
 				require.NoError(t, row.Scan(&n))
 				return n == numJobs
 			}, 15*time.Second, 20*time.Millisecond, "every job must eventually succeed despite a full simulated fleet restart mid-flight")
+			if !converged {
+				rows, derr := db.QueryContext(ctx, `
+					SELECT id, state, attempt_count, lease_owner, lease_generation, lease_expires_at, eligible_at, cancel_requested
+					FROM jobs WHERE job_type = 'chaos.fleetrestart' AND state <> 'SUCCEEDED' ORDER BY id`)
+				require.NoError(t, derr)
+				for rows.Next() {
+					var id, state string
+					var attemptCount int
+					var leaseOwner sql.NullString
+					var leaseGeneration int64
+					var leaseExpiresAt, eligibleAt sql.NullTime
+					var cancelRequested bool
+					require.NoError(t, rows.Scan(&id, &state, &attemptCount, &leaseOwner, &leaseGeneration, &leaseExpiresAt, &eligibleAt, &cancelRequested))
+					t.Logf("stuck job id=%s state=%s attempt_count=%d lease_owner=%v lease_generation=%d lease_expires_at=%v eligible_at=%v cancel_requested=%v",
+						id, state, attemptCount, leaseOwner, leaseGeneration, leaseExpiresAt, eligibleAt, cancelRequested)
+				}
+				require.NoError(t, rows.Err())
+				t.FailNow()
+			}
 
 			gen2Cancel()
 			wg2.Wait()
