@@ -149,12 +149,22 @@ below rather than listed as an unconditional P0.
    out of scope for v1 ("If the database is down, TaskForge is down for
    writes"). There is no documented backup/restore procedure, no tested PITR
    runbook, and no failover drill anywhere in the repository.
-6. **No supply-chain hardening.** No SBOM, no dependency vulnerability
+6. **No supply-chain hardening.** ~~No SBOM, no dependency vulnerability
    scanning (no `govulncheck`, Trivy, Snyk, or CodeQL step), no artifact
    signing/provenance/attestation, no Dockerfile (only a `docker-compose.yml`
    for a stock local Postgres). CI (`.github/workflows/ci.yml`) runs
    `gofmt`/`go vet`/`go build`/`go test`/`go test -race` only — five checks,
-   no security gate.
+   no security gate.~~ **Resolved by docs/enterprise-roadmap.md Phase 10** —
+   see [docs/supply-chain-security.md](supply-chain-security.md). CI now
+   also runs `govulncheck` (every PR + weekly) and CodeQL for Go;
+   Dependabot and dependency-review are configured; every workflow is
+   least-privilege and every Action SHA-pinned; releases generate an SBOM,
+   checksums, and GitHub Artifact Attestations. No Dockerfile is still
+   correct — Phase 10 explicitly does not add a container image (no
+   product code currently ships one). A small number of GitHub
+   account-level settings (branch-protection "required check" status,
+   secret-scanning toggle) remain unverified from a non-interactive
+   implementation environment — see that document's "Limitations" section.
 7. **No upgrade/version-compatibility guarantees of any kind.** There is no
    documented policy for rolling server upgrades, old-worker/new-server or
    new-worker/old-server compatibility, job payload schema evolution, or
@@ -255,15 +265,18 @@ review will ask for an RPO/RTO number and a tested restore procedure.
 
 ## 9. Supply-Chain Gaps
 
-No SBOM, no dependency vulnerability scanning, no artifact signing/
-attestation, no container image at all (no Dockerfile), no release process
-beyond git tags (not verified to exist). The dependency surface is small and
-reputable (`pgx/v5`, `google/uuid`, `prometheus/client_golang`,
-`stretchr/testify`, `fergusstrange/embedded-postgres` — the last being a
-test-only dependency), which meaningfully limits blast radius, but "small
-surface" is not the same claim as "actively scanned surface," and today
-neither Dependabot-equivalent scanning nor a documented triage process
-exists.
+**Resolved by docs/enterprise-roadmap.md Phase 10** — see
+[docs/supply-chain-security.md](supply-chain-security.md) for the full
+implementation: SBOM generation, `govulncheck` + CodeQL scanning,
+Dependabot, dependency-review, SHA-pinned/least-privilege CI, and a
+release process producing checksums and GitHub Artifact Attestations. The
+dependency surface itself remains small and reputable (`pgx/v5`,
+`google/uuid`, `prometheus/client_golang`, `stretchr/testify`,
+`fergusstrange/embedded-postgres` — the last being a test-only dependency),
+now paired with active scanning rather than relying on surface size alone.
+No release has actually been tagged yet (this phase's scope excludes
+tagging/pushing), so no live release artifact exists to point to yet —
+see docs/supply-chain-security.md "Limitations."
 
 ## 10. Observability/Performance Evidence Gaps
 
@@ -349,9 +362,14 @@ maps to a specific phase in [enterprise-roadmap.md](enterprise-roadmap.md):
       restore-from-backup drill has been executed and timed at least once.
 - [ ] A two-binary-version (old worker / new server, and new worker / old
       server) integration test exists and passes.
-- [ ] `govulncheck` (or equivalent) runs in CI and fails the build on a
-      known-exploitable vulnerability in a direct dependency.
-- [ ] An SBOM is generated and attached to at least one tagged release.
+- [x] `govulncheck` (or equivalent) runs in CI and fails the build on a
+      known-exploitable vulnerability in a direct dependency. Implemented
+      Phase 10 — see [docs/supply-chain-security.md](supply-chain-security.md) §1.
+- [x] An SBOM generation mechanism is implemented and produces one for
+      every release artifact. Implemented Phase 10 — see
+      [docs/supply-chain-security.md](supply-chain-security.md) §6; not yet
+      exercised against a real tagged release (see that document's
+      "Limitations").
 - [ ] A named-queue or per-job-type concurrency-limit mechanism exists with
       a passing test demonstrating one job type cannot starve another
       indefinitely.

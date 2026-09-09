@@ -1,0 +1,290 @@
+name: Release
+
+# Phase 10 (docs/enterprise-roadmap.md "Document the minimal release
+# process this implies (tag -> build -> attest -> publish)"). Triggered
+# only by a semantic-version tag push -- pushing a tag already requires
+# write access to the repository, so this can never be triggered by
+# untrusted pull-request code (no pull_request/pull_request_target trigger
+# exists in this file at all). See docs/supply-chain-security.md
+# "Release process" for the full, human-readable walkthrough of every step
+# below and how to verify the result.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# The "v*.*.*" glob above is only a routing trigger -- it also matches
+# non-SemVer tags like "vfoo.bar.baz" or "v1.2.3junk". It is not validation.
+# The verify job's "Validate release tag is strict SemVer" step below
+# performs the actual strict vMAJOR.MINOR.PATCH check and fails closed
+# before any build/release work happens. See docs/supply-chain-security.md
+# §9.
+
+permissions:
+  contents: read
+
+jobs:
+  # verify repeats the applicable Go/test/vulnerability gates ci.yml
+  # enforces on every PR -- gofmt, go vet, go build, go test, go test
+  # -race, go mod verify, and govulncheck -- against the exact commit the
+  # tag points at, before a single release artifact is built. A tag pushed
+  # straight to a commit that skipped/failed PR CI (e.g. pushed locally)
+  # must not be released unverified. dependency-review.yml is a PR-time-only
+  # gate (it diffs a PR's base against its head) and has no meaning against
+  # a single already-merged commit, so it is intentionally not "rerun"
+  # here -- see docs/supply-chain-security.md §2.
+  #
+  # This job also enforces two release-trust checks that the tag-push
+  # trigger alone cannot: that the tag is strictly SemVer (not just glob-matched)
+  # and that the tagged commit is actually reachable from origin/main (not an
+  # arbitrary unmerged branch commit) -- see the two steps below and
+  # docs/supply-chain-security.md §9 "Release trust boundary".
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: taskforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TASKFORGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/taskforge_test?sslmode=disable
+
+    steps:
+      # fetch-depth: 0 (full history, all branches/tags) is required here,
+      # not just a preference: the ancestry check below runs `git merge-base
+      # --is-ancestor $GITHUB_SHA origin/main`, which needs both the tagged
+      # commit's and origin/main's full commit graphs present locally --
+      # actions/checkout's default shallow (depth-1) clone would make that
+      # check unreliable/false-negative. persist-credentials: false is kept
+      # even though this job needs `origin/main` -- the ancestry check below
+      # fetches it explicitly over the anonymous HTTPS remote already left
+      # by checkout, not via a persisted credential.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The push trigger's "v*.*.*" glob only routes; it also matches
+      # invalid tags like "vfoo.bar.baz", "v1.2", "v01.2.3", or
+      # "v1.2.3junk". This step is the actual validation: stable SemVer
+      # only (vMAJOR.MINOR.PATCH, nonnegative numeric components, no
+      # leading zeroes except a lone "0"). No prerelease/build-metadata
+      # suffix is accepted in this phase. Fails closed -- any tag that
+      # doesn't match is rejected before any build/release work runs. See
+      # docs/supply-chain-security.md §9.
+      - name: Validate release tag is strict SemVer
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::'$tag' is not a valid stable SemVer tag (expected vMAJOR.MINOR.PATCH, e.g. v1.2.3)"
+            exit 1
+          fi
+          echo "Tag '$tag' is valid stable SemVer."
+
+      # A collaborator with tag-push access but no merged PR must not be
+      # able to tag an arbitrary branch commit and obtain an official
+      # release just because their local tests pass. This does not require
+      # the tag to point at main's current tip -- an older commit that
+      # genuinely was merged into main may still be released -- only that
+      # GITHUB_SHA is reachable from origin/main's history. Fails closed.
+      # See docs/supply-chain-security.md §9 "Release trust boundary".
+      - name: Verify tagged commit is reachable from main
+        run: |
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_SHA} is not reachable from origin/main -- refusing to release a commit that was never merged to main"
+            exit 1
+          fi
+          echo "${GITHUB_SHA} is reachable from origin/main."
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -p 1 ./...
+
+      - name: go test -race
+        run: go test -race -p 1 ./...
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: govulncheck
+        run: make vulncheck
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write is needed only here, only to create the GitHub
+      # Release and upload its assets via `gh release create`. id-token +
+      # attestations + artifact-metadata are the exact set actions/attest's
+      # own README documents as required (see .github/workflows/codeql.yml
+      # for CodeQL's analogous, differently-scoped elevation). No other job
+      # in this repository holds any of these four permissions.
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Generated exactly once, here, and exported via GITHUB_ENV so every
+      # later step in this job (both release-build and release-metadata)
+      # receives the identical value. Calling `date -u ...` separately in
+      # each step would let a few seconds' skew make the date embedded in
+      # the binaries (via internal/buildinfo) differ from
+      # release-metadata.json's "date" field for the same release.
+      - name: Set release date
+        run: echo "RELEASE_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # clean -> binaries -> artifact-specific SBOMs -> release metadata ->
+      # checksums -> attest -> publish. release-build itself removes and
+      # recreates dist/ first (see Makefile), so no stale file from a
+      # previous run of this job/runner can enter SHA256SUMS or the
+      # published release.
+      - name: Build release binaries
+        run: |
+          make release-build \
+            VERSION="${GITHUB_REF_NAME}" \
+            COMMIT="${GITHUB_SHA}" \
+            DATE="${RELEASE_DATE}"
+
+      # One CycloneDX SBOM per released binary (cyclonedx-gomod "app", build
+      # constraints evaluated per GOOS/GOARCH/CGO_ENABLED) -- see the `sbom`
+      # Makefile target's doc comment for why "app" and not "mod".
+      - name: Generate SBOMs
+        run: make sbom
+
+      - name: Generate release metadata
+        run: |
+          make release-metadata \
+            VERSION="${GITHUB_REF_NAME}" \
+            COMMIT="${GITHUB_SHA}" \
+            DATE="${RELEASE_DATE}"
+
+      - name: Generate checksums
+        run: make checksums
+
+      - name: List release artifacts
+        run: ls -la dist/
+
+      # Provenance mode (no sbom-path): auto-generates a SLSA build
+      # provenance predicate for every binary. subject-path is an explicit,
+      # newline-delimited list of exactly the 8 released binaries -- not a
+      # glob -- so it can never accidentally widen to match a SBOM file,
+      # SHA256SUMS, or release-metadata.json dropped into dist/ later. See
+      # docs/supply-chain-security.md for exactly what this does and does
+      # not prove.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/taskforge-api-linux-amd64
+            dist/taskforge-api-linux-arm64
+            dist/taskforge-api-darwin-amd64
+            dist/taskforge-api-darwin-arm64
+            dist/taskforge-worker-linux-amd64
+            dist/taskforge-worker-linux-arm64
+            dist/taskforge-worker-darwin-amd64
+            dist/taskforge-worker-darwin-arm64
+
+      # SBOM mode (sbom-path set): binds each binary's SBOM to that binary's
+      # digest as a signed predicate. Each binary is attested against its
+      # own build-constrained SBOM, not a shared/aggregate one -- eight
+      # explicit steps, one per (binary, platform) pair, kept as plain,
+      # individually-readable steps rather than a matrix/loop abstraction so
+      # each binary<->SBOM pairing stays visually verifiable in this file.
+      - name: Attest SBOM (taskforge-api-linux-amd64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-api-linux-amd64"
+          sbom-path: "dist/taskforge-api-linux-amd64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-api-linux-arm64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-api-linux-arm64"
+          sbom-path: "dist/taskforge-api-linux-arm64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-api-darwin-amd64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-api-darwin-amd64"
+          sbom-path: "dist/taskforge-api-darwin-amd64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-api-darwin-arm64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-api-darwin-arm64"
+          sbom-path: "dist/taskforge-api-darwin-arm64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-worker-linux-amd64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-worker-linux-amd64"
+          sbom-path: "dist/taskforge-worker-linux-amd64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-worker-linux-arm64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-worker-linux-arm64"
+          sbom-path: "dist/taskforge-worker-linux-arm64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-worker-darwin-amd64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-worker-darwin-amd64"
+          sbom-path: "dist/taskforge-worker-darwin-amd64.sbom.cdx.json"
+
+      - name: Attest SBOM (taskforge-worker-darwin-arm64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "dist/taskforge-worker-darwin-arm64"
+          sbom-path: "dist/taskforge-worker-darwin-arm64.sbom.cdx.json"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/taskforge-* dist/release-metadata.json dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes "Built from commit ${GITHUB_SHA}. See docs/supply-chain-security.md for how to verify checksums, each binary's matching SBOM, release-metadata.json, and build provenance/SBOM attestations for these artifacts."

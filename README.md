@@ -15,7 +15,17 @@ label to qualify; Phase 9 is **Hardening**, not yet Stable — see "Phase 9:
 What's Implemented" below for exactly why: docs/roadmap.md's Stable bar
 for this phase requires "zero invariant violations across a multi-hour
 chaos run," and only a bounded, short manual run has actually been
-executed so far, not a multi-hour one).**
+executed so far, not a multi-hour one). Separately, Phase 10 —
+Supply-Chain & Release Hardening — of
+[docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) is
+**implementation-complete**: every workflow/mechanism it adds is in place
+and locally exercised, but live release evidence (an actual tagged release,
+a real GitHub attestation) and a handful of GitHub account-level settings
+(branch-protection required-check status, secret-scanning/push-protection
+toggles) remain pending — not yet a claim of unconditional completion; see
+"Phase 10: What's Implemented" below and
+[docs/supply-chain-security.md](docs/supply-chain-security.md); it adds no
+runtime/product code and does not change any guarantee above.**
 Phases 1 through 8 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication and optional
@@ -2496,6 +2506,80 @@ genuine multi-hour `cmd/chaos -mode=soak` run (or an extended CI job) has
 actually executed and is reported here with its real results, not a
 judgment call to make preemptively.
 
+## Phase 10: What's Implemented
+
+**Status: Implementation-complete (mechanism); live release and
+GitHub-account-level evidence pending** — see "Not implemented / explicit
+non-scope" below and [docs/supply-chain-security.md](docs/supply-chain-security.md)'s
+"Limitations" section for exactly what that means.
+
+Phase 10 (docs/enterprise-roadmap.md "Supply-Chain & Release Hardening")
+is CI/release-process hardening only — it touches no file under `internal/`
+or `cmd/` except `internal/buildinfo` (a small new package holding release
+version metadata) and a `-version` flag on `cmd/api`/`cmd/worker`. It adds
+no runtime behavior, no new database schema, and changes none of the
+guarantees described in Phases 1–9 above. Full detail, including exactly
+what each control does and does not prove, lives in
+[docs/supply-chain-security.md](docs/supply-chain-security.md); this
+section is a summary.
+
+### Implemented now
+
+- `govulncheck` (Go's official vulnerability scanner) runs in CI on every
+  push/PR (`.github/workflows/ci.yml`) and weekly on a schedule
+  (`.github/workflows/scheduled-security.yml`), via the identical `make
+  vulncheck` command a developer runs locally — never three different
+  invocations that could drift.
+- CodeQL static analysis for Go runs on every push/PR to `main` and weekly
+  (`.github/workflows/codeql.yml`).
+- Dependabot is configured for both Go modules and GitHub Actions
+  (`.github/dependabot.yml`), and GitHub's dependency-review action fails
+  the check on a PR that introduces a newly-vulnerable dependency
+  (`.github/workflows/dependency-review.yml`) — whether that failure
+  actually blocks the merge depends on branch protection marking it a
+  required status check, a repository setting not yet configured (see
+  "Not implemented / explicit non-scope" below).
+- Every workflow declares an explicit, least-privilege `permissions:`
+  block (`contents: read` by default; a write/attestation scope only on
+  the one job that needs it, with a comment explaining why), and every
+  third-party GitHub Action reference across all five workflow files is
+  pinned to a full, immutable commit SHA with a human-readable version
+  comment — never a mutable tag. Every `actions/checkout` step across
+  every workflow also sets `persist-credentials: false`; no workflow
+  authenticates a `git push` off a checkout-persisted credential.
+- A tagged release (`.github/workflows/release.yml`) builds `taskforge-api`
+  and `taskforge-worker` binaries for linux/amd64, linux/arm64,
+  darwin/amd64, and darwin/arm64, each with version/commit/build-date
+  metadata embedded via `internal/buildinfo` and readable via `-version`;
+  generates one build-constrained CycloneDX SBOM per binary (8 total), a
+  `release-metadata.json` summary, and a `SHA256SUMS` checksum manifest;
+  attests build provenance (all binaries) and, separately, each binary's
+  own matching SBOM via GitHub Artifact Attestations (`actions/attest`);
+  and publishes a GitHub Release with all of the above as assets.
+- `make vulncheck`, `make release-build`, `make sbom`, `make
+  release-metadata`, and `make checksums` let a developer run every one of
+  the above (except publishing) locally, in that order.
+
+### Not implemented / explicit non-scope
+
+- No container image, no Kubernetes manifests, no code-signing
+  infrastructure outside GitHub's own Sigstore-backed attestations, no
+  hosted security platform beyond GitHub-native tooling — all explicitly
+  out of scope per docs/enterprise-roadmap.md Phase 10.
+- Secret scanning / push protection status is documented, not
+  programmatically verified from this implementation environment (an
+  account/repository-settings action, not a code or workflow change) — see
+  docs/supply-chain-security.md's "Limitations" section.
+- No CI check added or modified by Phase 10 (`vulncheck`, CodeQL,
+  dependency-review) has been marked a branch-protection "required status
+  check" — every one of them runs and fails on a finding, but whether that
+  failure actually blocks a PR from merging is a repository *setting* not
+  toggled from this implementation environment.
+- No bit-for-bit reproducible builds are claimed — see
+  docs/supply-chain-security.md "Release verification" for the precise,
+  narrower claim ("traceable/repeatable release procedure") this phase
+  actually supports.
+
 ## Documentation Map
 
 | Document | Contents |
@@ -2516,6 +2600,8 @@ judgment call to make preemptively.
 | [docs/scenario-corpus.md](docs/scenario-corpus.md) | 30 named, deterministic test scenarios (SF-001 through SF-030) |
 | [docs/roadmap.md](docs/roadmap.md) | Phased implementation plan with entry/exit criteria per phase |
 | [docs/adr/](docs/adr/README.md) | Architecture decision records — the real tradeoffs behind the design |
+| [docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) | Phases 10–18: the enterprise-readiness sequencing plan (Phase 10 implemented; 11–18 proposed) |
+| [docs/supply-chain-security.md](docs/supply-chain-security.md) | Phase 10: dependency scanning, SBOM, provenance attestation, release process and verification, limitations |
 
 ## Technology Direction
 

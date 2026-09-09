@@ -1,0 +1,55 @@
+name: CodeQL
+
+# Phase 10 (docs/enterprise-roadmap.md): closes the "verified by inspection,
+# not by an automated SAST/CodeQL gate" caveat docs/security-model.md §3
+# flags for the parameterized-query finding. Go only -- TaskForge contains
+# no other analyzable language. No Postgres service is needed here: CodeQL
+# performs static analysis over a compiled build, it does not execute
+# tests, so this does not duplicate ci.yml's test job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, independent of PR/push activity -- a CodeQL query pack update
+    # can surface a new finding in unchanged code, same rationale as
+    # scheduled-security.yml's govulncheck run.
+    - cron: "17 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      # security-events: write is the one genuinely-needed elevation in
+      # this entire workflow set: github/codeql-action/analyze uploads its
+      # SARIF results to the repository's code scanning API, which requires
+      # it. actions: read lets the action resolve the triggering workflow
+      # run, per GitHub's own default CodeQL workflow template.
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: go
+
+      - uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:go"

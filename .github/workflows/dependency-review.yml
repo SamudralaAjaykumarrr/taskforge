@@ -1,0 +1,43 @@
+name: Dependency Review
+
+# Phase 10 (docs/enterprise-roadmap.md): fails a PR that introduces a
+# runtime-scoped dependency carrying a known vulnerability of low severity
+# or higher, using GitHub's dependency-graph diff between base and head.
+# This is a PR-time complement to vulncheck's scan of the already-merged
+# tree, not a replacement for it. TaskForge has no approved/disallowed
+# license policy -- this workflow does not enforce one (see the job's
+# `with:` block below).
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Stated explicitly rather than left to silently-relied-upon
+          # defaults, so the intended policy is visible in this file
+          # without cross-referencing the action's own docs. This is a
+          # vulnerability gate only: TaskForge has no approved/disallowed
+          # license policy, so license-check is explicitly disabled and
+          # `allow-licenses`/`deny-licenses` are deliberately not set here --
+          # do not add either without an actual license policy decision
+          # first. GitHub may still surface license metadata on a PR; that
+          # is informational only and does not fail this check. See
+          # docs/supply-chain-security.md §2 for the platform limitation on
+          # public-repo enforcement (branch protection "required status
+          # check" cannot be configured from this implementation
+          # environment).
+          fail-on-severity: low
+          fail-on-scopes: runtime
+          comment-summary-in-pr: never
+          license-check: false

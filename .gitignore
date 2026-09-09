@@ -7,6 +7,10 @@ bin/
 dist/
 *.exe
 
+# Locally go-installed build tooling (e.g. cyclonedx-gomod; see Makefile's
+# sbom target)
+.tools/
+
 # Test / coverage
 coverage.out
 *.coverprofile
