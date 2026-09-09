@@ -7,6 +7,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,6 +21,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/buildinfo"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
@@ -26,6 +29,13 @@ import (
 )
 
 func main() {
+	versionFlag := flag.Bool("version", false, "print version information and exit")
+	flag.Parse()
+	if *versionFlag {
+		fmt.Println("taskforge-api " + buildinfo.String())
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	if err := run(logger); err != nil {
@@ -79,7 +89,7 @@ func run(logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("api server listening", "addr", cfg.HTTPAddr)
+		logger.Info("api server listening", "addr", cfg.HTTPAddr, "version", buildinfo.Version, "commit", buildinfo.Commit)
 		errCh <- srv.ListenAndServe()
 	}()
 

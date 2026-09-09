@@ -164,12 +164,30 @@ as documented, lower-assurance defaults for that context only.
 
 ## 6. Supply-Chain Security
 
-| Threat | Description | Status today | Severity |
+**Resolved by docs/enterprise-roadmap.md Phase 10** — see
+[docs/supply-chain-security.md](supply-chain-security.md) for the current,
+authoritative design (this section's table is retained below as the
+original review finding it responds to, for historical/audit traceability;
+each row's "Status today" is now out of date and superseded by the note
+that follows it).
+
+| Threat | Description | Status at original review | Severity at original review |
 |---|---|---|---|
 | **Dependency compromise** | A compromised transitive or direct dependency (e.g. a malicious release of `pgx`, `google/uuid`, or `prometheus/client_golang`) would be pulled in on the next `go get`/`go mod tidy` with no automated detection. | No dependency vulnerability scanning in CI (no `govulncheck`, Dependabot config, Snyk, or Trivy step found). `go.sum` exists and provides checksum integrity for what is already pinned, which is a real (if partial) mitigation against silent tampering of already-vetted versions. | P0 — no detection mechanism for a newly-disclosed CVE in an existing pinned dependency, and no automated PR to bump it |
 | **Artifact tampering** | No build provenance or artifact signing exists — there is no CI step producing a signed, attestable build artifact (e.g. via GitHub Artifact Attestations/SLSA), and no container image is built at all (only a local-dev `docker-compose.yml`, no `Dockerfile`). | Confirmed absent. | P1 — no current release/distribution mechanism to attest, but a blocker the moment one exists |
 | **No SBOM** | No CycloneDX/SPDX file exists anywhere in the repository. | Confirmed absent by file search. | P1 |
 | **Small, reputable direct dependency surface** | Direct dependencies are `pgx/v5`, `google/uuid`, `prometheus/client_golang`, `prometheus/client_model`, `stretchr/testify` (test-only), and `fergusstrange/embedded-postgres` (test-only). No web framework, no auth library, no third-party observability SDK. | This is a genuine mitigating factor — a small, well-known dependency surface has less attack surface than a sprawling one, independent of whether scanning exists. | Positive finding, does not offset the missing scanning/SBOM/attestation gaps above |
+
+**Now (post-Phase 10)**: `govulncheck` runs on every PR and weekly
+(closing the "Dependency compromise" row's P0); `actions/attest` produces
+signed build-provenance and per-binary SBOM attestations for release
+binaries (closing "Artifact tampering"); `cyclonedx-gomod` generates one
+build-constrained CycloneDX SBOM per released binary at release time
+(closing "No SBOM"). The dependency surface itself is unchanged (still
+small and reputable) — it is now actively scanned rather than relying on
+surface size alone. No release has actually been tagged yet, so no live
+attestation/SBOM has been verified end-to-end against a real artifact —
+see docs/supply-chain-security.md "Limitations."
 
 ## 7. Tenant / Idempotency Interaction
 
@@ -202,7 +220,7 @@ before either ships.
 | Database trust | **Comparatively strong.** Parameterized queries throughout (verified by inspection, not by automated SAST), payload opacity by design, disciplined non-sensitive logging (verified). |
 | Transport security | **Absent.** No TLS/mTLS configuration anywhere. |
 | Operational security | **Absent.** No metrics auth, no actor-attributed audit trail (blocked on missing authN), no incident runbook. |
-| Supply-chain security | **Absent.** No scanning, no SBOM, no attestation — partially offset by a small, reputable dependency surface and `go.sum` integrity checksums. |
+| Supply-chain security | **Implemented (Phase 10).** `govulncheck` (PR + scheduled), CodeQL, Dependabot, dependency-review, SHA-pinned least-privilege CI, and a release process producing an SBOM, checksums, and GitHub Artifact Attestations — see [docs/supply-chain-security.md](supply-chain-security.md). Branch-protection "required check" enforcement and the secret-scanning/push-protection toggle are documented but not verifiable from a non-interactive implementation environment. |
 
 ## What This Document Does Not Do
 

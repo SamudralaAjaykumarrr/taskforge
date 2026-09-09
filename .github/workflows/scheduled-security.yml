@@ -1,0 +1,32 @@
+name: Scheduled vulnerability scan
+
+# Phase 10 (docs/enterprise-roadmap.md): a CVE can be disclosed in a
+# dependency TaskForge already depends on at any time -- not only when a PR
+# happens to be open. This workflow runs the identical govulncheck
+# invocation ci.yml's vulncheck job and `make vulncheck` use (see
+# Makefile), on a schedule, so detection does not depend on PR cadence.
+# Dependabot PR frequency is explicitly not treated as a detection
+# mechanism -- see docs/supply-chain-security.md.
+on:
+  schedule:
+    - cron: "23 4 * * 1" # weekly, Monday 04:23 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: make vulncheck

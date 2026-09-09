@@ -650,9 +650,28 @@ corpus in [scenario-corpus.md](scenario-corpus.md) is.
   interleaving under test, rather than relying on repeated runs to
   "usually" hit the race.
 
+## Supply-Chain / CI Quality Gates (Phase 10)
+
+The categories above all concern proving TaskForge's runtime correctness.
+Phase 10 (docs/enterprise-roadmap.md) adds a second, orthogonal set of
+CI-enforced gates that say nothing about job-execution correctness but do
+run, and fail on a finding, on every push and pull request: `gofmt`, `go
+vet`, `go build`, `go test`, `go test -race`, and `go mod verify` (all
+pre-existing, in `.github/workflows/ci.yml`),
+plus `govulncheck` (dependency/stdlib vulnerability scanning, new in Phase
+10, both PR-triggered and scheduled weekly) and CodeQL static analysis for
+Go (also new). None of these substitute for the invariant/scenario-driven
+tests above — a passing `govulncheck` run means no reachable known Go
+vulnerability was reported for the scanned packages, at the scanned
+build/toolchain configuration, against the vulnerability database as of
+scan time, not that TaskForge's dependencies are exhaustively free of
+CVEs, and says nothing about whether TaskForge's own state machine is
+correct. Full detail: [supply-chain-security.md](supply-chain-security.md).
+
 ## Cross-References
 
 - Invariants: [invariants.md](invariants.md)
 - Scenarios: [scenario-corpus.md](scenario-corpus.md)
 - Roadmap placement of test categories: [roadmap.md](roadmap.md) (each
   phase names its required tests)
+- Supply-chain/release CI gates: [supply-chain-security.md](supply-chain-security.md)

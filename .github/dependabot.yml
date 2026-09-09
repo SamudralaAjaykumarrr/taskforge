@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  # Go modules: go.mod/go.sum direct and indirect dependency updates,
+  # including security advisories GitHub's own advisory database knows
+  # about. This is a *complement* to govulncheck (ci.yml, scheduled-security.yml),
+  # not a substitute -- Dependabot's own PR cadence is not treated as a
+  # detection mechanism in docs/enterprise-roadmap.md's Phase 10 (see
+  # "Failure scenarios to guard against" there): govulncheck is what
+  # deterministically gates, Dependabot is what deterministically proposes
+  # the fix once a gate trips (or on its own schedule, independent of
+  # whether anything tripped).
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(go)"
+
+  # GitHub Actions: keeps every workflow's pinned SHA (see
+  # docs/supply-chain-security.md "Action pinning") current. Dependabot
+  # understands SHA-pinned `uses:` references and opens a PR that updates
+  # both the SHA and its version comment together when a new upstream
+  # release ships.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(actions)"

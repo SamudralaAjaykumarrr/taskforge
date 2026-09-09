@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/buildinfo"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/handler"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
@@ -64,6 +66,13 @@ func (h flakyHandler) Execute(_ context.Context, j *job.Job) (handler.Result, er
 }
 
 func main() {
+	versionFlag := flag.Bool("version", false, "print version information and exit")
+	flag.Parse()
+	if *versionFlag {
+		fmt.Println("taskforge-worker " + buildinfo.String())
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	if err := run(logger); err != nil {
@@ -131,7 +140,7 @@ func run(logger *slog.Logger) error {
 		}()
 	}
 
-	logger.Info("worker starting", "worker_id", workerID, "poll_interval", cfg.WorkerPollInterval)
+	logger.Info("worker starting", "worker_id", workerID, "poll_interval", cfg.WorkerPollInterval, "version", buildinfo.Version, "commit", buildinfo.Commit)
 	err = w.Run(ctx)
 	if err != nil && ctx.Err() != nil {
 		logger.Info("worker stopped")

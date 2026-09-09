@@ -2,6 +2,17 @@ module github.com/SamudralaAjaykumarrr/taskforge
 
 go 1.25.0
 
+// Phase 10 (docs/enterprise-roadmap.md, docs/supply-chain-security.md):
+// pinned by `make vulncheck`/govulncheck surfacing stdlib CVEs (e.g.
+// GO-2026-5026, GO-2026-5972) fixed in go1.26.6; go1.26.8 is the latest
+// available patch at pin time. This does not raise the module's minimum
+// language version (still go 1.25.0 above) -- `go` and `GOTOOLCHAIN=auto`
+// (the default) fetch this exact patch toolchain automatically for any
+// local build/test/vulncheck and for CI, even on a machine whose installed
+// `go` binary is older. Re-pin here whenever govulncheck reports a new
+// stdlib CVE with no corresponding bump yet.
+toolchain go1.26.8
+
 require (
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/google/uuid v1.6.0

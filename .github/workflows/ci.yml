@@ -5,6 +5,14 @@ on:
     branches: [main, "phase-*"]
   pull_request:
 
+# Phase 10 (docs/enterprise-roadmap.md, docs/supply-chain-security.md):
+# workflow-level default is least-privilege. Neither job below needs to
+# write anything -- both only read the checked-out source and talk to the
+# ephemeral Postgres service container -- so contents: read is sufficient
+# for the whole workflow and no job overrides it upward.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,11 +36,13 @@ jobs:
       TASKFORGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/taskforge_test?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: "1.25"
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
           cache: true
 
       - name: gofmt check
@@ -62,3 +72,32 @@ jobs:
 
       - name: go test -race
         run: go test -race -p 1 ./...
+
+      - name: go mod verify
+        run: go mod verify
+
+  # Phase 10: golang.org/x/vuln's govulncheck, invoked the exact same
+  # Go-native way as `make vulncheck` (see Makefile) and
+  # scheduled-security.yml, so all three surfaces can never drift. A
+  # nonzero exit (govulncheck exits 3 on a finding) fails this job -- never
+  # swallowed. Whether a failing job actually blocks a PR from merging
+  # depends on branch protection marking it a required status check, a
+  # repository setting not configured from this implementation environment
+  # (see docs/supply-chain-security.md §2/§9's Limitations). Runs on every
+  # PR and push; scheduled-security.yml additionally runs this weekly so a
+  # CVE disclosed in an already-merged dependency is still caught between
+  # PRs.
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: make vulncheck
