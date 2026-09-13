@@ -124,6 +124,54 @@ handler cooperates" is wrong and should be corrected on sight — see
 - Invariants: TF-INV-008, TF-INV-016 in [invariants.md](invariants.md)
 - Schema: `UNIQUE (job_type, idempotency_key)` in [data-model.md](data-model.md)
 
+## Idempotency Inside a Caller-Owned Transaction (Phase 11)
+
+Status: implemented — docs/enterprise-roadmap.md Phase 11. The `txenqueue`
+package's `EnqueueTx` (docs/transactional-enqueue.md) preserves every
+guarantee in this document unchanged, including inside a caller-owned
+`pgx.Tx`: `UNIQUE(job_type, idempotency_key)` remains the sole,
+database-enforced source of truth (TF-INV-008/TF-INV-016) — there is no
+second, weaker, application-level idempotency check for the transactional
+path.
+
+The one implementation subtlety worth naming: PostgreSQL aborts an entire
+transaction after any statement inside it fails (including a unique-
+constraint violation), so the plain-pool implementation's "attempt INSERT,
+catch the unique-violation, re-read the existing row" pattern cannot run
+unmodified inside a caller's already-open transaction — the re-read would
+itself fail against an aborted transaction. `internal/store.InsertTx`
+resolves this with a PostgreSQL `SAVEPOINT` (via `pgx.Tx.Begin`'s
+pseudo-nested-transaction support): the INSERT attempt runs inside the
+savepoint, and a conflict is recovered with `ROLLBACK TO SAVEPOINT` (not a
+rollback of the caller's own transaction), after which the fallback re-read
+runs normally, still inside the caller's transaction. See
+`internal/store/tx.go`'s doc comment for the full mechanism.
+
+A second subtlety, specific to the transactional entry point and not
+present in the plain-pool path (audit correction, Phase 11): the fallback
+re-read above runs inside the *caller's own* transaction, so it is subject
+to that transaction's isolation level. Under READ COMMITTED (PostgreSQL's
+default), each statement gets a fresh snapshot, so the re-read always sees
+the already-committed winning row. Under REPEATABLE READ or SERIALIZABLE,
+a transaction's snapshot is fixed at (or before) its first statement — so
+if the winning row committed *after* that point, the losing transaction's
+own snapshot cannot see it, even though PostgreSQL's unique-index
+enforcement (not governed by snapshot visibility) already detected the
+conflict. `EnqueueTx` never mistakes this for "no such job": it returns
+`txenqueue.ErrMustRetryTransaction`, and the caller must roll back and
+retry its whole transaction. See docs/transactional-enqueue.md "Isolation
+level and idempotency conflicts" for the full mechanism and proof.
+
+Proven by `txenqueue/txenqueue_test.go` and `txenqueue/errors_test.go`
+against real PostgreSQL: first insert, a duplicate submission of the same
+key inside the same transaction, a duplicate submission racing across
+concurrent transactions (every successful transaction commits; exactly one
+of them is the transaction whose own `INSERT` created the row), reuse of a
+key after the transaction that first used it rolled back (a genuine first
+insert, not a duplicate hit), a READ COMMITTED cross-transaction conflict
+resolving cleanly, and the REPEATABLE READ/SERIALIZABLE
+snapshot-visibility case above correctly classified as a required retry.
+
 ## Open Questions
 
 - Should TaskForge validate that a retried submission's payload matches the

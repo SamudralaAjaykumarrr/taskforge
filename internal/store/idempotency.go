@@ -92,31 +92,8 @@ func isIdempotencyKeyViolation(err error) bool {
 // docs/idempotency.md, a duplicate submission gets "the same success
 // status code the original submission would have produced."
 func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job, bool, error) {
-	id := uuid.New()
-	var idemKey sql.NullString
-	if p.IdempotencyKey != nil {
-		idemKey = sql.NullString{String: *p.IdempotencyKey, Valid: true}
-	}
-	var scheduledAt sql.NullTime
-	if p.ScheduledAt != nil {
-		scheduledAt = sql.NullTime{Time: *p.ScheduledAt, Valid: true}
-	}
-
-	// eligible_at is COALESCE'd to now() (both evaluated by PostgreSQL's
-	// own clock, per docs/failure-model.md's Clock Model) rather than left
-	// at the schema's now()-default column, so a caller-supplied
-	// scheduled_at is what actually gates claim eligibility -- per
-	// docs/scheduling.md: "scheduled_at ... Set to now() (or scheduled_at)
-	// at submission time." scheduled_at itself is stored unmodified
-	// (NULL when not supplied) as the immutable audit record of the
-	// caller's original request, per that same document's field
-	// separation from the live, retry-advanced eligible_at.
-	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key, scheduled_at, eligible_at)
-		VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, $7, COALESCE($7, now()))
-		RETURNING `+jobColumns,
-		id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey, scheduledAt,
-	)
+	_, args := insertJobArgs(p)
+	row := s.db.QueryRowContext(ctx, insertJobQuery, args...)
 	j, err := scanJob(row)
 	if err == nil {
 		s.metrics.JobsSubmittedTotal.WithLabelValues(p.JobType).Inc()
@@ -133,6 +110,39 @@ func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job
 	s.metrics.JobsSubmittedTotal.WithLabelValues(p.JobType).Inc()
 	s.metrics.IdempotentSubmissionHitsTotal.Inc()
 	return existing, false, nil
+}
+
+// insertJobQuery is the INSERT shared by the pool-based InsertIdempotent
+// above and the pgx.Tx-based InsertTx (tx.go, Phase 11) -- both paths must
+// create a durable jobs row with identical shape, so there is exactly one
+// copy of this statement.
+const insertJobQuery = `
+	INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key, scheduled_at, eligible_at)
+	VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, $7, COALESCE($7, now()))
+	RETURNING ` + jobColumns
+
+// insertJobArgs generates a fresh job id and builds insertJobQuery's
+// positional arguments from p, shared by InsertIdempotent and InsertTx.
+//
+// eligible_at is COALESCE'd to now() (both evaluated by PostgreSQL's own
+// clock, per docs/failure-model.md's Clock Model) rather than left at the
+// schema's now()-default column, so a caller-supplied scheduled_at is what
+// actually gates claim eligibility -- per docs/scheduling.md: "scheduled_at
+// ... Set to now() (or scheduled_at) at submission time." scheduled_at
+// itself is stored unmodified (NULL when not supplied) as the immutable
+// audit record of the caller's original request, per that same document's
+// field separation from the live, retry-advanced eligible_at.
+func insertJobArgs(p job.NewParams) (uuid.UUID, []any) {
+	id := uuid.New()
+	var idemKey sql.NullString
+	if p.IdempotencyKey != nil {
+		idemKey = sql.NullString{String: *p.IdempotencyKey, Valid: true}
+	}
+	var scheduledAt sql.NullTime
+	if p.ScheduledAt != nil {
+		scheduledAt = sql.NullTime{Time: *p.ScheduledAt, Valid: true}
+	}
+	return id, []any{id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey, scheduledAt}
 }
 
 // GetByIdempotencyKey returns the job durably mapped to (jobType, key), or

@@ -572,6 +572,110 @@ responsible for proving, and README.md's "Phase 1 guarantees" / "Phase 2
 guarantees" sections for which of this matrix's scenarios have a passing
 test today.
 
+As of Phase 11 ("Transactional Enqueue & API Contract Hardening",
+[docs/enterprise-roadmap.md](enterprise-roadmap.md)), the following
+additional categories now have real, passing, executable tests, in
+`txenqueue/txenqueue_test.go` and `internal/api/handlers_phase11_test.go`
+unless noted:
+
+- **Transactional-enqueue atomicity tests** (new scenarios SF-031 through
+  SF-035, see [scenario-corpus.md](scenario-corpus.md)): commit makes both
+  a caller's own business row and the job durable, and the job is
+  claimable through the ordinary `internal/store.Claim` query (not a
+  parallel path); rollback (both "business write then enqueue" and
+  "enqueue then later business write" orderings) leaves neither durable;
+  an enqueue attempted against a transaction pgx has already closed fails
+  loudly with no orphan row; a validation failure touches the transaction
+  not at all, leaving it fully usable for the caller's own subsequent
+  work.
+- **Transactional-idempotency tests**: a duplicate `Idempotency-Key`
+  submission inside the *same* transaction returns the first call's job
+  (`created=false`) and commits to exactly one row; the same key reused by
+  a *later, separate* transaction after the first one rolled back is a
+  genuine first insert (`created=true`); and — the concurrency proof this
+  phase's roadmap entry specifically calls for, extending Phase 4's
+  `TestInsertIdempotent_ConcurrentDuplicateSubmissions_SF005` pattern to
+  real, separately-committing pgx transactions —
+  `TestEnqueueTx_IdempotencyKey_ConcurrentTransactions_ExactlyOneCreates`
+  (renamed from `...ExactlyOneCommits`, an audit finding: every successful
+  caller's own transaction commits; exactly one caller's own `INSERT` is
+  what *created* the durable row, the rest resolve to it) proves this
+  under real concurrency.
+- **Concurrent commit/rollback race test**:
+  `TestEnqueueTx_ConcurrentCommitRollbackRace_OnlyCommittedJobsExist` runs
+  20 real, concurrent transactions, each independently choosing to commit
+  or roll back its own transactionally-enqueued job, and proves exactly
+  the committed half are ever durable/claimable.
+- **Isolation-level idempotency-conflict tests** (`txenqueue/errors_test.go`,
+  Phase 11 audit-fix addition): under READ COMMITTED, a cross-transaction
+  idempotency-key conflict always resolves cleanly to the existing row
+  (`TestEnqueueTx_ReadCommitted_DuplicateAcrossSeparateTransactions_ResolvesToExistingRow`).
+  Under REPEATABLE READ and SERIALIZABLE, a deterministic fixture
+  (fix the second transaction's snapshot via an initial statement, commit
+  the conflicting key in a separate transaction afterward, then attempt
+  `EnqueueTx`) proves PostgreSQL's own unique-index enforcement still
+  detects the conflict, but the second transaction's fallback re-read
+  cannot see the winning row within its own already-fixed snapshot — and
+  that this is correctly classified as `txenqueue.ErrMustRetryTransaction`
+  (never `store.ErrNotFound`'s "job doesn't exist" meaning, never a false
+  success) via `TestEnqueueTx_RepeatableRead_IdempotencyConflictOutsideSnapshot_MapsToMustRetry`
+  and `TestEnqueueTx_Serializable_IdempotencyConflictOutsideSnapshot_MapsToMustRetry`.
+- **Public error-contract tests** (`txenqueue/errors_test.go`, Phase 11
+  audit-fix addition): every `EnqueueTx` error is proven classifiable via
+  `errors.Is` against exactly one of `ErrInvalidRequest`,
+  `ErrInvalidTransaction`, `ErrMustRetryTransaction`, `ErrEnqueueFailed`,
+  and proven to never contain raw internal/store/PostgreSQL detail (SQL,
+  SQLSTATE, constraint names, a `"store:"` prefix) in its `Error()` text —
+  including a deliberately induced unexpected insert failure
+  (`TestEnqueueTx_UnexpectedInsertFailure_ClassifiesAsErrEnqueueFailed_NoLeak`).
+  A companion HTTP-boundary test,
+  `internal/api/handlers_phase11_test.go`'s
+  `TestCreateJob_StoreFailure_Returns500WithoutLeakingInternalDetails`,
+  proves the same no-leak property at `POST /jobs` using a poisoned
+  `api.JobStore` fake.
+- **Nil-transaction regression test**:
+  `TestEnqueueTx_NilTransaction_NoPanicReturnsInvalidTransactionError`
+  proves an ordinary nil `pgx.Tx` interface value passed to `EnqueueTx`
+  (a real caller mistake — forgetting to check `pool.Begin`'s own error
+  first) returns `txenqueue.ErrInvalidTransaction` and never panics.
+- **`max_attempts` storage-representability boundary tests**
+  (`internal/job/validate_test.go`,
+  `internal/api/handlers_phase11_test.go`, Phase 11 audit-fix addition):
+  the largest value PostgreSQL's `jobs.max_attempts` `INTEGER` column can
+  hold (`job.MaxRepresentableMaxAttempts` == `math.MaxInt32`) is accepted
+  and durably round-trips through `POST /jobs`/`GET /jobs/{id}`
+  (`TestCreateJob_MaxAttempts_LargestRepresentableValue_Accepted`); the
+  next value up, still a valid Go `int`, is rejected with an ordinary 400
+  before any INSERT is attempted, never an internal 500
+  (`TestCreateJob_MaxAttempts_FirstUnrepresentableValue_Rejected400NotDBError`).
+- **API-contract hardening tests**: all six canonical routes (`POST /jobs`,
+  `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `POST /workflows`,
+  `GET /workflows/{id}`, `POST /workflows/{id}/cancel`) are proven served
+  identically under the `/v1/` version prefix and the legacy unprefixed
+  path (`TestRouter_V1PrefixServesSameHandlersAsLegacy`, corrected — an
+  earlier version of this test exercised only two of the six routes
+  despite its doc comment's "every endpoint" claim), while the legacy
+  surface (kept fully functional, not removed) is proven to carry an RFC
+  9745 `Deprecation: @1788998400` response header (not the earlier,
+  non-conformant `Deprecation: true`) the `/v1/` surface does not, with no
+  change to the legacy route's own behavior
+  (`TestRouter_LegacyDeprecationHeader_DoesNotChangeLegacyBehavior`);
+  `POST /jobs`/`POST /workflows` reject a body over `api.MaxRequestBodyBytes`
+  with `413`; and an unknown JSON field is proven tolerated in both
+  directions (an old-shape request and a new-shape request both succeed
+  unchanged) — closing docs/compatibility-policy.md's "has this ever been
+  tested" gap, and correcting an audit finding along the way (both
+  decoders previously called `DisallowUnknownFields`, the opposite of the
+  assumed-safe behavior).
+
+All Phase 11 integration tests (including this section's audit-fix
+additions) were run repeatedly
+(`go test -p 1 -count=5 ./txenqueue/... ./internal/api/... ./internal/store/...`)
+and under `-race` (`go test -race -p 1 ./txenqueue/... ./internal/api/... ./internal/store/...`)
+with zero failures and zero detected data races. The full pre-existing
+Phase 1-10 regression suite remains green, including under `-race`, with
+no existing test's assertions weakened.
+
 ## Test Categories
 
 | Category | Purpose | Example |
@@ -600,22 +704,22 @@ scenario from [scenario-corpus.md](scenario-corpus.md).
 
 | Invariant | Test category | Scenario(s) |
 |---|---|---|
-| TF-INV-001 | Process restart tests | SF-018 |
+| TF-INV-001 | Process restart tests; transactional-enqueue tests | SF-018, SF-031, SF-033, SF-035 |
 | TF-INV-002 | Concurrency tests | SF-006 |
 | TF-INV-003 | Stale-worker fencing tests | SF-008 |
 | TF-INV-004 | Worker crash tests, lease-expiration tests | SF-002, SF-003, SF-007 |
 | TF-INV-005 | State-machine table tests; durable-state invariant checks (`internal/invariant`, incl. historical reopen detection and marker self-validation) | SF-015 |
 | TF-INV-006 | Property tests | SF-010 |
 | TF-INV-007 | Integration tests (append-only assertions) | SF-009, SF-010 |
-| TF-INV-008 | Idempotency tests (concurrency) | SF-005 |
+| TF-INV-008 | Idempotency tests (concurrency); transactional-idempotency tests | SF-005, SF-034 |
 | TF-INV-009 | Integration tests | SF-010 |
 | TF-INV-010 | Race tests | SF-012 |
 | TF-INV-011 | Integration tests (clock-controlled) | SF-013 |
 | TF-INV-012 | DAG scenario tests | SF-019 through SF-030 |
-| TF-INV-013 | Fault-injection tests | SF-014 |
+| TF-INV-013 | Fault-injection tests; transactional-enqueue tests | SF-014, SF-031, SF-032, SF-033, SF-035 |
 | TF-INV-014 | Stale-worker fencing tests (multi-generation) | SF-008 |
 | TF-INV-015 | Fencing tests (heartbeat-specific) | SF-016, SF-017 |
-| TF-INV-016 | Schema tests + idempotency tests | SF-005 |
+| TF-INV-016 | Schema tests + idempotency tests; transactional-idempotency tests | SF-005, SF-034 |
 
 Every row in this table must remain populated as the project moves into
 implementation; a code change that would leave any invariant without a

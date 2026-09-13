@@ -138,6 +138,24 @@ func freePort() (uint32, error) {
 	return uint32(l.Addr().(*net.TCPAddr).Port), nil
 }
 
+// resolveDSN returns the DSN to use for this test binary's PostgreSQL
+// instance: TASKFORGE_TEST_DATABASE_URL if set, otherwise a lazily-started
+// embedded-postgres instance shared by the whole binary (see
+// startEmbedded). Shared by DB and DSN below.
+func resolveDSN(t *testing.T) string {
+	t.Helper()
+
+	dsn := os.Getenv(envDatabaseURL)
+	if dsn != "" {
+		return dsn
+	}
+	dsn, err := startEmbedded()
+	if err != nil {
+		t.Fatalf("testutil: could not obtain a test database: %v", err)
+	}
+	return dsn
+}
+
 // DB returns an open, migrated *sql.DB for integration tests, with the
 // jobs table truncated so the test starts from an empty, deterministic
 // state (docs/testing-strategy.md: "Tests must be deterministic and
@@ -145,14 +163,7 @@ func freePort() (uint32, error) {
 func DB(t *testing.T) *sql.DB {
 	t.Helper()
 
-	dsn := os.Getenv(envDatabaseURL)
-	if dsn == "" {
-		var err error
-		dsn, err = startEmbedded()
-		if err != nil {
-			t.Fatalf("testutil: could not obtain a test database: %v", err)
-		}
-	}
+	dsn := resolveDSN(t)
 
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -179,4 +190,19 @@ func DB(t *testing.T) *sql.DB {
 	}
 
 	return db
+}
+
+// DSN returns a DSN pointing at the same fresh, migrated, empty-tables
+// PostgreSQL instance DB provides -- but as a connection string rather
+// than an open *sql.DB, for tests that need to open their own native pgx
+// connection or pool (e.g. to obtain a real pgx.Tx -- see the txenqueue
+// package's integration tests) instead of going through database/sql.
+// Migration and truncation are performed via a throwaway *sql.DB that is
+// closed before this function returns; the caller owns the lifecycle of
+// whatever it opens against the returned DSN.
+func DSN(t *testing.T) string {
+	t.Helper()
+	dsn := resolveDSN(t)
+	DB(t) // migrates and truncates; t.Cleanup already closes the *sql.DB this opens
+	return dsn
 }

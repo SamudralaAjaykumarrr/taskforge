@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
@@ -82,57 +83,37 @@ func toWorkflowResponse(wf *workflow.Instance) workflowResponse {
 }
 
 // validateWorkflowNodeRequest applies exactly the same per-node field
-// rules internal/api.validateCreateJobRequest applies to a standalone
-// POST /jobs submission (job_type presence/length, payload JSON
-// validity, max_attempts/execution_timeout_seconds bounds and defaults)
-// -- these are ordinary job-field concerns, not DAG structure, so they
-// live here rather than in internal/workflow.ValidateGraph (which is
+// rules a standalone POST /jobs submission gets (job_type presence/length,
+// payload JSON validity, max_attempts/execution_timeout_seconds bounds and
+// defaults) -- these are ordinary job-field concerns, not DAG structure, so
+// they live here rather than in internal/workflow.ValidateGraph (which is
 // reserved for graph-shape validation: node_key uniqueness,
 // self-dependency, unknown dependency, cycles). node_key and depends_on
 // are passed through as-is for internal/workflow.ValidateGraph to check.
+//
+// As of Phase 11 (docs/enterprise-roadmap.md), the job-field rules
+// themselves are delegated to internal/job.ValidateSubmission -- the same
+// function validateCreateJobRequest (handlers.go) and the direct-Go
+// transactional enqueue API (txenqueue) use -- only the node_key presence
+// check and the "node %q: ..." error-message prefix are specific to this
+// call site.
 func validateWorkflowNodeRequest(req createWorkflowNodeRequest) (workflow.NodeSpec, string) {
 	nodeKey := strings.TrimSpace(req.NodeKey)
 	if nodeKey == "" {
 		return workflow.NodeSpec{}, "node_key is required"
 	}
 
-	jobType := strings.TrimSpace(req.JobType)
-	if jobType == "" {
-		return workflow.NodeSpec{}, fmt.Sprintf("node %q: job_type is required", nodeKey)
-	}
-	if len(jobType) > 255 {
-		return workflow.NodeSpec{}, fmt.Sprintf("node %q: job_type must be at most 255 characters", nodeKey)
-	}
-
-	payload := req.Payload
-	if len(payload) == 0 {
-		payload = json.RawMessage(`{}`)
-	} else if !json.Valid(payload) {
-		return workflow.NodeSpec{}, fmt.Sprintf("node %q: payload must be valid JSON", nodeKey)
-	}
-
-	maxAttempts := DefaultMaxAttempts
-	if req.MaxAttempts != nil {
-		if *req.MaxAttempts < 1 {
-			return workflow.NodeSpec{}, fmt.Sprintf("node %q: max_attempts must be at least 1", nodeKey)
-		}
-		maxAttempts = *req.MaxAttempts
-	}
-
-	executionTimeout := DefaultExecutionTimeoutSeconds
-	if req.ExecutionTimeoutSeconds != nil {
-		if *req.ExecutionTimeoutSeconds < 1 {
-			return workflow.NodeSpec{}, fmt.Sprintf("node %q: execution_timeout_seconds must be at least 1", nodeKey)
-		}
-		executionTimeout = *req.ExecutionTimeoutSeconds
+	params, err := job.ValidateSubmission(req.JobType, req.Payload, req.MaxAttempts, req.ExecutionTimeoutSeconds, nil)
+	if err != nil {
+		return workflow.NodeSpec{}, fmt.Sprintf("node %q: %s", nodeKey, err.Error())
 	}
 
 	return workflow.NodeSpec{
 		NodeKey:                 nodeKey,
-		JobType:                 jobType,
-		Payload:                 payload,
-		MaxAttempts:             maxAttempts,
-		ExecutionTimeoutSeconds: executionTimeout,
+		JobType:                 params.JobType,
+		Payload:                 params.Payload,
+		MaxAttempts:             params.MaxAttempts,
+		ExecutionTimeoutSeconds: params.ExecutionTimeoutSeconds,
 		ScheduledAt:             req.ScheduledAt,
 		DependsOn:               req.DependsOn,
 	}, ""
@@ -150,10 +131,15 @@ func validateWorkflowNodeRequest(req createWorkflowNodeRequest) (workflow.NodeSp
 // guarantee, extended to workflow creation) -- an invalid submission
 // never touches the database and is never acknowledged as created.
 func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
+
 	var req createWorkflowRequest
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body must be at most %d bytes", MaxRequestBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}

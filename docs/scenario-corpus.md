@@ -782,6 +782,119 @@ honest account.
   TF-INV-013 (analogously — no half-created workflow, proved directly by
   a fault-injection test forcing a mid-transaction failure).
 
+### SF-031 — Transactional enqueue commits with caller's business write
+
+- **Initial state**: No business row, no job.
+- **Actions**: Within one caller-owned `pgx.Tx`: insert a business row,
+  call `txenqueue.EnqueueTx`, commit.
+- **Fault**: None.
+- **Expected durable state**: Both the business row and the job exist
+  after commit; the job is `QUEUED` and claimable via the ordinary
+  `internal/store.Claim` query — the same claim path any other job uses.
+- **Invariants proved**: TF-INV-001 (accepted jobs cannot disappear,
+  extended to the transactional entry point), TF-INV-013 (no
+  half-transitioned/half-created state).
+- **Test**: `txenqueue/txenqueue_test.go`'s
+  `TestEnqueueTx_Commit_BusinessDataAndJobBothDurable_ClaimableThroughNormalEngine`.
+
+### SF-032 — Transactional enqueue rolls back with caller's business write
+
+- **Initial state**: No business row, no job.
+- **Actions**: Within one caller-owned `pgx.Tx`: insert a business row,
+  call `txenqueue.EnqueueTx`, roll back. A companion ordering (enqueue
+  first, business write second, roll back) is also exercised.
+- **Fault**: The caller's own decision to roll back (standing in for any
+  later business-logic failure).
+- **Expected durable state**: Neither the business row nor the job exists
+  after rollback, regardless of statement order.
+- **Invariants proved**: TF-INV-013 (rollback never leaves a
+  half-transitioned/half-created job), extended to the transactional entry
+  point — no orphan job from a successful-but-later-rolled-back enqueue.
+- **Test**: `TestEnqueueTx_Rollback_NoBusinessDataNoJob`,
+  `TestEnqueueTx_SuccessfulEnqueueThenLaterCallerRollback_NoOrphanJob`.
+
+### SF-033 — Transactional enqueue itself fails inside the caller's transaction
+
+- **Initial state**: No job.
+- **Actions**: Call `txenqueue.EnqueueTx` against a `pgx.Tx` pgx has
+  already closed (standing in for any failure that ends the transaction
+  before the enqueue statement can run).
+- **Fault**: The already-closed transaction.
+- **Expected durable state**: `EnqueueTx` returns an error (never a false
+  success); no job row exists for the attempted `job_type`; transaction
+  ownership remains entirely with the caller.
+- **Invariants proved**: TF-INV-001 (no success is ever reported for a
+  write that did not durably happen), TF-INV-013.
+- **Test**: `TestEnqueueTx_FailsOnClosedTransaction_NoFalseSuccessNoOrphanJob`.
+
+### SF-034 — Transactional-idempotency inside and across transactions
+
+- **Initial state**: No job for the idempotency key under test.
+- **Actions**: (a) two `EnqueueTx` calls with the same
+  `(job_type, idempotency_key)` inside one transaction; (b) the same key
+  reused by a second, separate transaction after the first rolled back;
+  (c) N separate transactions concurrently calling `EnqueueTx` with the
+  same key, each racing to commit.
+- **Fault**: Concurrent transactions racing on the same database unique
+  constraint (case c).
+- **Expected durable state**: (a) exactly one job row, the second call's
+  `created=false`; (b) a genuine new row after reuse post-rollback,
+  `created=true`; (c) exactly one job row across all N transactions,
+  exactly one `created=true`, every transaction observing the same
+  `job_id`.
+- **Invariants proved**: TF-INV-008 (an idempotency key never creates two
+  logical jobs, extended to the transactional entry point and to
+  concurrent transactions rather than only concurrent pool callers),
+  TF-INV-016 (enforced by the database constraint, not application logic,
+  proved here via the SAVEPOINT-based conflict recovery in
+  `internal/store.InsertTx`).
+- **Test**: `TestEnqueueTx_IdempotencyKey_DuplicateWithinSameTransaction`,
+  `TestEnqueueTx_IdempotencyKey_RollbackThenReuseSameKey_Succeeds`,
+  `TestEnqueueTx_IdempotencyKey_ConcurrentTransactions_ExactlyOneCreates`
+  (renamed from `...ExactlyOneCommits` — every successful transaction
+  commits; exactly one's own `INSERT` creates the row).
+
+### SF-035 — Many concurrent transactions independently commit or roll back
+
+- **Initial state**: No jobs for the `job_type` under test.
+- **Actions**: 20 concurrent goroutines, each opening its own transaction,
+  calling `EnqueueTx`, and independently choosing to commit (half) or roll
+  back (half).
+- **Fault**: True concurrency across separate connections/transactions.
+- **Expected durable state**: Exactly the committed half's jobs exist and
+  are independently queryable by ID; every rolled-back half's job does
+  not exist. No cross-transaction leakage or corruption.
+- **Invariants proved**: TF-INV-001, TF-INV-013, under concurrency rather
+  than only sequentially.
+- **Test**: `TestEnqueueTx_ConcurrentCommitRollbackRace_OnlyCommittedJobsExist`.
+
+### SF-036 — Idempotency-key conflict outside a REPEATABLE READ/SERIALIZABLE snapshot (Phase 11 audit-fix addition)
+
+- **Initial state**: No job for the idempotency key under test.
+- **Actions**: Transaction B opens at REPEATABLE READ (respectively
+  SERIALIZABLE) and fixes its snapshot with an initial statement.
+  Transaction A, separately, then inserts and commits a job under the same
+  `(job_type, idempotency_key)`. B then calls `EnqueueTx` with that same
+  key.
+- **Fault**: B's snapshot was fixed strictly before A's commit — B's
+  `INSERT` still loses the uniqueness race (PostgreSQL's unique-index
+  enforcement checks the latest committed data, not a transaction's
+  snapshot), but B's fallback re-read, constrained to B's own snapshot,
+  cannot see A's now-committed row.
+- **Expected durable state**: Exactly one row (A's). `EnqueueTx` returns
+  `txenqueue.ErrMustRetryTransaction` — never `store.ErrNotFound`'s "job
+  doesn't exist" meaning, never a false success — with no raw
+  internal/store/PostgreSQL detail in the error text. B's transaction
+  ownership (rollback/retry) remains entirely with the caller.
+- **Invariants proved**: TF-INV-008/TF-INV-016 (an idempotency key never
+  creates two logical jobs, including when a conflict cannot be resolved
+  within the losing transaction's own snapshot), TF-INV-013 (no
+  half-transitioned/half-created state), and Phase 11's public-API
+  error-leakage requirement.
+- **Test**: `TestEnqueueTx_RepeatableRead_IdempotencyConflictOutsideSnapshot_MapsToMustRetry`,
+  `TestEnqueueTx_Serializable_IdempotencyConflictOutsideSnapshot_MapsToMustRetry`
+  (`txenqueue/errors_test.go`).
+
 ## Scenario-to-Invariant Cross-Check
 
 See [testing-strategy.md](testing-strategy.md) for the invariant-to-test

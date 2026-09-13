@@ -240,6 +240,17 @@ None. This phase can start immediately.
 
 ## Phase 11 — Transactional Enqueue & API Contract Hardening
 
+**Implementation status: COMPLETE.** Unlike the rest of this roadmap
+(Phases 12–18, still PROPOSED per this document's own header), Phase 11's
+code is implemented and its proof obligations are demonstrated by real,
+passing tests against a real PostgreSQL instance — see
+docs/transactional-enqueue.md for the full design and exactly what is (and
+is not) guaranteed, and this phase's own final report for the exact
+commands/output. The rest of this section is retained as originally
+written, as the authoritative scope statement this phase was implemented
+against; its exit-criteria checkboxes below are updated to reflect what
+has actually been proven.
+
 ### Why it matters
 Two compounding problems, both confirmed by direct code inspection: (1)
 there is no way for a caller to enqueue a job atomically with their own
@@ -257,8 +268,9 @@ HTTP/service architecture — see "What this phase is and is not" below.
 This phase deliberately distinguishes two integration scenarios that were
 previously conflated:
 
-- **(A) Caller's business data lives in the same PostgreSQL instance as
-  TaskForge.** This phase adds a **deliberate, public Go integration
+- **(A) Caller's business data lives in the same PostgreSQL database as
+  TaskForge, written using the same caller-owned transaction.** This
+  phase adds a **deliberate, public Go integration
   surface** — a new, exported package (not `internal/store`, which cannot be
   a public API for unrelated applications — `internal/` is Go-enforced
   unimportable outside this module) that accepts a caller-owned `pgx.Tx`
@@ -276,11 +288,12 @@ previously conflated:
   this case is the **transactional outbox**: the caller writes their
   business row and an "outbox" row in their own database transaction, and a
   separate relay process (the caller's own, not TaskForge's) reads the
-  outbox and calls TaskForge's ordinary HTTP `POST /jobs` (idempotently, via
-  the existing `Idempotency-Key` mechanism) to enqueue the job. This
-  document does not claim atomicity for case (B); it documents outbox as
-  the correct pattern and explains why cross-database atomicity is not
-  achievable here.
+  outbox and calls TaskForge's canonical HTTP `POST /v1/jobs` (idempotently,
+  via the existing `Idempotency-Key` mechanism) to enqueue the job -- new
+  integration guidance targets the canonical `/v1/` surface, not the
+  deprecated legacy `POST /jobs` alias. This document does not claim
+  atomicity for case (B); it documents outbox as the correct pattern and
+  explains why cross-database atomicity is not achievable here.
 
 ### Exact scope
 - Add a new, exported Go package providing a `Store`-shaped API that accepts
@@ -356,17 +369,57 @@ None beyond Phase 10 running in parallel (no hard dependency).
   both succeed unchanged.
 
 ### Enterprise exit criteria
-- [ ] A caller on the same PostgreSQL instance can enqueue a job inside
-      their own transaction via a documented, exported (non-`internal/`) Go
-      API, and a rollback leaves no claimable job.
-- [ ] The transactional-outbox pattern is documented as the recommended
+- [x] A caller on the same PostgreSQL database, using the same
+      caller-owned transaction, can enqueue a job inside that transaction
+      via a documented, exported (non-`internal/`) Go API, and a rollback
+      leaves no claimable job. Implemented: the `txenqueue` package
+      (`txenqueue/txenqueue.go`, `EnqueueTx`), built on
+      `internal/store.InsertTx`. Proven live during implementation against
+      real PostgreSQL: `txenqueue/txenqueue_test.go`'s
+      `TestEnqueueTx_Commit_BusinessDataAndJobBothDurable_ClaimableThroughNormalEngine`
+      and `TestEnqueueTx_Rollback_NoBusinessDataNoJob`, plus the
+      concurrent-transaction races
+      (`TestEnqueueTx_ConcurrentCommitRollbackRace_OnlyCommittedJobsExist`,
+      `TestEnqueueTx_IdempotencyKey_ConcurrentTransactions_ExactlyOneCreates`
+      -- renamed from `...ExactlyOneCommits`, a Phase 11 audit finding: every
+      successful caller's transaction commits; exactly one caller's own
+      `INSERT` is what created the durable row). The public error contract
+      (`txenqueue/errors.go`) and REPEATABLE READ/SERIALIZABLE idempotency-
+      conflict classification (`txenqueue/errors_test.go`) are additional
+      Phase 11 audit-fix proofs -- see
+      [docs/transactional-enqueue.md](transactional-enqueue.md) "Error
+      contract" and "Isolation level and idempotency conflicts."
+- [x] The transactional-outbox pattern is documented as the recommended
       integration for a caller whose business data lives in a different
       database, with an explicit statement that cross-database atomicity is
-      not provided.
-- [ ] All endpoints are served under `/v1/`, with the old surface's fate
-      (redirect vs. removed) documented in [compatibility-policy.md](compatibility-policy.md).
-- [ ] `POST /jobs` and `POST /workflows` reject oversized bodies with `413`.
-- [ ] A passing test demonstrates unknown-field tolerance in both directions.
+      not provided. See [docs/transactional-enqueue.md](transactional-enqueue.md)
+      and this section's own "What this phase is and is not" above.
+- [x] All six canonical routes (`POST /jobs`, `GET /jobs/{id}`,
+      `POST /jobs/{id}/cancel`, `POST /workflows`, `GET /workflows/{id}`,
+      `POST /workflows/{id}/cancel`) are served under `/v1/`, with the old
+      surface's fate (kept fully functional, marked deprecated via an RFC
+      9745 `Deprecation: @1788998400` response header and a structured log
+      line, not redirected or removed) documented in
+      [compatibility-policy.md](compatibility-policy.md)'s "API Evolution"
+      section. Implemented: `internal/api.NewRouter`
+      (`registerJobRoutes`/`deprecationWarning`); proven for all six routes,
+      under both the `/v1/` and legacy prefixes, by
+      `internal/api/handlers_phase11_test.go`'s
+      `TestRouter_V1PrefixServesSameHandlersAsLegacy` (audit finding,
+      corrected here: an earlier version of this test exercised only
+      `POST /jobs`/`GET /jobs/{id}` despite its doc comment's "every
+      endpoint" claim) and `TestRouter_LegacyRoutesRemainFunctional_ButMarkedDeprecated`.
+- [x] `POST /jobs` and `POST /workflows` reject oversized bodies with `413`.
+      Implemented via `http.MaxBytesReader` (`api.MaxRequestBodyBytes`, 1
+      MiB), enforced before JSON decoding begins; proven by
+      `TestCreateJob_OversizedBodyRejected413` /
+      `TestCreateWorkflow_OversizedBodyRejected413`.
+- [x] A passing test demonstrates unknown-field tolerance in both
+      directions. Audit finding: both decoders previously called
+      `DisallowUnknownFields`, the opposite of the assumed-safe behavior —
+      corrected, and proven by
+      `TestCreateJob_UnknownFieldsAreIgnored_RoundTrip` and
+      `TestCreateWorkflow_UnknownFieldsAreIgnored`.
 
 ---
 

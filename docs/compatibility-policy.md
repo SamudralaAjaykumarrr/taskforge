@@ -1,12 +1,18 @@
 # Compatibility / Evolution Policy
 
-Status: **review document, PROPOSED.** Every rule in this document is marked
-`PROPOSED` because none of it is implemented, tested, or proven today. This
-document exists to specify the rules TaskForge *should* adopt, not to claim
-they already hold. Treating a proposed guarantee as an existing one would be
+Status: **review document, mostly PROPOSED, partially implemented.**
+This document originally marked every rule `PROPOSED` because none of it
+was implemented, tested, or proven. As of Phase 11
+(docs/enterprise-roadmap.md), the "API Evolution" and "Transactional
+Enqueue" sections below are now implemented and proven — each such rule is
+labeled "Status: implemented" at its section header, with the executable
+test(s) that prove it. Every rule not so labeled remains `PROPOSED`: a
+specification of what TaskForge *should* adopt, not a claim that it already
+holds. Treating a still-PROPOSED guarantee as an existing one would be
 exactly the kind of unsupported claim [vision.md](vision.md) and
-[invariants.md](invariants.md) exist to prevent — do not cite this document
-as evidence of a shipped compatibility guarantee.
+[invariants.md](invariants.md) exist to prevent — cite only the
+sections explicitly marked implemented as evidence of a shipped
+compatibility guarantee.
 
 ## Why This Document Exists Now
 
@@ -25,23 +31,130 @@ once. This document names the rules that will be needed before that first
 real test arrives in production, so the policy is decided deliberately
 rather than under incident pressure.
 
-## PROPOSED: API Evolution
+## API Evolution
 
-- **No API version prefix exists today** (`POST /jobs`, not
-  `POST /v1/jobs`). PROPOSED: introduce a version prefix before any
-  breaking change to a request/response shape, not retroactively once a
-  breaking change is already needed.
-- **Additive changes** (a new optional request field, a new response field)
-  do not require a version bump. TaskForge's JSON handling should be
-  audited to confirm it already ignores unknown request fields and that
-  documented clients are expected to ignore unknown response fields —
-  this has not been explicitly tested.
+Status: **implemented** as of Phase 11 (docs/enterprise-roadmap.md).
+
+- **An API version prefix now exists**: every job/workflow endpoint is
+  served under both `/v1/...` (the current canonical surface) and its
+  original unprefixed path (`internal/api.NewRouter`). The unprefixed
+  surface is not removed or redirected by this phase — it remains fully
+  functional, and carries a `Deprecation: @1788998400` response header
+  (RFC 9745, https://www.rfc-editor.org/rfc/rfc9745 -- Deprecation is an
+  HTTP Structured Field Item whose value MUST be a Date, serialized
+  `@<unix-seconds>`; the bare `Deprecation: true` this codebase originally
+  shipped was not valid RFC 9745 syntax and is corrected here.
+  `1788998400` is the fixed Phase 11 deprecation *effective* date,
+  `2026-09-10T00:00:00Z` -- not a removal/sunset date; see below) plus a
+  structured `deprecated_route_used` log line on every request, per the
+  deprecation policy below. A future, separately-decided release may
+  remove it, no sooner than the deprecation window this document already
+  specifies.
+- **Additive changes** (a new optional request field, a new response
+  field) do not require a version bump. **Proven, not merely assumed**:
+  `POST /jobs`'s and `POST /workflows`'s JSON decoders no longer call
+  `DisallowUnknownFields` (audit finding: they previously did, which
+  contradicted this very rule — closed by Phase 11) — an unrecognized
+  request field is silently ignored, not rejected, in both directions
+  (an old-shape request missing a newer optional field, and a
+  new-shape request carrying a field this server version does not yet
+  recognize). See `internal/api/handlers_phase11_test.go`'s
+  `TestCreateJob_UnknownFieldsAreIgnored_RoundTrip` and
+  `TestCreateWorkflow_UnknownFieldsAreIgnored`. Documented clients are
+  still expected to ignore unknown response fields (unchanged, untested
+  in this direction — this codebase does not ship a client that could
+  regress it).
 - **Breaking changes** (removing/renaming a field, changing a field's
   type or semantics, changing a status code's meaning) require a new
   version prefix and a documented deprecation window for the old one.
+- **Request body size limit, implemented**: `POST /jobs` and
+  `POST /workflows` both reject a request body larger than
+  `api.MaxRequestBodyBytes` (1 MiB) with `413 Request Entity Too Large`,
+  enforced via `http.MaxBytesReader` *before* JSON decoding begins (so an
+  oversized body is rejected while it is still being read, not only after
+  it has been fully buffered) — see
+  `TestCreateJob_OversizedBodyRejected413` /
+  `TestCreateWorkflow_OversizedBodyRejected413`.
+- **`max_attempts` upper bound, decided**: TaskForge deliberately enforces
+  **no arbitrary product/operational** upper bound on caller-supplied
+  `max_attempts` beyond the value PostgreSQL's `jobs.max_attempts` column
+  (`INTEGER`, a 32-bit signed integer) can actually represent (see the
+  storage-representability bound immediately below). This is an explicit
+  policy decision (docs/security-model.md's "Abusive retry workload" P2,
+  docs/retry-semantics.md "Open Questions"), not an oversight: a large
+  `max_attempts` amplifies retry-scheduling churn for that one job and
+  cannot bypass TF-INV-006's ceiling or create additional jobs -- but,
+  corrected (Phase 11 audit finding): this is **not** a claim that a large
+  `max_attempts` is free or isolated. Every retry attempt still consumes
+  shared worker, database, and scheduling/claim-query resources, so a
+  sufficiently large configured retry budget can create real
+  shared-resource pressure that could be felt by other jobs/tenants
+  contending for the same claim query and worker pool. That operational/
+  governance concern is an accepted, explicitly **deferred** risk for
+  Phase 13's workload-governance work (per-queue/tenant concurrency limits
+  and fairness), not something this phase claims is harmless. No arbitrary
+  numeric cap is imposed *for that reason* -- one that could reject a
+  previously-valid caller with a legitimate need for many attempts -- but
+  the risk itself is real and unmitigated until Phase 13.
+- **`max_attempts` storage-representability bound, implemented**:
+  independent of the policy decision above, `internal/job.ValidateSubmission`
+  rejects any caller-supplied `max_attempts` greater than
+  `job.MaxRepresentableMaxAttempts` (`math.MaxInt32`, matching the
+  `jobs.max_attempts` `INTEGER` column's range) with an ordinary
+  400/invalid-request response, at every submission entry point
+  (`POST /jobs`, `POST /workflows`, `txenqueue`) -- before any INSERT is
+  attempted. This closes an API-contract hole (Phase 11 audit finding): Go's
+  `int` is 64-bit on every platform TaskForge ships for, so a caller-supplied
+  value could previously be a valid Go `int` (passing a naive `>= 1` check)
+  while being outside PostgreSQL's `INTEGER` range, which would otherwise
+  have surfaced as an internal 500 once the INSERT itself failed. This is a
+  storage-representability bound, distinct from (and not a replacement for)
+  the no-arbitrary-operational-cap decision above -- see
+  `internal/job/validate_test.go` and
+  `internal/api/handlers_phase11_test.go`'s
+  `TestCreateJob_MaxAttempts_LargestRepresentableValue_Accepted` /
+  `TestCreateJob_MaxAttempts_FirstUnrepresentableValue_Rejected400NotDBError`.
 - PROPOSED deprecation window: a minimum of one full minor-version release
   cycle with the old surface still functional and a `Deprecation`/`Sunset`
-  response header (or equivalent), before removal.
+  response header (or equivalent), before removal. The header mechanism
+  itself is now implemented (see above); the *removal* decision for the
+  legacy unprefixed routes remains PROPOSED/future — Phase 11 does not
+  remove them, and this document does not set a Sunset date.
+
+## Transactional Enqueue: Same-Database Atomicity Only (Phase 11)
+
+Status: **implemented**. See docs/transactional-enqueue.md for the full
+specification; summarized here because it is itself a compatibility-shaped
+guarantee (what TaskForge does and does not promise about a caller's own
+transaction boundary).
+
+The `txenqueue` Go package (repository root) lets a caller enqueue a job
+using a `pgx.Tx` the caller already owns, so a business-data write and the
+job insert commit together or neither does — **when both live in the same
+PostgreSQL database**. This required no schema change: the existing `jobs`
+table (docs/data-model.md) already supports a plain `INSERT` from any
+transaction, including one a caller opened, so no migration was added for
+this phase.
+
+This guarantee is explicitly **not** extended, and cannot be, across two
+different databases or any non-PostgreSQL system. TaskForge does not
+implement distributed transactions or two-phase commit. The documented
+pattern for that case is the transactional outbox (docs/transactional-enqueue.md;
+also referenced from docs/idempotency.md's execution-idempotency
+patterns, which already named it for a different reason — a handler's own
+side effect — before this phase existed). The outbox relay's own call
+target is the canonical `POST /v1/jobs` route, not the deprecated legacy
+`POST /jobs` alias, per the "API Evolution" rules above.
+
+`txenqueue`'s public compatibility surface is deliberately small and
+Go-internal-detail-free: its `Job` return type is a package-owned
+projection (`struct{ ID uuid.UUID }`), not a type alias onto
+`internal/job.Job`, so TaskForge's internal durable-row shape is free to
+change without being part of this package's public contract; and every
+error `EnqueueTx` returns is classifiable via `errors.Is` against one of
+four sentinel errors (`txenqueue/errors.go`), never the raw
+`internal/store`/PostgreSQL error text — see
+docs/transactional-enqueue.md "Error contract."
 
 ## PROPOSED: Database Migrations
 
@@ -231,14 +344,21 @@ To be unambiguous, restating what is **not** proposed but already true
 today, because it was built correctly from the start:
 
 - Schema additions so far have never required breaking an existing server
-  version (verified: migrations `0001`→`0003`, and Phases 3/4/6 needing
+  version (verified: migrations `0001`→`0004`, and Phases 3/4/6/11 needing
   zero new migrations).
 - Scheduled-job and workflow-structure durability across restarts/deploys
   is already proven (TF-INV-011, TF-INV-012, SF-013, SF-029).
 - Job payload opacity is an existing, deliberate architectural property,
   not a proposal.
+- **As of Phase 11**: the `/v1/` API version prefix, unknown-request-field
+  tolerance, the request-body size limit, the `max_attempts`
+  no-upper-bound policy decision, and same-PostgreSQL-transaction
+  atomicity (`txenqueue`) are all **implemented and proven**, not
+  proposed — see the "API Evolution" and "Transactional Enqueue" sections
+  above.
 
-Everything else in this document — API versioning, rolling-upgrade proof,
-old/new worker-server compatibility testing, payload `schema_version`
-convention, and formal deprecation policy — is **PROPOSED and unimplemented**
-as of this review.
+Everything else in this document — rolling-upgrade proof, old/new
+worker-server compatibility testing, payload `schema_version` convention,
+and the deprecation window's actual *removal* decision for the legacy
+unprefixed routes — remains **PROPOSED and unimplemented** as of this
+review (targeted at Phase 14, docs/enterprise-roadmap.md).

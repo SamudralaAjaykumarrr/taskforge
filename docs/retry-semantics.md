@@ -132,3 +132,25 @@ See [invariants.md](invariants.md) for full detail.
 - Whether a handler should be able to request a *specific* retry delay
   (rather than accepting the computed backoff) is deferred; v1 gives the
   handler only a binary retryable/permanent signal.
+- **Settled (Phase 11, [enterprise-roadmap.md](enterprise-roadmap.md)):**
+  whether caller-supplied `max_attempts` needs an application-level upper
+  bound, closing [security-model.md](security-model.md)'s "Abusive retry
+  workload" P2. Decision: **no arbitrary product/operational cap.**
+  `max_attempts` must be at least 1 and at most
+  `job.MaxRepresentableMaxAttempts` (`math.MaxInt32` — a
+  storage-representability bound matching PostgreSQL's `jobs.max_attempts`
+  `INTEGER` column, not a smaller operational cap; see
+  `internal/job.ValidateSubmission`). Reasoning: a large `max_attempts`
+  only amplifies retry-scheduling churn for that one job — it cannot
+  bypass TF-INV-006's ceiling or create additional jobs — but this is
+  **not** a claim that it is free of any effect on other work: retries
+  still consume shared worker, database, and claim-query/scheduling
+  resources, so a very large configured retry budget can create real
+  shared-resource pressure other jobs/tenants contend against. That
+  governance concern is accepted as an explicit, **deferred** risk for
+  Phase 13's per-tenant/per-queue concurrency and fairness work — not
+  closed as harmless — rather than mitigated here with an arbitrary
+  numeric product cap that could reject a caller with a legitimate need
+  for many attempts (e.g. a long-running eventual-consistency poll).
+  Revisit if Phase 13's governance work finds the deferred risk
+  insufficiently mitigated in practice.

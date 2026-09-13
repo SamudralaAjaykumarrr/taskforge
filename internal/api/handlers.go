@@ -23,8 +23,8 @@ type createJobRequest struct {
 	// docs/scheduling.md. Omitted or null means "run as soon as
 	// possible" (unchanged Phase 1-5 behavior). encoding/json parses this
 	// as RFC 3339 automatically -- a malformed value fails at
-	// dec.Decode's DisallowUnknownFields JSON parse in CreateJob below,
-	// before validateCreateJobRequest ever runs, with a 400 response.
+	// dec.Decode's JSON parse in CreateJob below, before
+	// validateCreateJobRequest ever runs, with a 400 response.
 	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
 }
 
@@ -90,11 +90,27 @@ const idempotencyKeyHeader = "Idempotency-Key"
 // representation with the SAME 2xx status a fresh submission would have
 // produced — never a different status code, and never a comparison against
 // the new request's payload.
+//
+// Phase 11 (docs/enterprise-roadmap.md, docs/compatibility-policy.md "API
+// Evolution"): the request body is bounded via http.MaxBytesReader before
+// any JSON decoding is attempted, so an oversized body is rejected (413)
+// without buffering it in memory first, and the decoder no longer calls
+// DisallowUnknownFields -- an unrecognized field in the request body is
+// silently ignored (ordinary encoding/json behavior), not rejected, so a
+// newer client sending an additive field a running server doesn't yet know
+// about does not break -- see
+// TestCreateJob_UnknownFieldsAreIgnored_RoundTrip and
+// TestCreateJob_OversizedBodyRejected413 in handlers_phase11_test.go.
 func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
+
 	var req createJobRequest
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body must be at most %d bytes", MaxRequestBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -160,45 +176,29 @@ func parseIdempotencyKey(raw string) (*string, string) {
 	return &key, ""
 }
 
+// validateCreateJobRequest delegates the job-field rules (job_type,
+// payload, max_attempts, execution_timeout_seconds) to
+// internal/job.ValidateSubmission -- the same function the direct-Go
+// transactional enqueue API (see the txenqueue package) uses -- so the two
+// entry points cannot silently diverge (docs/enterprise-roadmap.md Phase
+// 11). Idempotency-Key is handled separately by parseIdempotencyKey
+// (called by CreateJob) because it arrives via an HTTP header, not a body
+// field, and is passed in as nil here.
 func validateCreateJobRequest(req createJobRequest) (job.NewParams, string) {
-	jobType := strings.TrimSpace(req.JobType)
-	if jobType == "" {
-		return job.NewParams{}, "job_type is required"
+	params, err := job.ValidateSubmission(req.JobType, req.Payload, req.MaxAttempts, req.ExecutionTimeoutSeconds, nil)
+	if err != nil {
+		return job.NewParams{}, err.Error()
 	}
-	if len(jobType) > 255 {
-		return job.NewParams{}, "job_type must be at most 255 characters"
-	}
+	params.ScheduledAt = req.ScheduledAt
+	return params, ""
+}
 
-	payload := req.Payload
-	if len(payload) == 0 {
-		payload = json.RawMessage(`{}`)
-	} else if !json.Valid(payload) {
-		return job.NewParams{}, "payload must be valid JSON"
-	}
-
-	maxAttempts := DefaultMaxAttempts
-	if req.MaxAttempts != nil {
-		if *req.MaxAttempts < 1 {
-			return job.NewParams{}, "max_attempts must be at least 1"
-		}
-		maxAttempts = *req.MaxAttempts
-	}
-
-	executionTimeout := DefaultExecutionTimeoutSeconds
-	if req.ExecutionTimeoutSeconds != nil {
-		if *req.ExecutionTimeoutSeconds < 1 {
-			return job.NewParams{}, "execution_timeout_seconds must be at least 1"
-		}
-		executionTimeout = *req.ExecutionTimeoutSeconds
-	}
-
-	return job.NewParams{
-		JobType:                 jobType,
-		Payload:                 payload,
-		MaxAttempts:             maxAttempts,
-		ExecutionTimeoutSeconds: executionTimeout,
-		ScheduledAt:             req.ScheduledAt,
-	}, ""
+// isMaxBytesError reports whether err originates from an http.MaxBytesReader
+// rejecting a request body that exceeded MaxRequestBodyBytes -- see
+// CreateJob and CreateWorkflow.
+func isMaxBytesError(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
 }
 
 // GetJob handles GET /jobs/{id}. It is a plain read against durable state
