@@ -31,7 +31,7 @@ The single durable record of a logical unit of work.
 | `lease_expires_at` | `timestamptz` NULL | NULL when not `RUNNING`. Governs reclaim eligibility. |
 | `heartbeat_at` | `timestamptz` NULL | Last heartbeat received. Observability only — `lease_expires_at` is the actual correctness guard (TF-INV-015). |
 | `attempt_count` | `int` NOT NULL DEFAULT 0 | Incremented on each claim. 1-based numbering (first attempt is `attempt_count = 1`) — see [retry-semantics.md](retry-semantics.md). |
-| `max_attempts` | `int` NOT NULL DEFAULT 5 | Caller-configurable at submission. Governs TF-INV-006. |
+| `max_attempts` | `int` NOT NULL DEFAULT 5 | Caller-configurable at submission. Governs TF-INV-006. `int` here is PostgreSQL's 32-bit signed `INTEGER` — as of Phase 11, `internal/job.ValidateSubmission` rejects a caller-supplied value outside that representable range (`job.MaxRepresentableMaxAttempts`) before any INSERT is attempted; see docs/compatibility-policy.md "API Evolution." |
 | `execution_timeout_seconds` | `int` NOT NULL | Per-attempt wall-clock budget. See [execution-semantics.md](execution-semantics.md) Timeout Semantics. |
 | `cancel_requested` | `boolean` NOT NULL DEFAULT `false` | Set by cancellation request while `RUNNING`. |
 | `cancel_requested_at` | `timestamptz` NULL | Set when `cancel_requested` becomes true. |
@@ -177,6 +177,18 @@ for observability/audit beyond what `job_attempts` captures (e.g.,
 heartbeat events, cancellation requests). Deferred because `job_attempts`
 plus structured logs (see [observability.md](observability.md)) cover v1's
 needs without a second history table.
+
+## Transactional Enqueue Needed No Schema Change (Phase 11)
+
+docs/enterprise-roadmap.md Phase 11 added a `pgx.Tx`-based enqueue entry
+point (the `txenqueue` package, docs/transactional-enqueue.md). It required
+**zero migrations**: the `jobs` table already supports an ordinary `INSERT`
+from any transaction, including one a caller opened and controls — the
+existing columns, constraints, and indexes above are used completely
+unchanged by this entry point. This is called out explicitly because it
+was a deliberate audit finding (docs/enterprise-roadmap.md's own
+"Migration / Schema Discipline" instruction for that phase), not an
+oversight.
 
 ## Why Not Over-Design v1
 

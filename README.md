@@ -25,7 +25,15 @@ a real GitHub attestation) and a handful of GitHub account-level settings
 toggles) remain pending — not yet a claim of unconditional completion; see
 "Phase 10: What's Implemented" below and
 [docs/supply-chain-security.md](docs/supply-chain-security.md); it adds no
-runtime/product code and does not change any guarantee above.**
+runtime/product code and does not change any guarantee above. Phase 11 —
+Transactional Enqueue & API Contract Hardening — of
+[docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) is **complete**:
+a same-PostgreSQL-transaction enqueue API (`txenqueue`), API versioning
+(`/v1/`), a request body size limit, and audited/corrected unknown-field
+tolerance — see "Phase 11: What's Implemented" below and
+[docs/transactional-enqueue.md](docs/transactional-enqueue.md); it does
+not weaken any Phase 1-9 guarantee, and provides no cross-database
+atomicity of any kind.**
 Phases 1 through 8 of [docs/roadmap.md](docs/roadmap.md) are implemented: a
 durable PostgreSQL-backed job engine with HTTP submission (including
 database-enforced `Idempotency-Key` deduplication and optional
@@ -2580,6 +2588,102 @@ section is a summary.
   narrower claim ("traceable/repeatable release procedure") this phase
   actually supports.
 
+## Phase 11: What's Implemented
+
+**Status: Complete.** Phase 11 (docs/enterprise-roadmap.md "Transactional
+Enqueue & API Contract Hardening") closes two confirmed gaps: (1) no way
+for a caller to enqueue a TaskForge job atomically with their own
+business-data write when both live in the same PostgreSQL database, and
+(2) an unversioned, lightly-tested HTTP API contract. See
+docs/transactional-enqueue.md for the full design.
+
+- **Transactional enqueue** (same-PostgreSQL-database only): a new,
+  exported Go package, `txenqueue` (repository root — deliberately not
+  `internal/store`, which cannot be a public API outside this module),
+  lets a caller enqueue a job using a `pgx.Tx` (`github.com/jackc/pgx/v5`,
+  an interface) it already owns:
+
+  ```go
+  tx, _ := pool.Begin(ctx)
+  // ... caller's own business-data write, using tx ...
+  job, created, err := txenqueue.New().EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{
+      JobType: "invoice.charge",
+      Payload: payload,
+  })
+  // ... tx.Commit(ctx) or tx.Rollback(ctx) — the caller decides, always ...
+  ```
+
+  `EnqueueTx` never commits or rolls back the caller's transaction, opens
+  no second connection, and starts no independent top-level transaction —
+  proven against real PostgreSQL in `txenqueue/txenqueue_test.go`: commit
+  makes both rows durable and the job claimable through the ordinary
+  engine; rollback (in either statement order) leaves neither; an
+  already-closed transaction fails loudly with no orphan row; and
+  submission-idempotency (`Idempotency-Key`, TF-INV-008/016) holds inside
+  a transaction, across a rollback-then-reuse, and under many concurrent
+  transactions racing on the same key (`TestEnqueueTx_IdempotencyKey_ConcurrentTransactions_ExactlyOneCreates`
+  — every successful caller's transaction commits; exactly one caller's own
+  `INSERT` is what created the durable row). This guarantee is
+  **same-PostgreSQL-database, same-caller-owned-transaction atomicity
+  only** — TaskForge does not and cannot provide cross-database atomicity;
+  the transactional-outbox pattern (targeting the canonical `POST /v1/jobs`
+  route) is documented for that case. `EnqueueTx`'s return type is a small,
+  package-owned `Job{ ID uuid.UUID }` projection, not an alias onto
+  TaskForge's internal durable row type, and every error it returns is
+  classifiable against one of four public sentinels
+  (`txenqueue/errors.go`) rather than a raw internal/PostgreSQL error — see
+  docs/transactional-enqueue.md "Error contract" and "Isolation level and
+  idempotency conflicts" for the REPEATABLE READ/SERIALIZABLE proof.
+- **API versioning**: all six canonical routes (`POST /jobs`,
+  `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `POST /workflows`,
+  `GET /workflows/{id}`, `POST /workflows/{id}/cancel`) are now served
+  under both `/v1/...` (canonical) and their original unprefixed paths
+  (kept fully functional, marked deprecated via an RFC 9745
+  `Deprecation: @1788998400` header and a structured log line — never
+  silently redirected or removed).
+- **Request body size limit**: `POST /jobs` and `POST /workflows` reject a
+  body over 1 MiB (`api.MaxRequestBodyBytes`) with `413`, enforced via
+  `http.MaxBytesReader` before JSON decoding begins.
+- **Unknown-field tolerance, audited and corrected**: both JSON decoders
+  previously called `DisallowUnknownFields` — the opposite of
+  docs/compatibility-policy.md's assumed-safe behavior. Both now tolerate
+  an unrecognized field in either direction (old-shape request, new-shape
+  request), proven by a round-trip test.
+- **`max_attempts` upper bound**: decided, not left unverified — no
+  arbitrary product/operational cap is imposed (see docs/retry-semantics.md
+  "Open Questions"), a deliberate policy decision now documented and
+  re-checked against the single, shared validation path
+  (`internal/job.ValidateSubmission`) every submission entry point
+  (`POST /jobs`, `POST /workflows`, and `txenqueue`) now uses, closing a
+  duplication risk between them along the way — but a large configured
+  retry budget is **not** claimed harmless: it still consumes shared
+  worker/database/claim-query resources, an accepted risk deferred to
+  Phase 13's governance work, not closed as harmless (audit correction). A
+  separate **storage-representability bound** (`job.MaxRepresentableMaxAttempts`,
+  matching PostgreSQL's `jobs.max_attempts` `INTEGER` column) is enforced
+  before any INSERT is attempted, so a Go-valid `int` outside PostgreSQL's
+  representable range is rejected with an ordinary 400, never an internal
+  500 from a failed INSERT — see `TestCreateJob_MaxAttempts_LargestRepresentableValue_Accepted`
+  / `TestCreateJob_MaxAttempts_FirstUnrepresentableValue_Rejected400NotDBError`.
+- **No schema change**: the existing `jobs` table already supported an
+  `INSERT` from any transaction; this phase added zero migrations.
+
+### Not implemented / explicit non-scope
+
+- Cross-database or cross-PostgreSQL-instance atomicity of any kind — not
+  provided, not claimed. See docs/transactional-enqueue.md.
+- No relay/outbox-processor implementation — the transactional-outbox
+  pattern is documented as the caller's own responsibility, not built here.
+- No authentication/authorization on the new `txenqueue` package or the
+  `/v1/` routes (Phase 12).
+- No named queues, priorities, or rate limiting (Phase 13).
+- No removal of the legacy unprefixed HTTP routes — this phase marks them
+  deprecated only; removal is a future, separately-decided release.
+- No change to the job state machine, lease/fencing mechanism, or any
+  Phase 1-9 invariant — a transactionally-enqueued job, once committed,
+  uses the exact same durable representation and execution path as any
+  other job.
+
 ## Documentation Map
 
 | Document | Contents |
@@ -2597,11 +2701,13 @@ section is a summary.
 | [docs/workflows.md](docs/workflows.md) | DAG execution design (staged for a later phase) |
 | [docs/observability.md](docs/observability.md) | Metrics, structured logs, trace boundaries |
 | [docs/testing-strategy.md](docs/testing-strategy.md) | Test categories and the invariant-to-test matrix |
-| [docs/scenario-corpus.md](docs/scenario-corpus.md) | 30 named, deterministic test scenarios (SF-001 through SF-030) |
+| [docs/scenario-corpus.md](docs/scenario-corpus.md) | 36 named, deterministic test scenarios (SF-001 through SF-036) |
 | [docs/roadmap.md](docs/roadmap.md) | Phased implementation plan with entry/exit criteria per phase |
 | [docs/adr/](docs/adr/README.md) | Architecture decision records — the real tradeoffs behind the design |
-| [docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) | Phases 10–18: the enterprise-readiness sequencing plan (Phase 10 implemented; 11–18 proposed) |
+| [docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) | Phases 10–18: the enterprise-readiness sequencing plan (Phases 10–11 implemented; 12–18 proposed) |
 | [docs/supply-chain-security.md](docs/supply-chain-security.md) | Phase 10: dependency scanning, SBOM, provenance attestation, release process and verification, limitations |
+| [docs/transactional-enqueue.md](docs/transactional-enqueue.md) | Phase 11: the `txenqueue` package, same-PostgreSQL-transaction atomicity, and the transactional-outbox pattern for the cross-database case |
+| [docs/compatibility-policy.md](docs/compatibility-policy.md) | API/schema evolution rules — API versioning, unknown-field tolerance, and body-size limits implemented (Phase 11); rolling-upgrade proof still proposed (Phase 14) |
 
 ## Technology Direction
 
