@@ -1,0 +1,25 @@
+-- Phase 12 (docs/phase-12-plan.md §5), final step: retire migration 0001's
+-- global UNIQUE (job_type, idempotency_key) index, now that 0009's
+-- principal-scoped replacement is live and enforcing.
+--
+-- LOCK PROFILE: ACCESS EXCLUSIVE, catalog-only, O(1) once acquired
+-- ---------------------------------------------------------------------
+-- DROP INDEX needs ACCESS EXCLUSIVE on the table and does no scan. It is in
+-- its own file precisely BECAUSE of that lock: appended to the end of 0009
+-- it made the whole transaction -- including the full-table validation scan
+-- already performed -- sit waiting for ACCESS EXCLUSIVE, and PostgreSQL
+-- queues every new lock request behind a waiting stronger one, so ordinary
+-- readers blocked on it too. Isolating it means 0009's scan work commits and
+-- becomes durable first, and only this one-statement transaction waits.
+--
+-- Deployment note: like all DDL this must WAIT for any conflicting lock
+-- currently held on jobs, and queues new requests behind it while waiting.
+-- Set lock_timeout and retry if the deployment window is busy; re-running is
+-- safe (IF EXISTS).
+--
+-- Until this migration runs, both indexes are live and the stricter global
+-- one is still enforcing -- so the window between 0009 and 0010 cannot let a
+-- cross-tenant collision through. migrate.Up applies both in the same run,
+-- so no completed startup ever ends inside that window.
+
+DROP INDEX IF EXISTS idx_jobs_idempotency_key;

@@ -17,7 +17,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/google/uuid"
+
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
 )
@@ -32,15 +35,36 @@ type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
+// newTestServer is the Phase 1-11 suite's server. As of Phase 12 it wires
+// the real authentication middleware against a real principals/api_keys
+// table and injects a real credential for requests that do not carry one
+// (see injectCredential's doc comment in phase12_harness_test.go for why
+// that is a regression-preservation device and not an auth bypass). Every
+// request these tests make is therefore genuinely authenticated, by the
+// same middleware production uses, as a real caller principal.
 func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
 	db := testutil.DB(t)
 	s := store.New(db)
-	h := api.NewHandlers(s, discardLogger())
-	srv := httptest.NewServer(api.NewRouter(h))
+	ps := newPrincipalStore(t, db)
+	ident := newIdentity(t, ps, principal.KindCaller, "legacy suite caller", principal.ScopeJobs)
+	h := api.NewHandlers(s, discardLogger(), api.WithAuthenticator(ps))
+	srv := httptest.NewServer(injectCredential(api.NewRouter(h), ident))
 	t.Cleanup(srv.Close)
+	testSuitePrincipal = ident.PrincipalID
 	return srv, s
 }
+
+// testSuitePrincipal is the principal newTestServer's injected credential
+// belongs to, so a test that needs to read a row back through a
+// principal-scoped store method knows whose identity to present.
+//
+// A package-level variable is safe here only because no test in this
+// repository calls t.Parallel() -- a deliberate project property, since
+// every integration test shares one PostgreSQL instance
+// (docs/testing-strategy.md, internal/testutil). The race-detector run is
+// what actually confirms it.
+var testSuitePrincipal uuid.UUID
 
 // TestCreateJob_AcknowledgementImpliesDurableCommit is the API-level proof
 // of TF-INV-001's mechanism: a 201 response is only ever produced after
@@ -220,7 +244,7 @@ func TestCreateJob_IdempotencyKey_SequentialDuplicateReturnsSameJob(t *testing.T
 
 	require.Equal(t, first.ID, second.ID, "no duplicate logical job is created")
 
-	mapped, err := s.GetByIdempotencyKey(context.Background(), "test.idem.http.seq", "http-retry-key")
+	mapped, err := s.GetByIdempotencyKey(context.Background(), testSuitePrincipal, "test.idem.http.seq", "http-retry-key")
 	require.NoError(t, err)
 	require.Equal(t, first.ID, mapped.ID.String(), "TF-INV-008: the (job_type, idempotency_key) pair maps to exactly this one job")
 }
@@ -314,15 +338,24 @@ func TestCreateJob_IdempotencyKey_TooLongRejected(t *testing.T) {
 // stateless ... no in-memory state is lost because none is load-bearing").
 func TestCreateJob_IdempotencyKey_ProcessRestartThenDuplicateReturnsExistingJob(t *testing.T) {
 	db := testutil.DB(t)
-	before := httptest.NewServer(api.NewRouter(api.NewHandlers(store.New(db), discardLogger())))
+	ps := newPrincipalStore(t, db)
+	// One identity spanning both "processes": a restart must not
+	// invalidate a credential, and the durable job it looks up belongs to
+	// that same principal on both sides of the restart.
+	ident := newIdentity(t, ps, principal.KindCaller, "restart suite caller", principal.ScopeJobs)
+	newProcess := func() *httptest.Server {
+		h := api.NewHandlers(store.New(db), discardLogger(), api.WithAuthenticator(newPrincipalStore(t, db)))
+		return httptest.NewServer(injectCredential(api.NewRouter(h), ident))
+	}
+	before := newProcess()
 	t.Cleanup(before.Close)
 
 	first := decodeCreatedJob(t, postJob(t, before, `{"job_type":"test.idem.http.restart","payload":{}}`, "restart-http-key"))
 	before.Close()
 
-	// "Restart": a brand-new server, brand-new Handlers, brand-new Store --
-	// sharing only the underlying database.
-	after := httptest.NewServer(api.NewRouter(api.NewHandlers(store.New(db), discardLogger())))
+	// "Restart": a brand-new server, brand-new Handlers, brand-new Store,
+	// brand-new principal.Store -- sharing only the underlying database.
+	after := newProcess()
 	t.Cleanup(after.Close)
 
 	second := decodeCreatedJob(t, postJob(t, after, `{"job_type":"test.idem.http.restart","payload":{}}`, "restart-http-key"))

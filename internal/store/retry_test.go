@@ -235,7 +235,7 @@ func TestCompleteRetryableFailure_RejectsStaleGeneration(t *testing.T) {
 	_, err = s.CompleteRetryableFailure(ctx, claimed.ID, "worker-1", 999, "boom", time.Second)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	current, err := s.GetByID(ctx, claimed.ID)
+	current, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, current.State, "a rejected retry report must leave the job untouched")
 }
@@ -287,7 +287,7 @@ func TestCompleteRetryableFailure_RejectedAfterReclaim(t *testing.T) {
 	_, err = s.CompleteRetryableFailure(ctx, a.ID, "worker-A", a.LeaseGeneration, "late retryable report", time.Second)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State, "worker B's success must be untouched by worker A's stale retry report")
 }
@@ -321,7 +321,7 @@ func TestCompleteFailure_PermanentRejectedAfterReclaim(t *testing.T) {
 	_, err = s.CompleteFailure(ctx, a.ID, "worker-A", a.LeaseGeneration, "late permanent report", job.ErrorClassPermanent)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 }
@@ -671,7 +671,7 @@ func TestRetryTransition_RollbackLeavesJobAndAttemptConsistent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	beforeJob, err := s.GetByID(ctx, claimed.ID)
+	beforeJob, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	beforeAttempts := attemptsForJob(t, db, claimed.ID)
 	require.Len(t, beforeAttempts, 1)
@@ -703,7 +703,7 @@ func TestRetryTransition_RollbackLeavesJobAndAttemptConsistent(t *testing.T) {
 	require.Error(t, err, "an invalid outcome value must violate the CHECK constraint")
 	require.NoError(t, tx.Rollback())
 
-	afterJob, err := s.GetByID(ctx, claimed.ID)
+	afterJob, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, beforeJob.State, afterJob.State, "rollback must leave the job row's state untouched")
 	require.Equal(t, beforeJob.Version, afterJob.Version)
@@ -787,7 +787,7 @@ func TestProperty_AttemptCountNeverExceedsMaxAttempts(t *testing.T) {
 			forceSetEligibleAt(t, db, created.ID, -time.Second)
 		}
 
-		final, err := s.GetByID(ctx, created.ID)
+		final, err := s.GetByID(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 		require.LessOrEqualf(t, final.AttemptCount, maxAttempts, "scenario %d: final attempt_count exceeded max_attempts", i)
 		require.Truef(t, final.State == jobstate.Succeeded || final.State == jobstate.DeadLettered,
@@ -807,9 +807,9 @@ func TestProperty_AttemptCountNeverExceedsMaxAttempts(t *testing.T) {
 func TestSchema_RetryWaitStateAlreadySupportedByCheckConstraint(t *testing.T) {
 	db := testutil.DB(t)
 	_, err := db.Exec(`
-		INSERT INTO jobs (id, job_type, payload, state, execution_timeout_seconds, eligible_at)
-		VALUES ($1, 'test.schema.retrywait', '{}', 'RETRY_WAIT', 30, now() + interval '1 minute')`,
-		uuid.New())
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, execution_timeout_seconds, eligible_at)
+		VALUES ($1, $2, 'test.schema.retrywait', '{}', 'RETRY_WAIT', 30, now() + interval '1 minute')`,
+		uuid.New(), testPrincipalID)
 	require.NoError(t, err, "RETRY_WAIT must already be a legal state value under migration 0001's CHECK constraint")
 }
 

@@ -48,6 +48,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/google/uuid"
+
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/chaos"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/invariant"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
@@ -168,7 +170,7 @@ func runStress(db *sql.DB, logger *slog.Logger, checker *invariant.Checker, cfg 
 	runCtx, runCancel := context.WithTimeout(ctx, cfg.duration)
 	defer runCancel()
 
-	submitWorkload(runCtx, s, rng, cfg, report)
+	submitWorkload(runCtx, db, s, rng, cfg, report)
 
 	violations := checkAndReport(ctx, checker, report, "post-submission")
 	if len(violations) > 0 {
@@ -260,12 +262,42 @@ func runSoak(db *sql.DB, logger *slog.Logger, checker *invariant.Checker, cfg co
 	return exitCode
 }
 
+// ensureChaosPrincipal creates the throwaway principal this campaign's
+// jobs are attributed to (Phase 12). It is a plain principals INSERT, not
+// an api_keys one: the chaos harness talks to internal/store directly and
+// never authenticates over HTTP, so it needs an identity to own rows but
+// no credential to present.
+func ensureChaosPrincipal(ctx context.Context, db *sql.DB) (uuid.UUID, error) {
+	id := uuid.New()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO principals (id, kind, display_name) VALUES ($1, 'caller', $2)`,
+		id, "chaos harness campaign")
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
 // submitWorkload creates this campaign's mixed workload: plain jobs (a
 // fraction scheduled in the future), duplicate-idempotent-submission
 // groups, and diamond workflows -- mirroring
 // internal/chaos.TestChaos_CombinedCampaign_AllInvariantsSimultaneously_Seeded's
 // shape at manually configurable scale.
-func submitWorkload(ctx context.Context, s *store.Store, rng *chaos.Rand, cfg config, report *report) {
+func submitWorkload(ctx context.Context, db *sql.DB, s *store.Store, rng *chaos.Rand, cfg config, report *report) {
+	// Phase 12: every job row needs an owning principal. The chaos
+	// harness is an operator-run stress tool with no HTTP surface and no
+	// callers to authenticate, so it creates one throwaway principal for
+	// the campaign and attributes its whole workload to it -- an explicit
+	// identity chosen here, not a default the store supplied. The
+	// campaign's jobs are therefore owned exactly as a real caller's
+	// would be, which is what keeps the invariant checks it runs
+	// meaningful against principal-scoped queries.
+	principalID, err := ensureChaosPrincipal(ctx, db)
+	if err != nil {
+		report.recordError(fmt.Errorf("create chaos principal: %w", err))
+		return
+	}
+
 	for i := 0; i < cfg.jobs; i++ {
 		var scheduledAt *time.Time
 		if rng.Bool(0.15) {
@@ -273,7 +305,8 @@ func submitWorkload(ctx context.Context, s *store.Store, rng *chaos.Rand, cfg co
 			scheduledAt = &st
 		}
 		created, err := s.Insert(ctx, job.NewParams{
-			JobType: "chaos.stress.plain", Payload: []byte(`{}`),
+			PrincipalID: principalID,
+			JobType:     "chaos.stress.plain", Payload: []byte(`{}`),
 			MaxAttempts: 2 + rng.Intn(4), ExecutionTimeoutSeconds: 10, ScheduledAt: scheduledAt,
 		})
 		if err != nil {
@@ -293,7 +326,8 @@ func submitWorkload(ctx context.Context, s *store.Store, rng *chaos.Rand, cfg co
 				defer idemWG.Done()
 				k := key
 				created, _, err := s.InsertIdempotent(ctx, job.NewParams{
-					JobType: "chaos.stress.idem", Payload: []byte(`{}`),
+					PrincipalID: principalID,
+					JobType:     "chaos.stress.idem", Payload: []byte(`{}`),
 					MaxAttempts: 3, ExecutionTimeoutSeconds: 10, IdempotencyKey: &k,
 				})
 				if err != nil {
@@ -308,7 +342,7 @@ func submitWorkload(ctx context.Context, s *store.Store, rng *chaos.Rand, cfg co
 
 	for i := 0; i < cfg.workflows; i++ {
 		prefix := fmt.Sprintf("chaos.stress.wf.%d.%d", report.seed, i)
-		inst, err := s.CreateWorkflow(ctx, diamondSpec(prefix))
+		inst, err := s.CreateWorkflow(ctx, diamondSpec(principalID, prefix))
 		if err != nil {
 			report.recordError(fmt.Errorf("create workflow: %w", err))
 			continue

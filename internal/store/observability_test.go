@@ -279,7 +279,7 @@ func TestMetrics_SF011_CancellationBeforeClaim(t *testing.T) {
 	created, err := s.Insert(ctx, newJobParamsN("test.metrics.sf011", 5))
 	require.NoError(t, err)
 
-	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	require.Equal(t, uint64(1), histogramSampleCount(t, m.RetryCount.WithLabelValues("test.metrics.sf011")))
@@ -302,7 +302,7 @@ func TestMetrics_SF012_CancelCommitsFirst_CompletionRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	_, err = s.CompleteCancelled(ctx, claimed.ID, "worker-A", claimed.LeaseGeneration)
 	require.NoError(t, err)

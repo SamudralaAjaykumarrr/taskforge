@@ -111,6 +111,35 @@ func toPublicJob(j *job.Job) *Job {
 // (nil) applies TaskForge's documented defaults, exactly as an omitted JSON
 // field does over HTTP -- a non-nil value less than 1 is rejected.
 type EnqueueRequest struct {
+	// PrincipalID is the TaskForge principal this job is submitted on
+	// behalf of. REQUIRED as of Phase 12 (docs/phase-12-plan.md §6b,
+	// OD-4): a zero value is rejected with ErrInvalidRequest before tx is
+	// touched at all.
+	//
+	// There is deliberately no default. TaskForge does NOT resolve an
+	// unset PrincipalID to a system principal, to the first principal it
+	// finds, or to anything else -- a caller that cannot say who it is
+	// submitting for cannot enqueue. The system principal exists solely
+	// as the backfill identity for rows that predate Phase 12 (migration
+	// 0006); nothing on this path, or on the HTTP path, ever assigns it.
+	// TestEnqueueTx_NoDefaultSystemPrincipalPath asserts the absence of
+	// such a fallback directly, against real database state.
+	//
+	// This is a deliberate, reviewed hard break in this package's public
+	// Go API, justified by evidence rather than convenience: a
+	// repository-wide search for callers of this package outside its own
+	// tests returns zero results, and README.md/docs/roadmap.md both
+	// still label the project Experimental. Per OD-4, an
+	// EnqueueTxUnscoped-style compatibility adapter is a documented
+	// CONTINGENCY, not committed scope -- it is not built here, and would
+	// only ever be built as a separately named function that logs on
+	// every call, never as a silent fallback reachable through EnqueueTx.
+	//
+	// The caller decides where this value comes from. A service handling
+	// its own authenticated HTTP traffic should pass the principal it
+	// authenticated, not a hardcoded constant.
+	PrincipalID uuid.UUID
+
 	// JobType identifies which handler executes this job. Required,
 	// non-empty after trimming, at most 255 characters.
 	JobType string
@@ -185,6 +214,12 @@ func New() *Store {
 //     (PostgreSQL may have put it in an aborted state) and the caller is
 //     responsible for deciding whether to roll it back.
 //
+// # Principal
+//
+// req.PrincipalID is required (Phase 12). A zero value is rejected with
+// ErrInvalidRequest before tx is touched, and is never silently resolved
+// to a default or system principal -- see EnqueueRequest.PrincipalID.
+//
 // # Error contract
 //
 // Every non-nil error EnqueueTx returns is classifiable via errors.Is as
@@ -230,6 +265,24 @@ func (s *Store) EnqueueTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest) (*
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: %s", ErrInvalidRequest, err.Error())
 	}
+
+	// Phase 12 (docs/phase-12-plan.md §6b): PrincipalID is part of
+	// ordinary submission validation, checked here -- alongside
+	// internal/job.ValidateSubmission and BEFORE the tx nil-check below,
+	// so tx is provably never touched when this fails, exactly as this
+	// method's documented ErrInvalidRequest contract already promises
+	// ("req failed ordinary submission validation ... tx was never
+	// touched"). No new error sentinel is introduced: this is an invalid
+	// request, and ErrInvalidRequest already means that.
+	//
+	// Note what does NOT happen here: there is no "if PrincipalID is
+	// zero, use the system principal" branch, no lookup of a default
+	// principal, and no environment-derived fallback. Rejecting is the
+	// only behaviour.
+	if req.PrincipalID == uuid.Nil {
+		return nil, false, fmt.Errorf("%w: principal_id is required", ErrInvalidRequest)
+	}
+	params.PrincipalID = req.PrincipalID
 	params.ScheduledAt = req.ScheduledAt
 
 	// A caller passing a nil pgx.Tx (the ordinary nil-interface case --

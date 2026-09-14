@@ -64,6 +64,7 @@ func TestStress_ManyWorkersProcessLargeMixedJobPool(t *testing.T) {
 	insertN := func(jobType string, n int, maxAttempts int) {
 		for i := 0; i < n; i++ {
 			_, err := s.Insert(context.Background(), job.NewParams{
+				PrincipalID:             testPrincipalID,
 				JobType:                 jobType,
 				Payload:                 json.RawMessage(`{}`),
 				MaxAttempts:             maxAttempts,
@@ -189,6 +190,7 @@ func TestStress_ManyConcurrentLeaseLossRaces_NoStaleAuthoritativeCompletions(t *
 	for i := 0; i < numJobs; i++ {
 		jobType := fmt.Sprintf("stress.leaseloss.%d", i)
 		created, err := s.Insert(ctx, job.NewParams{
+			PrincipalID:             testPrincipalID,
 			JobType:                 jobType,
 			Payload:                 json.RawMessage(`{}`),
 			MaxAttempts:             5,
@@ -308,6 +310,7 @@ func TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority(t
 	jobIDs := make([]string, 0, numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		created, err := s.Insert(ctx, job.NewParams{
+			PrincipalID:             testPrincipalID,
 			JobType:                 "stress.shutdown",
 			Payload:                 json.RawMessage(`{}`),
 			MaxAttempts:             5,

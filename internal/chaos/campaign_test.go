@@ -283,7 +283,8 @@ func TestChaos_CombinedCampaign_AllInvariantsSimultaneously_Seeded(t *testing.T)
 					scheduledAt = &st
 				}
 				created, err := s.Insert(ctx, job.NewParams{
-					JobType: "chaos.combined.plain", Payload: []byte(`{}`),
+					PrincipalID: testPrincipalID,
+					JobType:     "chaos.combined.plain", Payload: []byte(`{}`),
 					MaxAttempts: 2 + rng.Intn(4), ExecutionTimeoutSeconds: 5, ScheduledAt: scheduledAt,
 				})
 				require.NoError(t, err)
@@ -309,7 +310,8 @@ func TestChaos_CombinedCampaign_AllInvariantsSimultaneously_Seeded(t *testing.T)
 						<-barrier
 						k := key
 						created, _, err := s.InsertIdempotent(ctx, job.NewParams{
-							JobType: "chaos.combined.idem", Payload: []byte(`{}`),
+							PrincipalID: testPrincipalID,
+							JobType:     "chaos.combined.idem", Payload: []byte(`{}`),
 							MaxAttempts: 3, ExecutionTimeoutSeconds: 5, IdempotencyKey: &k,
 						})
 						require.NoError(t, err)
@@ -471,7 +473,7 @@ func resolveCombinedClaim(t *testing.T, s *store.Store, ctx context.Context, j *
 		// crash: do nothing
 		return
 	case 4:
-		if _, rerr := s.RequestCancellation(ctx, j.ID); rerr != nil {
+		if _, rerr := s.RequestCancellation(ctx, j.ID, testAccess); rerr != nil {
 			require.ErrorIs(t, rerr, store.ErrStaleTransition)
 			return
 		}

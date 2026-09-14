@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
@@ -125,7 +126,12 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
 
 	workflowID := uuid.New()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, state) VALUES ($1, 'RUNNING')`, workflowID); err != nil {
+	// Phase 12: the workflow instance and every one of its node jobs
+	// below are attributed to the SAME principal, in this one
+	// transaction -- a workflow and its nodes can never end up owned by
+	// different principals, so workflow-level ownership scoping is
+	// sufficient to protect the nodes too.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, principal_id, state) VALUES ($1, $2, 'RUNNING')`, workflowID, g.PrincipalID); err != nil {
 		return nil, fmt.Errorf("store: create workflow: insert instance: %w", err)
 	}
 
@@ -138,7 +144,7 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	for _, n := range g.Nodes {
 		jobID := uuid.New()
 		blocked := len(n.DependsOn) > 0
-		if err := insertWorkflowNodeJob(ctx, tx, jobID, n, blocked); err != nil {
+		if err := insertWorkflowNodeJob(ctx, tx, jobID, g.PrincipalID, n, blocked); err != nil {
 			return nil, fmt.Errorf("store: create workflow: insert node %q job: %w", n.NodeKey, err)
 		}
 		jobTypes = append(jobTypes, n.JobType)
@@ -173,7 +179,10 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	s.logger.Info("workflow created",
 		"event", "workflow_created", "workflow_id", workflowID.String(), "node_count", len(g.Nodes))
 
-	return s.GetWorkflow(ctx, workflowID)
+	// The creating principal is, by construction, this workflow's owner,
+	// so reading it back under its own identity is correct and needs no
+	// admin bypass.
+	return s.GetWorkflow(ctx, workflowID, principal.AccessContext{PrincipalID: g.PrincipalID})
 }
 
 // insertWorkflowNodeJob inserts the underlying jobs row for one workflow
@@ -186,15 +195,15 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 // consistent with docs/failure-model.md's Clock Model — blockedEligibleAt
 // itself is a fixed constant, not a clock reading, so passing it as a
 // literal parameter does not reintroduce a clock-skew dependency.
-func insertWorkflowNodeJob(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, n workflow.NodeSpec, blocked bool) error {
+func insertWorkflowNodeJob(ctx context.Context, tx *sql.Tx, jobID, principalID uuid.UUID, n workflow.NodeSpec, blocked bool) error {
 	var scheduledAt sql.NullTime
 	if n.ScheduledAt != nil {
 		scheduledAt = sql.NullTime{Time: *n.ScheduledAt, Valid: true}
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, scheduled_at, eligible_at)
-		VALUES ($1, $2, $3, 'QUEUED', $4, $5, $6, CASE WHEN $7 THEN $8 ELSE COALESCE($6, now()) END)`,
-		jobID, n.JobType, []byte(n.Payload), n.MaxAttempts, n.ExecutionTimeoutSeconds, scheduledAt, blocked, blockedEligibleAt,
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, scheduled_at, eligible_at)
+		VALUES ($1, $9, $2, $3, 'QUEUED', $4, $5, $6, CASE WHEN $7 THEN $8 ELSE COALESCE($6, now()) END)`,
+		jobID, n.JobType, []byte(n.Payload), n.MaxAttempts, n.ExecutionTimeoutSeconds, scheduledAt, blocked, blockedEligibleAt, principalID,
 	)
 	return err
 }
@@ -203,15 +212,23 @@ func insertWorkflowNodeJob(ctx context.Context, tx *sql.Tx, jobID uuid.UUID, n w
 // instance and all of its nodes (each joined with its underlying job's
 // current state), or ErrNotFound if no such workflow exists. Like
 // GetByID, this is a plain read: no locking, no side effects.
-func (s *Store) GetWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error) {
+//
+// Phase 12 (docs/phase-12-plan.md §4a): scoped to authz's principal by the
+// same single-statement predicate GetByID uses. A workflow that exists but
+// belongs to a different, non-admin principal is ErrNotFound -- identical
+// to a workflow id that has never existed. Because the nodes are loaded
+// only after this instance row matches, a non-owned workflow's node list
+// is never read either.
+func (s *Store) GetWorkflow(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*workflow.Instance, error) {
 	var inst workflow.Instance
 	var state string
 	var cancelReqAt, terminalAt sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, state, cancel_requested, cancel_requested_at, created_at, updated_at, terminal_at
-		FROM workflow_instances WHERE id = $1`, id,
-	).Scan(&inst.ID, &state, &inst.CancelRequested, &cancelReqAt, &inst.CreatedAt, &inst.UpdatedAt, &terminalAt)
+		SELECT id, principal_id, state, cancel_requested, cancel_requested_at, created_at, updated_at, terminal_at
+		FROM workflow_instances WHERE id = $1 AND `+workflowPrincipalScopeClause(2, 3),
+		append([]any{id}, scopeArgs(authz)...)...,
+	).Scan(&inst.ID, &inst.PrincipalID, &state, &inst.CancelRequested, &cancelReqAt, &inst.CreatedAt, &inst.UpdatedAt, &terminalAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -315,13 +332,31 @@ func loadWorkflowNodes(ctx context.Context, q nodeQuerier, workflowID uuid.UUID)
 // If the workflow is already terminal, this is an idempotent no-op that
 // reports the workflow's actual current state, mirroring
 // docs/worker-protocol.md's job-level cancel contract.
-func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error) {
+//
+// Phase 12 (docs/phase-12-plan.md §7): the ownership predicate is on this
+// method's FIRST statement -- the cancel_requested UPDATE -- and again on
+// the GetWorkflow read that immediately follows it. A workflow belonging
+// to a different, non-admin principal therefore matches neither: the
+// UPDATE affects zero rows, GetWorkflow returns ErrNotFound, and the
+// method returns before the per-node cancellation loop is reached at all.
+// That ordering is what makes the workflow-level check gate its nodes: a
+// non-owned workflow's node jobs are never touched, not merely its
+// top-level row.
+//
+// authz is threaded into the per-node CancelQueuedOrRetryWait/
+// RequestCancellation calls rather than being replaced with an
+// unrestricted context, so the node-level statements carry the same
+// predicate as the workflow-level one. Because CreateWorkflow writes one
+// principal_id across the instance and every node job in a single
+// transaction, an owner's authz always matches its own nodes.
+func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*workflow.Instance, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE workflow_instances
 		SET cancel_requested = true,
 			cancel_requested_at = COALESCE(cancel_requested_at, now()),
 			updated_at = now()
-		WHERE id = $1 AND state = 'RUNNING'`, id)
+		WHERE id = $1 AND state = 'RUNNING' AND `+workflowPrincipalScopeClause(2, 3),
+		append([]any{id}, scopeArgs(authz)...)...)
 	if err != nil {
 		return nil, fmt.Errorf("store: cancel workflow %s: record request: %w", id, err)
 	}
@@ -329,7 +364,7 @@ func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Ins
 		s.logger.Info("workflow cancellation requested", "event", "workflow_cancellation_requested", "workflow_id", id.String())
 	}
 
-	inst, err := s.GetWorkflow(ctx, id)
+	inst, err := s.GetWorkflow(ctx, id, authz)
 	if err != nil {
 		return nil, err
 	}
@@ -340,17 +375,17 @@ func (s *Store) CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Ins
 	for _, n := range inst.Nodes {
 		switch n.JobState {
 		case jobstate.Queued, jobstate.RetryWait:
-			if _, cerr := s.CancelQueuedOrRetryWait(ctx, n.JobID); cerr != nil && !errors.Is(cerr, ErrStaleTransition) {
+			if _, cerr := s.CancelQueuedOrRetryWait(ctx, n.JobID, authz); cerr != nil && !errors.Is(cerr, ErrStaleTransition) {
 				return nil, fmt.Errorf("store: cancel workflow %s: node %q: %w", id, n.NodeKey, cerr)
 			}
 		case jobstate.Running:
-			if _, cerr := s.RequestCancellation(ctx, n.JobID); cerr != nil && !errors.Is(cerr, ErrStaleTransition) {
+			if _, cerr := s.RequestCancellation(ctx, n.JobID, authz); cerr != nil && !errors.Is(cerr, ErrStaleTransition) {
 				return nil, fmt.Errorf("store: cancel workflow %s: node %q: %w", id, n.NodeKey, cerr)
 			}
 		}
 	}
 
-	return s.GetWorkflow(ctx, id)
+	return s.GetWorkflow(ctx, id, authz)
 }
 
 // dependentNode is one direct dependent discovered by dependentsOf: its

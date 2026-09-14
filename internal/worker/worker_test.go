@@ -41,6 +41,7 @@ func TestRunOnce_SF001_NormalSuccess(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.succeed",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -56,7 +57,7 @@ func TestRunOnce_SF001_NormalSuccess(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, 1, final.AttemptCount)
@@ -71,6 +72,7 @@ func TestRunOnce_FailurePath(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.fail",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -86,7 +88,7 @@ func TestRunOnce_FailurePath(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.Equal(t, 1, final.AttemptCount)
@@ -104,6 +106,7 @@ func TestRunOnce_NoHandlerRegistered(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.unregistered",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -118,7 +121,7 @@ func TestRunOnce_NoHandlerRegistered(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.NotNil(t, final.LastError)
@@ -148,6 +151,7 @@ func TestRunOnce_HandlerRecordsExactlyOneExecution(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.recorded",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,

@@ -63,6 +63,7 @@ func TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive(t *testing.T) {
 	// the handler open for less than the same value (the execution-
 	// timeout ceiling) so it is never at risk of firing.
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.longrunning",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -92,7 +93,7 @@ func TestRunOnce_LongRunningJob_HeartbeatKeepsLeaseAlive(t *testing.T) {
 	require.NoError(t, runErr)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, int64(1), final.LeaseGeneration, "lease_generation must not have advanced: no spurious reclaim occurred")
@@ -113,6 +114,7 @@ func TestRunOnce_LeaseLostDuringExecution_SkipsCompletion(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.lease.lost",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -168,7 +170,7 @@ func TestRunOnce_LeaseLostDuringExecution_SkipsCompletion(t *testing.T) {
 	// generation 1 finalized as LEASE_EXPIRED (by the reclaim), not
 	// SUCCEEDED (which is what worker-1 would have recorded had it
 	// wrongly completed against a fenced-out generation).
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, int64(2), final.LeaseGeneration)
@@ -185,6 +187,7 @@ func TestRunOnce_HeartbeatGoroutineDoesNotLeak(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.goroutine.leak",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -205,7 +208,7 @@ func TestRunOnce_HeartbeatGoroutineDoesNotLeak(t *testing.T) {
 	after := pollGoroutineCount(t, before, 2*time.Second)
 	require.LessOrEqual(t, after, before, "RunOnce must not leave a heartbeat goroutine running after it returns")
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 }
@@ -241,6 +244,7 @@ func TestRunOnce_ContextCancellationStopsHeartbeatDeterministically(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 
 	_, err := s.Insert(context.Background(), job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.ctx.cancel",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -297,6 +301,7 @@ func TestRun_MultipleWorkersProcessSharedJobPool(t *testing.T) {
 
 	for i := 0; i < numJobs; i++ {
 		_, err := s.Insert(context.Background(), job.NewParams{
+			PrincipalID:             testPrincipalID,
 			JobType:                 "test.multiworker",
 			Payload:                 json.RawMessage(`{}`),
 			MaxAttempts:             5,

@@ -59,6 +59,7 @@ func TestChaos_ResponseLossDuplicateSubmission_SeededConcurrentRetries(t *testin
 						<-start
 						k := key
 						created, _, err := s.InsertIdempotent(ctx, job.NewParams{
+							PrincipalID:             testPrincipalID,
 							JobType:                 "chaos.idempotency",
 							Payload:                 []byte(`{}`),
 							MaxAttempts:             3,

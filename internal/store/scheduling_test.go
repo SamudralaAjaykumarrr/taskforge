@@ -43,6 +43,7 @@ func forceSetScheduledEligibility(t *testing.T, db *sql.DB, jobID uuid.UUID, del
 
 func newScheduledJobParams(jobType string, scheduledAt *time.Time) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -95,7 +96,7 @@ func TestInsertIdempotent_FutureScheduledAt_DurablyRecordedAndNotClaimable(t *te
 
 	// Re-read to prove the row itself (not just the claim query) shows no
 	// side effect from the rejected claim attempt.
-	reread, err := s.GetByID(ctx, created.ID)
+	reread, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Queued, reread.State)
 	require.Equal(t, int64(0), reread.LeaseGeneration)
@@ -182,7 +183,7 @@ func TestInsertIdempotent_ScheduledJob_CancelledBeforeEligibility_NeverExecutes(
 	created, err := s.Insert(ctx, newScheduledJobParams("test.sched.cancel", &future))
 	require.NoError(t, err)
 
-	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID)
+	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cancelled.State)
 	require.NotNil(t, cancelled.TerminalAt)
@@ -197,7 +198,7 @@ func TestInsertIdempotent_ScheduledJob_CancelledBeforeEligibility_NeverExecutes(
 	require.NoError(t, err)
 	require.False(t, ok, "a cancelled job must never be claimed, even past its original eligible_at")
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, final.State)
 }

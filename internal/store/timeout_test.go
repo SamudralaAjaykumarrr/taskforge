@@ -20,6 +20,7 @@ import (
 
 func newTimeoutJobParams(jobType string, maxAttempts int) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             maxAttempts,
@@ -139,7 +140,7 @@ func TestCompleteTimeout_RacesCancellation_FirstCommitWins(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	// Cancellation acknowledgement commits first.
@@ -152,7 +153,7 @@ func TestCompleteTimeout_RacesCancellation_FirstCommitWins(t *testing.T) {
 	_, err = s.CompleteTimeout(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration, time.Second)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, final.State)
 }
@@ -170,7 +171,7 @@ func TestCompleteTimeout_RollbackLeavesRowUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	before, err := s.GetByID(bgCtx, created.ID)
+	before, err := s.GetByID(bgCtx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	cancelledCtx, cancel := context.WithCancel(bgCtx)
@@ -179,7 +180,7 @@ func TestCompleteTimeout_RollbackLeavesRowUnchanged(t *testing.T) {
 	_, err = s.CompleteTimeout(cancelledCtx, claimed.ID, "worker-1", claimed.LeaseGeneration, time.Second)
 	require.Error(t, err)
 
-	after, err := s.GetByID(bgCtx, created.ID)
+	after, err := s.GetByID(bgCtx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, before.State, after.State)
 	require.Equal(t, before.Version, after.Version)

@@ -424,7 +424,7 @@ func TestStress_SF008_FencingHoldsUnderSustainedConcurrentCompletionAttempts(t *
 	}
 
 	for _, c := range final {
-		got, err := s.GetByID(ctx, mustParseUUID(t, c.jobID))
+		got, err := s.GetByID(ctx, mustParseUUID(t, c.jobID), testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.Succeeded, got.State)
 		require.Equal(t, c.generation, got.LeaseGeneration, "the job's final generation must be the legitimate one, untouched by any stale writer")
@@ -678,7 +678,7 @@ func TestStress_ConcurrentSweepOfManyExhaustedExpiredLeases_NoDoubleDeadLetter(t
 	require.Equal(t, int64(0), totalClaims, "an attempt-exhausted expired lease must never be reclaimed, only swept (TF-INV-006)")
 
 	for _, id := range jobIDs {
-		final, err := s.GetByID(ctx, mustParseUUID(t, id))
+		final, err := s.GetByID(ctx, mustParseUUID(t, id), testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.DeadLettered, final.State)
 		require.NotNil(t, final.TerminalAt)
@@ -855,7 +855,7 @@ func TestStress_RandomizedCrashRetrySucceed_RepeatedSeeds_InvariantsHold(t *test
 			// and DEAD_LETTERED only happened at or above max_attempts.
 			for _, idStr := range jobIDs {
 				id := mustParseUUID(t, idStr)
-				final, err := s.GetByID(ctx, id)
+				final, err := s.GetByID(ctx, id, testAccess)
 				require.NoError(t, err)
 				require.True(t, final.IsTerminal(), "job %s did not reach a terminal state (TF-INV-004: nothing may be stranded)", idStr)
 				require.LessOrEqual(t, final.AttemptCount, maxAttempts, "TF-INV-006: attempt_count must never exceed max_attempts")

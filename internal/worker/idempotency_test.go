@@ -54,6 +54,7 @@ func TestSF004_DuplicateExecutionWithoutIdempotency_EffectRunsTwice(t *testing.T
 	ctx := context.Background()
 
 	_, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.sf004.noidem",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -126,6 +127,7 @@ func TestSF004Companion_JobIDKeyedDedupTable_AvoidsDuplicateLogicalEffect(t *tes
 	})
 
 	_, err = s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.sf004.idem",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -189,6 +191,7 @@ func TestIdempotencyIdentity_JobIDStableAcrossReclaim(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.identity.reclaim",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -223,6 +226,7 @@ func TestIdempotencyIdentity_JobIDStableAcrossRetry(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.identity.retry",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -239,7 +243,7 @@ func TestIdempotencyIdentity_JobIDStableAcrossRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	mid, err := s.GetByID(ctx, created.ID)
+	mid, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, mid.State)
 	forceSetEligibleAtWT(t, db, created.ID, -time.Second)
@@ -248,7 +252,7 @@ func TestIdempotencyIdentity_JobIDStableAcrossRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 

@@ -18,6 +18,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 )
 
 // Store is a PostgreSQL-backed job repository.
@@ -78,11 +79,61 @@ func New(db *sql.DB, opts ...Option) *Store {
 // share a column name (e.g. "id"). Qualifying unconditionally keeps a
 // single column list usable by every query in this file.
 const jobColumns = `
-	jobs.id, jobs.job_type, jobs.payload, jobs.state, jobs.priority, jobs.created_at, jobs.updated_at, jobs.eligible_at,
+	jobs.id, jobs.principal_id, jobs.job_type, jobs.payload, jobs.state, jobs.priority, jobs.created_at, jobs.updated_at, jobs.eligible_at,
 	jobs.scheduled_at, jobs.lease_owner, jobs.lease_generation, jobs.lease_expires_at, jobs.heartbeat_at,
 	jobs.attempt_count, jobs.max_attempts, jobs.execution_timeout_seconds, jobs.cancel_requested,
 	jobs.cancel_requested_at, jobs.idempotency_key, jobs.last_error, jobs.last_error_class,
 	jobs.result_metadata, jobs.terminal_at, jobs.version`
+
+// principalScopeClause is Phase 12's ownership predicate
+// (docs/phase-12-plan.md §4a), rendered for the two positional parameters
+// an authz value binds. It is appended to the WHERE clause of every
+// statement that reads or mutates a caller-owned row, so authorization is
+// part of the same statement that does the work rather than a separate
+// check preceding it.
+//
+// Why this shape, and not a handler-level "read the row, check the owner,
+// then call the existing store method":
+//
+//   - Every mutating cancellation path in this package is a fenced,
+//     conditional UPDATE whose WHERE clause already carries every
+//     condition that must hold for the operation to be valid (id, state,
+//     and for worker-side calls lease_owner/lease_generation) -- the
+//     idiom ADR-0002 and TF-INV-003/010/014 are built on. Adding
+//     principal_id is one more predicate on that same statement.
+//   - A handler-level pre-check would reintroduce exactly the
+//     check-then-act TOCTOU window this codebase deliberately avoids (see
+//     idempotency.go: the idempotency guarantee is real specifically
+//     because the INSERT is attempted directly, never a check-then-act
+//     read). Worse, internal/api.CancelJob's first action is already a
+//     MUTATING call -- so a pre-check placed "before writing the
+//     response" would have let an unauthorized cancel flip
+//     cancel_requested on another principal's RUNNING job before any
+//     ownership check ran.
+//   - It makes "found but not yours" and "does not exist" the same
+//     outcome by construction, at the SQL level: neither matches, so both
+//     produce ErrNotFound/ErrStaleTransition through the identical code
+//     path. No handler needs to remember to collapse them, and there is
+//     no second error type to keep in sync (G2, verification point 9).
+//
+// The admin bypass is bound as a boolean parameter rather than branching
+// into a second query, so there is exactly one statement per operation
+// regardless of who is calling.
+func principalScopeClause(isAdminParam, principalParam int) string {
+	return fmt.Sprintf("($%d::boolean OR jobs.principal_id = $%d)", isAdminParam, principalParam)
+}
+
+// workflowPrincipalScopeClause is principalScopeClause's counterpart for
+// statements against workflow_instances.
+func workflowPrincipalScopeClause(isAdminParam, principalParam int) string {
+	return fmt.Sprintf("($%d::boolean OR workflow_instances.principal_id = $%d)", isAdminParam, principalParam)
+}
+
+// scopeArgs returns the two positional arguments principalScopeClause and
+// workflowPrincipalScopeClause consume, in order.
+func scopeArgs(authz principal.AccessContext) []any {
+	return []any{authz.IsAdmin, authz.PrincipalID}
+}
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface {
@@ -117,7 +168,7 @@ type jobScanFields struct {
 
 func (f *jobScanFields) dest() []any {
 	return []any{
-		&f.j.ID, &f.j.JobType, &f.j.Payload, &f.state, &f.j.Priority, &f.j.CreatedAt, &f.j.UpdatedAt, &f.j.EligibleAt,
+		&f.j.ID, &f.j.PrincipalID, &f.j.JobType, &f.j.Payload, &f.state, &f.j.Priority, &f.j.CreatedAt, &f.j.UpdatedAt, &f.j.EligibleAt,
 		&f.scheduledAt, &f.leaseOwner, &f.j.LeaseGeneration, &f.leaseExpiresAt, &f.heartbeatAt,
 		&f.j.AttemptCount, &f.j.MaxAttempts, &f.j.ExecutionTimeoutSeconds, &f.j.CancelRequested,
 		&f.cancelReqAt, &f.idempotencyKey, &f.lastError, &f.lastErrorClass,
@@ -186,10 +237,19 @@ func (s *Store) Insert(ctx context.Context, p job.NewParams) (*job.Job, error) {
 	return j, err
 }
 
-// GetByID returns the current durable row for id. It is a plain read: no
-// locking, no side effects.
-func (s *Store) GetByID(ctx context.Context, id uuid.UUID) (*job.Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id = $1`, id)
+// GetByID returns the current durable row for id, scoped to authz's
+// principal. It is a plain read: no locking, no side effects.
+//
+// Phase 12: a row that exists but belongs to a different, non-admin
+// principal does not match this statement's WHERE clause, so it is
+// reported as ErrNotFound -- byte-for-byte the same outcome, through the
+// same code path, as an id that has never existed (G2, verification point
+// 9). An admin principal (principal.KindAdmin) matches every row, which is
+// the single documented exception.
+func (s *Store) GetByID(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error) {
+	args := append([]any{id}, scopeArgs(authz)...)
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs WHERE id = $1 AND `+principalScopeClause(2, 3), args...)
 	j, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

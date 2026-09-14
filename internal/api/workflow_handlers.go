@@ -22,6 +22,11 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
+// createWorkflowNodeRequest is one node in a POST /workflows body. Like
+// createJobRequest it deliberately carries no principal_id/tenant_id field
+// and must never gain one (docs/phase-12-plan.md §6a, verification point
+// 6) -- the owning principal is taken once, in CreateWorkflow, from the
+// authenticated AccessContext.
 type createWorkflowNodeRequest struct {
 	NodeKey                 string          `json:"node_key"`
 	JobType                 string          `json:"job_type"`
@@ -131,6 +136,11 @@ func validateWorkflowNodeRequest(req createWorkflowNodeRequest) (workflow.NodeSp
 // guarantee, extended to workflow creation) -- an invalid submission
 // never touches the database and is never acknowledged as created.
 func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
 
 	var req createWorkflowRequest
@@ -149,7 +159,11 @@ func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec := workflow.GraphSpec{Nodes: make([]workflow.NodeSpec, 0, len(req.Nodes))}
+	// PrincipalID is set here, once, from the verified credential --
+	// internal/store.CreateWorkflow writes it to the workflow_instances
+	// row and to every node's underlying jobs row in one transaction, so
+	// a workflow and its nodes are always owned by the same principal.
+	spec := workflow.GraphSpec{PrincipalID: authz.PrincipalID, Nodes: make([]workflow.NodeSpec, 0, len(req.Nodes))}
 	for _, n := range req.Nodes {
 		ns, verr := validateWorkflowNodeRequest(n)
 		if verr != "" {
@@ -171,7 +185,8 @@ func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logger.Info("workflow created", "workflow_id", wf.ID.String(), "node_count", len(wf.Nodes))
+	h.logger.Info("workflow created", "event", "workflow_submitted",
+		"actor", authz.PrincipalID.String(), "workflow_id", wf.ID.String(), "node_count", len(wf.Nodes))
 	writeJSON(w, http.StatusCreated, toWorkflowResponse(wf))
 }
 
@@ -179,7 +194,18 @@ func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 // read against durable state -- no locking, no side effects -- covering
 // both the workflow_instances row and every node's current, live job
 // state (joined fresh on every call, never cached).
+//
+// Phase 12: principal-scoped in SQL. Another principal's workflow is
+// ErrNotFound from the store and reported through the same branch as a
+// nonexistent id, so the 404 is byte-identical -- and because the instance
+// row must match before its nodes are loaded, a non-owned workflow's node
+// list (which would disclose job ids and job types) is never read.
 func (h *Handlers) GetWorkflow(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	idParam := r.PathValue("id")
 	id, err := uuid.Parse(idParam)
 	if err != nil {
@@ -187,7 +213,7 @@ func (h *Handlers) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wf, err := h.store.GetWorkflow(r.Context(), id)
+	wf, err := h.store.GetWorkflow(r.Context(), id, authz)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "workflow not found")
 		return
@@ -212,7 +238,18 @@ func (h *Handlers) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 // /workflows/{id} to observe the eventual outcome). Calling this on an
 // already-terminal workflow is an idempotent no-op reporting its actual
 // terminal state.
+//
+// Phase 12 (docs/phase-12-plan.md §7): the ownership predicate sits on
+// internal/store.CancelWorkflow's first statement AND on the read that
+// follows it, so a non-owned workflow returns before the per-node
+// cancellation loop is reached -- its node jobs are never touched, not
+// just its top-level row.
 func (h *Handlers) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	idParam := r.PathValue("id")
 	id, err := uuid.Parse(idParam)
 	if err != nil {
@@ -220,7 +257,7 @@ func (h *Handlers) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wf, err := h.store.CancelWorkflow(r.Context(), id)
+	wf, err := h.store.CancelWorkflow(r.Context(), id, authz)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "workflow not found")
 		return
@@ -230,6 +267,9 @@ func (h *Handlers) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to cancel workflow")
 		return
 	}
+
+	h.logger.Info("workflow cancellation requested", "event", "workflow_cancel_requested",
+		"actor", authz.PrincipalID.String(), "workflow_id", wf.ID.String(), "state", string(wf.State))
 
 	writeJSON(w, http.StatusOK, toWorkflowResponse(wf))
 }

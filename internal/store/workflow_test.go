@@ -33,7 +33,7 @@ func wfNode(key string, deps ...string) workflow.NodeSpec {
 // diamondSpec builds the canonical A -> B, A -> C, B+C -> D diamond this
 // task's quality gate names explicitly.
 func diamondSpec() workflow.GraphSpec {
-	return workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	return workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 		wfNode("C", "A"),
@@ -56,7 +56,7 @@ func TestCreateWorkflow_LinearChain_RootEligibleDependentsBlocked(t *testing.T) 
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 		wfNode("C", "B"),
@@ -95,7 +95,7 @@ func TestCreateWorkflow_AtomicCreation_InvalidGraphNeverPersisted(t *testing.T) 
 
 	// A -> B -> A: a cycle, rejected by workflow.ValidateGraph before any
 	// SQL is issued.
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A", "B"),
 		wfNode("B", "A"),
 	}}
@@ -126,12 +126,12 @@ func TestCreateWorkflow_RollbackLeavesNoPartialState(t *testing.T) {
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, state) VALUES ($1, 'RUNNING')`, workflowID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, principal_id, state) VALUES ($1, $2, 'RUNNING')`, workflowID, testPrincipalID)
 	require.NoError(t, err)
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, eligible_at)
-		VALUES ($1, 'test.rollback', '{}', 'QUEUED', 5, 30, now())`, jobID)
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, eligible_at)
+		VALUES ($1, $2, 'test.rollback', '{}', 'QUEUED', 5, 30, now())`, jobID, testPrincipalID)
 	require.NoError(t, err)
 
 	_, err = tx.ExecContext(ctx, `
@@ -160,7 +160,7 @@ func TestFanOut_AllChildrenIndependentlyEligibleAfterParentSucceeds(t *testing.T
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 		wfNode("C", "A"),
@@ -331,7 +331,7 @@ func TestRetryingPredecessor_DoesNotUnblockDependent(t *testing.T) {
 	s := store.New(db)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 	}}
@@ -378,7 +378,7 @@ func TestDeadLetteredPredecessor_CancelsDependentsTransitively(t *testing.T) {
 	ctx := context.Background()
 
 	// A -> B -> C: dead-lettering A must cascade CANCELLED to both B and C.
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 		wfNode("C", "B"),
@@ -396,19 +396,19 @@ func TestDeadLetteredPredecessor_CancelsDependentsTransitively(t *testing.T) {
 	_, err = s.CompleteFailure(ctx, claimed.ID, "w1", claimed.LeaseGeneration, "boom", "PERMANENT")
 	require.NoError(t, err)
 
-	aAfter, err := s.GetByID(ctx, a.JobID)
+	aAfter, err := s.GetByID(ctx, a.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, aAfter.State)
 
-	bAfter, err := s.GetByID(ctx, b.JobID)
+	bAfter, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, bAfter.State, "B must cascade-cancel when its only predecessor dead-letters")
 
-	cAfter, err := s.GetByID(ctx, c.JobID)
+	cAfter, err := s.GetByID(ctx, c.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cAfter.State, "C must transitively cascade-cancel through B")
 
-	wf, err := s.GetWorkflow(ctx, inst.ID)
+	wf, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Failed, wf.State)
 	require.NotNil(t, wf.TerminalAt)
@@ -418,7 +418,7 @@ func TestDeadLetteredPredecessor_ExhaustionViaRetryPath_CancelsDependents(t *tes
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 	}}
@@ -439,7 +439,7 @@ func TestDeadLetteredPredecessor_ExhaustionViaRetryPath_CancelsDependents(t *tes
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, result.State)
 
-	bAfter, err := s.GetByID(ctx, b.JobID)
+	bAfter, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, bAfter.State, "B must cascade-cancel when A dead-letters via retry exhaustion, not just via CompleteFailure")
 }
@@ -448,7 +448,7 @@ func TestCancelledPredecessor_CancelsDependents(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 	}}
@@ -457,10 +457,10 @@ func TestCancelledPredecessor_CancelsDependents(t *testing.T) {
 	a, b := nodeByKey(t, inst, "A"), nodeByKey(t, inst, "B")
 
 	// A is QUEUED, not yet claimed: direct cancellation.
-	_, err = s.CancelQueuedOrRetryWait(ctx, a.JobID)
+	_, err = s.CancelQueuedOrRetryWait(ctx, a.JobID, testAccess)
 	require.NoError(t, err)
 
-	bAfter, err := s.GetByID(ctx, b.JobID)
+	bAfter, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, bAfter.State, "B must cascade-cancel when A is cancelled directly, per docs/workflows.md's Failure Propagation table")
 }
@@ -485,7 +485,7 @@ func TestWorkflowState_SucceedsWhenEveryNodeSucceeds(t *testing.T) {
 		completed++
 	}
 
-	wf, err := s.GetWorkflow(ctx, inst.ID)
+	wf, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Succeeded, wf.State)
 	require.NotNil(t, wf.TerminalAt)
@@ -498,7 +498,7 @@ func TestWorkflowState_TerminalCannotReopen(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("solo")}}
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("solo")}}
 	inst, err := s.CreateWorkflow(ctx, spec)
 	require.NoError(t, err)
 	solo := nodeByKey(t, inst, "solo")
@@ -510,14 +510,14 @@ func TestWorkflowState_TerminalCannotReopen(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, j.ID, "w1", j.LeaseGeneration, nil)
 	require.NoError(t, err)
 
-	wf, err := s.GetWorkflow(ctx, inst.ID)
+	wf, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Succeeded, wf.State)
 	terminalAt := *wf.TerminalAt
 
 	// Cancelling an already-succeeded workflow must be a no-op: state and
 	// terminal_at never change.
-	wf2, err := s.CancelWorkflow(ctx, inst.ID)
+	wf2, err := s.CancelWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Succeeded, wf2.State, "a terminal workflow state must never reopen or be overwritten")
 	require.True(t, terminalAt.Equal(*wf2.TerminalAt))
@@ -530,7 +530,7 @@ func TestCancelWorkflow_QueuedAndBlockedNodesCancelledImmediately(t *testing.T) 
 	inst, err := s.CreateWorkflow(ctx, diamondSpec())
 	require.NoError(t, err)
 
-	wf, err := s.CancelWorkflow(ctx, inst.ID)
+	wf, err := s.CancelWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	for _, n := range wf.Nodes {
 		require.Equal(t, jobstate.Cancelled, n.JobState, "node %q", n.NodeKey)
@@ -544,7 +544,7 @@ func TestCancelWorkflow_RunningNodeRequestedNotYetConfirmed(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("solo")}}
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("solo")}}
 	inst, err := s.CreateWorkflow(ctx, spec)
 	require.NoError(t, err)
 	solo := nodeByKey(t, inst, "solo")
@@ -554,7 +554,7 @@ func TestCancelWorkflow_RunningNodeRequestedNotYetConfirmed(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, solo.JobID, j.ID)
 
-	wf, err := s.CancelWorkflow(ctx, inst.ID)
+	wf, err := s.CancelWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Running, wf.State, "workflow stays RUNNING until the RUNNING node's cancellation is acknowledged")
 	n := nodeByKey(t, &workflow.Instance{Nodes: wf.Nodes}, "solo")
@@ -564,7 +564,7 @@ func TestCancelWorkflow_RunningNodeRequestedNotYetConfirmed(t *testing.T) {
 	_, err = s.CompleteCancelled(ctx, j.ID, "w1", j.LeaseGeneration)
 	require.NoError(t, err)
 
-	wf2, err := s.GetWorkflow(ctx, inst.ID)
+	wf2, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Cancelled, wf2.State)
 }
@@ -584,7 +584,7 @@ func TestCancelWorkflow_MixedNodeStates(t *testing.T) {
 	ctx := context.Background()
 
 	future := time.Now().Add(time.Hour)
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("retrying"),
 		wfNode("running"),
 		wfNode("done"),
@@ -622,7 +622,7 @@ func TestCancelWorkflow_MixedNodeStates(t *testing.T) {
 	require.True(t, handled[running.JobID])
 	require.True(t, handled[done.JobID])
 
-	wf, err := s.CancelWorkflow(ctx, inst.ID)
+	wf, err := s.CancelWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 
 	byKey := map[string]workflow.Node{}
@@ -636,7 +636,7 @@ func TestCancelWorkflow_MixedNodeStates(t *testing.T) {
 	require.Equal(t, jobstate.Succeeded, byKey["done"].JobState, "already-completed node is untouched")
 
 	// The RUNNING node's job must have cancel_requested set.
-	runningJob, err := s.GetByID(ctx, running.JobID)
+	runningJob, err := s.GetByID(ctx, running.JobID, testAccess)
 	require.NoError(t, err)
 	require.True(t, runningJob.CancelRequested)
 
@@ -656,7 +656,7 @@ func TestStaleGeneration_CannotUnblockDependents(t *testing.T) {
 	s := store.New(db)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("X"),
 		wfNode("Y", "X"),
 	}}
@@ -681,7 +681,7 @@ func TestStaleGeneration_CannotUnblockDependents(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, claimedB.ID, "worker-B", claimedB.LeaseGeneration, nil)
 	require.NoError(t, err)
 
-	yAfterLegit, err := s.GetByID(ctx, y.JobID)
+	yAfterLegit, err := s.GetByID(ctx, y.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Queued, yAfterLegit.State)
 	require.True(t, yAfterLegit.EligibleAt.Before(time.Now().Add(time.Minute)), "Y must be genuinely activated by B's real success")
@@ -693,7 +693,7 @@ func TestStaleGeneration_CannotUnblockDependents(t *testing.T) {
 
 	// X's state (from B) and Y's activation are unaffected by A's
 	// rejected call.
-	xFinal, err := s.GetByID(ctx, x.JobID)
+	xFinal, err := s.GetByID(ctx, x.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, xFinal.State)
 	require.Equal(t, claimedB.LeaseGeneration, xFinal.LeaseGeneration)
@@ -709,7 +709,7 @@ func TestStaleGeneration_LateFailureCannotCancelDependents(t *testing.T) {
 	s := store.New(db)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("X"),
 		wfNode("Y", "X"),
 	}}
@@ -735,7 +735,7 @@ func TestStaleGeneration_LateFailureCannotCancelDependents(t *testing.T) {
 	_, err = s.CompleteFailure(ctx, x.JobID, "worker-A", staleGen, "too late", "PERMANENT")
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	yAfter, err := s.GetByID(ctx, y.JobID)
+	yAfter, err := s.GetByID(ctx, y.JobID, testAccess)
 	require.NoError(t, err)
 	require.NotEqual(t, jobstate.Cancelled, yAfter.State, "Y must not be cancelled by a rejected stale failure report")
 }
@@ -772,7 +772,7 @@ func TestRestart_WorkflowProgressSurvivesFreshStoreInstance(t *testing.T) {
 	require.True(t, claimedIDs[b.JobID])
 	require.True(t, claimedIDs[c.JobID])
 
-	wf, err := s2.GetWorkflow(ctx, inst.ID)
+	wf, err := s2.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Running, wf.State)
 }
@@ -782,7 +782,7 @@ func TestSchedulingInteraction_ActivationRespectsFutureSchedule(t *testing.T) {
 	ctx := context.Background()
 
 	future := time.Now().Add(time.Hour)
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 	}}
@@ -804,7 +804,7 @@ func TestSchedulingInteraction_ActivationRespectsFutureSchedule(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok, "B must wait for its own scheduled_at even though its dependency is satisfied")
 
-	bJob, err := s.GetByID(ctx, b.JobID)
+	bJob, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 	require.WithinDuration(t, future, bJob.EligibleAt, time.Second, "activation must set eligible_at to the node's own scheduled_at, not now()")
 }
@@ -814,7 +814,7 @@ func TestSchedulingInteraction_PastScheduleActivatesImmediately(t *testing.T) {
 	ctx := context.Background()
 
 	past := time.Now().Add(-time.Hour)
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B", "A"),
 	}}
@@ -840,7 +840,7 @@ func TestGetWorkflow_NotFound(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.GetWorkflow(ctx, uuid.New())
+	_, err := s.GetWorkflow(ctx, uuid.New(), testAccess)
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -848,7 +848,7 @@ func TestCancelWorkflow_NotFound(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.CancelWorkflow(ctx, uuid.New())
+	_, err := s.CancelWorkflow(ctx, uuid.New(), testAccess)
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -877,7 +877,7 @@ func TestMultiWorker_FanOutClaimedSafelyUnderContention(t *testing.T) {
 	for i := 0; i < fanOut; i++ {
 		nodes = append(nodes, wfNode(uuid.New().String(), "root"))
 	}
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: nodes})
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: nodes})
 	require.NoError(t, err)
 	root := nodeByKey(t, inst, "root")
 
@@ -924,7 +924,7 @@ func TestCreateWorkflow_MissingDependencyRejectedByStore(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("A", "ghost")}})
+	_, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("A", "ghost")}})
 	require.Error(t, err)
 	require.ErrorIs(t, err, workflow.ErrUnknownDependency)
 }
@@ -933,7 +933,7 @@ func TestCreateWorkflow_DuplicateNodeKeyRejectedByStore(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("A")}})
+	_, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("A")}})
 	require.Error(t, err)
 	require.ErrorIs(t, err, workflow.ErrDuplicateNodeKey)
 }
@@ -948,7 +948,7 @@ func TestMixedRetryAndSuccess_FanInWaitsForBothOutcomes(t *testing.T) {
 	s := store.New(db)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		wfNode("A"),
 		wfNode("B"),
 		wfNode("D", "A", "B"),
@@ -1016,7 +1016,7 @@ func TestFaultInjection_SuccessAndPropagationRollbackTogether(t *testing.T) {
 	s := store.New(db)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A")}}
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A")}}
 	inst, err := s.CreateWorkflow(ctx, spec)
 	require.NoError(t, err)
 	a, b := nodeByKey(t, inst, "A"), nodeByKey(t, inst, "B")
@@ -1026,9 +1026,9 @@ func TestFaultInjection_SuccessAndPropagationRollbackTogether(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, a.JobID, claimed.ID)
 
-	beforeA, err := s.GetByID(ctx, a.JobID)
+	beforeA, err := s.GetByID(ctx, a.JobID, testAccess)
 	require.NoError(t, err)
-	beforeB, err := s.GetByID(ctx, b.JobID)
+	beforeB, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -1055,9 +1055,9 @@ func TestFaultInjection_SuccessAndPropagationRollbackTogether(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, tx.Rollback())
 
-	afterA, err := s.GetByID(ctx, a.JobID)
+	afterA, err := s.GetByID(ctx, a.JobID, testAccess)
 	require.NoError(t, err)
-	afterB, err := s.GetByID(ctx, b.JobID)
+	afterB, err := s.GetByID(ctx, b.JobID, testAccess)
 	require.NoError(t, err)
 
 	require.Equal(t, beforeA.State, afterA.State, "A must remain RUNNING -- the success decision must not survive a rolled-back transaction")
@@ -1090,7 +1090,7 @@ func TestCancelWorkflow_RaceLostByCancellation_WorkflowStaysSucceeded(t *testing
 	s := newStore(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("solo")}}
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("solo")}}
 	inst, err := s.CreateWorkflow(ctx, spec)
 	require.NoError(t, err)
 	solo := nodeByKey(t, inst, "solo")
@@ -1101,7 +1101,7 @@ func TestCancelWorkflow_RaceLostByCancellation_WorkflowStaysSucceeded(t *testing
 	require.Equal(t, solo.JobID, j.ID)
 
 	// Cancellation is requested while the node is RUNNING...
-	wf, err := s.CancelWorkflow(ctx, inst.ID)
+	wf, err := s.CancelWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Running, wf.State)
 	require.True(t, wf.CancelRequested)
@@ -1112,11 +1112,11 @@ func TestCancelWorkflow_RaceLostByCancellation_WorkflowStaysSucceeded(t *testing
 	_, err = s.CompleteSuccess(ctx, j.ID, "w1", j.LeaseGeneration, nil)
 	require.NoError(t, err)
 
-	final, err := s.GetByID(ctx, solo.JobID)
+	final, err := s.GetByID(ctx, solo.JobID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 
-	wfFinal, err := s.GetWorkflow(ctx, inst.ID)
+	wfFinal, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Succeeded, wfFinal.State, "a workflow whose cancellation lost every race must be SUCCEEDED, never CANCELLED, once every node has actually succeeded")
 }
@@ -1146,7 +1146,7 @@ func TestLargeDAG_ExecutesCorrectlyUnderMultipleWorkers(t *testing.T) {
 	// A final sink depending on the last layer (fan-in of perLayer nodes).
 	nodes = append(nodes, wfNode("sink", prevLayer...))
 
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: nodes})
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: nodes})
 	require.NoError(t, err)
 	require.Len(t, inst.Nodes, 1+layers*perLayer+1)
 
@@ -1213,7 +1213,7 @@ func TestLargeDAG_ExecutesCorrectlyUnderMultipleWorkers(t *testing.T) {
 		require.Equal(t, 1, n, "job %s claimed %d times", id, n)
 	}
 
-	wf, err := s.GetWorkflow(ctx, inst.ID)
+	wf, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, workflow.Succeeded, wf.State)
 	for _, n := range wf.Nodes {

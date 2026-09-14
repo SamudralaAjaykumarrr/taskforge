@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -177,7 +178,7 @@ func InsertTx(ctx context.Context, tx pgx.Tx, p job.NewParams) (*job.Job, bool, 
 		return nil, false, fmt.Errorf("store: insert job (tx): rollback to savepoint: %w", rerr)
 	}
 
-	existing, gerr := getByIdempotencyKeyTx(ctx, tx, p.JobType, *p.IdempotencyKey)
+	existing, gerr := getByIdempotencyKeyTx(ctx, tx, p.PrincipalID, p.JobType, *p.IdempotencyKey)
 	if gerr != nil {
 		if errors.Is(gerr, ErrNotFound) {
 			// The INSERT lost a uniqueness race against a row some other,
@@ -210,8 +211,10 @@ func InsertTx(ctx context.Context, tx pgx.Tx, p job.NewParams) (*job.Job, bool, 
 // durably committed, but this transaction's fixed snapshot predates that
 // commit and cannot see it" rather than "no such job" -- see
 // ErrTransactionRetry's doc comment.
-func getByIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, jobType, key string) (*job.Job, error) {
-	row := tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE job_type = $1 AND idempotency_key = $2`, jobType, key)
+func getByIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, principalID uuid.UUID, jobType, key string) (*job.Job, error) {
+	row := tx.QueryRow(ctx,
+		`SELECT `+jobColumns+` FROM jobs WHERE principal_id = $1 AND job_type = $2 AND idempotency_key = $3`,
+		principalID, jobType, key)
 	j, err := scanJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

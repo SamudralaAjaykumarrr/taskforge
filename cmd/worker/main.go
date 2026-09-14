@@ -121,13 +121,33 @@ func run(logger *slog.Logger) error {
 	defer stop()
 
 	if cfg.MetricsAddr != "" {
+		// This listener is UNAUTHENTICATED, deliberately and as documented
+		// (docs/security-model.md §5, docs/observability.md). Phase 12
+		// added credential authentication to cmd/api's GET /metrics but
+		// NOT here, because verifying an API key requires reading the
+		// principals/api_keys tables and OD-3 plus
+		// deploy/postgres-roles.sql deliberately deny taskforge_worker any
+		// access to them. Protecting a metrics endpoint by dissolving the
+		// worker trust boundary would be a bad trade.
+		//
+		// The control is therefore a deployment obligation, in the same
+		// category as the external TLS boundary: bind or firewall
+		// TASKFORGE_METRICS_ADDR to a private, operator-controlled network
+		// reachable only by the Prometheus scraper. This process cannot
+		// verify that from the inside and does not claim to.
+		//
+		// It exposes operational volume (submission/completion/dead-letter
+		// rates and queue-depth gauges), never a payload, a credential, or
+		// any per-tenant identifier -- metric labels are cardinality-safe
+		// and audited (docs/observability.md's Cardinality Policy).
 		metricsSrv := &http.Server{
 			Addr:              cfg.MetricsAddr,
 			Handler:           promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		go func() {
-			logger.Info("worker metrics endpoint listening", "addr", cfg.MetricsAddr)
+			logger.Info("worker metrics endpoint listening (unauthenticated; restrict to a private network)",
+				"addr", cfg.MetricsAddr)
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("worker metrics endpoint exited with error", "error", err)
 			}

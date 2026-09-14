@@ -31,6 +31,17 @@ designed" from "silently degraded" for a specific failure mode in
 | `taskforge_active_workers` | gauge | Distinct `lease_owner` values with a `heartbeat_at` within the last lease-extension interval. |
 | `taskforge_heartbeats_total` | counter | Raw heartbeat volume — used to detect heartbeat-interval misconfiguration relative to lease TTL. |
 | `taskforge_idempotent_submission_hits_total` | counter | Count of `POST /jobs` calls that resolved to an existing row via idempotency key rather than creating a new one — validates that `Idempotency-Key` usage is actually happening when expected. |
+| `taskforge_auth_failures_total` (Phase 12) | counter, labeled by `reason` (`malformed`/`unknown_key`/`revoked`/`expired`/`bad_secret`/`principal_revoked`/`internal_error`) | HTTP requests rejected by authentication, broken down by why. This is the **server-side** half of a deliberate split: the caller always receives one uniform `401` body regardless of reason, so no client can enumerate which `key_id`s exist or which have been retired, while an operator still gets the breakdown needed to tell "someone is stuffing credentials" apart from "one deployment is still using a rotated-out key." `internal_error` is a deliberately separate bucket so a database outage is never reported as, or mistaken for, a credential problem. |
+
+**`taskforge_auth_failures_total` is not a rate limiter, and is not an input
+to one.** Automated brute-force lockout, IP throttling, and exponential
+backoff are explicit Phase 13 deferrals ([phase-12-plan.md](phase-12-plan.md)
+§3, with the reasoning: this credential is a 256-bit random secret, not a
+guessable password, so the online-guessing threat model differs
+qualitatively from a login form). This counter is the observability Phase 12
+provides *in place of* those controls — a signal for an operator to react
+manually or via their own edge/WAF tooling, not a claim the problem is
+solved.
 
 ## Structured Logs
 
@@ -50,6 +61,49 @@ applicable), `lease_generation` (if applicable). Key events to log:
   if it becomes frequent.
 - Job dead-lettered (`last_error`, `attempt_count`).
 - Cancellation requested / cancellation race outcome (which side won).
+- **Authentication rejected (Phase 12)**: `event: "auth_failed"`, with the
+  `reason` label above, the request method and path — and **never** the
+  Authorization header, the `key_id`, the secret, or the pepper.
+- **Scope denied (Phase 12)**: `event: "authz_scope_denied"`, with the
+  authenticated `actor` and the `required_scope` that was missing.
+
+### `actor` (Phase 12)
+
+Every **submit and cancel** log line carries an `actor` field holding the
+authenticated principal's ID: `submission`, `duplicate_submission_hit`,
+`cancellation_requested`, `workflow_submitted`, and
+`workflow_cancel_requested`. This closes
+[security-model.md](security-model.md) §5's "no audit log of who
+cancelled/submitted what" gap.
+
+Two deliberate boundaries on it:
+
+- A principal ID is a **non-secret identifier**, and is the only identity
+  value that ever reaches a log line. The credential that proved it — the
+  full `Bearer` value, the `key_id`, or the secret — never appears in any
+  log line, on any success or failure path. A log-output test audits every
+  path in the verification sequence for the raw secret, rather than trusting
+  review.
+- `actor` is **not** added to worker-side lifecycle lines (claim, complete,
+  heartbeat, reclaim). Those are driven by the worker fleet, whose identity
+  is a PostgreSQL role rather than an application principal
+  ([phase-12-plan.md](phase-12-plan.md) OD-3); `worker_id`/`lease_owner`
+  already answer "which worker process," and they remain what they have
+  always been — an unauthenticated, self-reported string, not an
+  authenticated identity. Putting `actor` on those lines would imply an
+  authentication that does not exist.
+
+Note two similarly-named workflow events that are deliberately distinct and
+both retained:
+
+| Event | Emitted by | Meaning |
+|---|---|---|
+| `workflow_submitted` / `workflow_cancel_requested` | `internal/api` | The **caller-facing** action, carrying `actor`. Emitted once per successful API request. |
+| `workflow_created` / `workflow_cancellation_requested` | `internal/store` | The **durable** event. `internal/store` has no notion of an authenticated caller (it is also driven by the worker fleet), so these carry no `actor`, and `workflow_cancellation_requested` fires only when the `UPDATE` actually affected a row — i.e. it is absent for an idempotent no-op against an already-terminal workflow, where the API line is still emitted. |
+
+**Cardinality**: `actor` is a high-cardinality identifier and therefore
+belongs in structured logs only — it is never a metric label, exactly as
+`job_id` and `Idempotency-Key` already are not.
 
 Logs are structured (key-value or JSON), not free-text, so they can be
 queried without vendor-specific log parsing.
@@ -101,6 +155,16 @@ type, or label listed above — those are implemented exactly as specified.
   has no other HTTP server) — no external Prometheus/collector is
   required to run TaskForge or its test suite; the endpoint costs
   nothing if never scraped.
+  **Access control differs between the two, deliberately (Phase 12).**
+  `cmd/api`'s `GET /metrics` is mounted through the same authentication
+  middleware as every other route and requires a credential carrying the
+  `metrics` scope. `cmd/worker`'s listener is **unauthenticated**, and
+  cannot be otherwise in this phase: verifying an API key there would
+  require the worker process to read the `principals`/`api_keys` tables,
+  which the worker trust boundary (OD-3) and `deploy/postgres-roles.sql`
+  explicitly forbid. Restricting that listener to a private,
+  operator-controlled network is a documented deployment obligation — see
+  [security-model.md](security-model.md) §5.
 - **Where metrics are recorded**: entirely inside `internal/store`, the
   single choke point every durable transition already runs through — not
   in `internal/worker` or `internal/api`. This means every metric is

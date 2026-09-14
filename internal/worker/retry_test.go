@@ -54,6 +54,7 @@ func TestRunOnce_RetryableFailure_TransitionsToRetryWait(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.retry.wait",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -69,7 +70,7 @@ func TestRunOnce_RetryableFailure_TransitionsToRetryWait(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, final.State)
 	require.Equal(t, 1, final.AttemptCount)
@@ -87,6 +88,7 @@ func TestRunOnce_PermanentFailure_DeadLettersImmediately(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.permanent",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -102,7 +104,7 @@ func TestRunOnce_PermanentFailure_DeadLettersImmediately(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.Equal(t, 1, final.AttemptCount, "a permanent failure must not consume more than the one attempt it actually made")
@@ -121,6 +123,7 @@ func TestRunOnce_UnclassifiedFailure_DefaultsToPermanent(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.unclassified",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -136,7 +139,7 @@ func TestRunOnce_UnclassifiedFailure_DefaultsToPermanent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State, "an unclassified handler error must default to permanent, not retry forever")
 }
@@ -152,6 +155,7 @@ func TestRunOnce_SF009_RetryableFailureEventuallySucceeds(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.sf009.worker",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -169,7 +173,7 @@ func TestRunOnce_SF009_RetryableFailureEventuallySucceeds(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, claimed)
 
-		mid, err := s.GetByID(ctx, created.ID)
+		mid, err := s.GetByID(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.RetryWait, mid.State)
 		forceSetEligibleAtWT(t, db, created.ID, -time.Second)
@@ -179,7 +183,7 @@ func TestRunOnce_SF009_RetryableFailureEventuallySucceeds(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, 3, final.AttemptCount)
@@ -194,6 +198,7 @@ func TestRunOnce_SF010_RetriesExhaustedDeadLetters(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.sf010.worker",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             3,
@@ -210,7 +215,7 @@ func TestRunOnce_SF010_RetriesExhaustedDeadLetters(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, claimed)
 
-		mid, err := s.GetByID(ctx, created.ID)
+		mid, err := s.GetByID(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 		if attempt < 3 {
 			require.Equal(t, jobstate.RetryWait, mid.State)
@@ -239,6 +244,7 @@ func TestRunOnce_RetryableFailureRejectedAfterLeaseLoss(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.retry.lease.lost",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -284,7 +290,7 @@ func TestRunOnce_RetryableFailureRejectedAfterLeaseLoss(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, completed.State)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State, "worker-1's stale retryable-failure report must not have altered the job")
 	require.Equal(t, int64(2), final.LeaseGeneration)
@@ -300,6 +306,7 @@ func TestRunOnce_RetryPath_HeartbeatGoroutineDoesNotLeak(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.retry.goroutine.leak",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -331,6 +338,7 @@ func TestRunOnce_CustomRetryConfig_UsesFastBackoff(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.retry.fastconfig",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -348,7 +356,7 @@ func TestRunOnce_CustomRetryConfig_UsesFastBackoff(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, final.State)
 	require.True(t, final.EligibleAt.Before(before.Add(5*time.Second)),

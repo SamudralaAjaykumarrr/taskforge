@@ -1,7 +1,25 @@
 # Phase 12 Implementation Plan — Security & Trust Boundaries
 
-Status: **PLANNING ONLY, Revision 2 (post independent architecture review).
-Not implemented. No Go code has been written or changed for this phase.**
+Status: **Revision 3 — IMPLEMENTED, reconciled to the shipped code.**
+Revision 2 was a planning-only document ("no Go code has been written");
+Phase 12 has since been implemented on
+`phase-12-security-trust-boundaries` and reviewed independently twice. This
+revision is **plan-to-implementation reconciliation only**: it corrects the
+places where this document describes something the implementation does not
+do. The architecture is unchanged and **OD-1 through OD-8 are not
+reopened** — every one of them is reflected in the merged code as written.
+
+The one substantive divergence found by review, and the only thing this
+revision changes in substance, is the **migration file layout**: §5 planned
+three files (`0005`–`0007`); the implementation ships six (`0005`–`0010`).
+That split is required by this document's own transaction-boundary finding
+and preserves the approved schema, ordering and guarantees exactly — see
+§5's "Why six files, not three" below. The second independent review
+classified it as an acceptable implementation-level decomposition and
+required this document be brought into line with it before staging, which
+is what this revision does. Locking language throughout has also been
+corrected to match measured PostgreSQL behaviour (§5a).
+
 This document does not redefine Phase 12's scope — that scope remains
 authoritative in [docs/enterprise-roadmap.md](enterprise-roadmap.md)
 ("Phase 12 — Security & Trust Boundaries") and
@@ -341,11 +359,21 @@ Both tables get `principal_id uuid REFERENCES principals(id)`, ending
 ```sql
 -- was (migration 0001): idx_jobs_idempotency_key, UNIQUE (job_type, idempotency_key)
 --   WHERE idempotency_key IS NOT NULL -- confirmed exact name/shape by inspection
+
+-- migration 0009, after that file's VALIDATE CONSTRAINT has run:
 CREATE UNIQUE INDEX idx_jobs_idempotency_scoped
   ON jobs (principal_id, job_type, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
+
+-- migration 0010, in its own transaction (DROP INDEX needs ACCESS EXCLUSIVE;
+-- appending it to 0009 would make that whole transaction queue for the lock):
 DROP INDEX idx_jobs_idempotency_key;
 ```
+
+Both indexes are live between `0009` and `0010`. That window is closed
+within a single `migrate.Up` run, and the stricter (global) constraint is
+the one still enforcing during it, so no cross-tenant collision can slip
+through the gap.
 
 Because `principal_id` is `NOT NULL` by the time this index is created
 (OD-1's resolution — see migration ordering below), there is **no**
@@ -358,7 +386,7 @@ an ordinary tenant-scoped constraint with no special-cased "unscoped" rows
 currently hardcodes the index name `idx_jobs_idempotency_key` and checks
 `pgErr.ConstraintName` against it exactly — this constant **must** be
 updated to `idx_jobs_idempotency_scoped` in the same change that ships
-migration `0007` below, or the Phase 8-era conflict-recovery path in
+migrations `0009`/`0010` below, or the Phase 8-era conflict-recovery path in
 `InsertIdempotent` silently stops recognizing idempotency-key conflicts
 (falls through to the generic `ErrEnqueueFailed`-equivalent path instead
 of the documented re-read-and-return-existing-row behavior) — flagged
@@ -366,56 +394,138 @@ explicitly because it is exactly the kind of single-hardcoded-string
 coupling that is easy to miss when only reading the schema, not the code
 that depends on its exact name.
 
-### Migration file plan (final, next available number: `0005`)
+### Migration file plan (as shipped: `0005`–`0010`)
 
-1. **`0005_create_principals_and_api_keys.{up,down}.sql`** — both new
-   tables (`api_keys` includes `scopes`), plus the system-principal seed
-   row, all in one transaction (the existing `internal/migrate` runner
-   wraps each `.up.sql` in its own transaction — confirmed by
-   `internal/migrate/migrate.go`'s `applyOne`). `down`: drop `api_keys`
-   then `principals` (FK order).
-2. **`0006_add_principal_id_to_jobs_and_workflows.{up,down}.sql`** — adds
-   both columns as **nullable** `REFERENCES principals(id)` + indexes;
-   backfills every existing row to `SystemPrincipalID` in the same
-   transaction (`UPDATE jobs SET principal_id = '000...001' WHERE
-   principal_id IS NULL`, same for `workflow_instances`). Still nullable
-   at the end of this migration — intentionally, to isolate the
-   (data-volume-dependent, potentially slower) backfill step from the
-   constraint-tightening step that follows. `down`: `DROP COLUMN
-   principal_id` on both tables (data-safe: the column and its backfilled
-   values are wholly additive and recoverable by re-running `0006`'s
-   `up` if ever needed).
-3. **`0007_scope_idempotency_and_require_principal.{up,down}.sql`** —
-   the constraint-tightening step, all in one migration per
-   `security-model.md` §7's explicit "must land together, not as a
-   follow-up" requirement:
-   - `ALTER TABLE jobs ADD CONSTRAINT jobs_principal_id_not_null CHECK
-     (principal_id IS NOT NULL) NOT VALID;` followed by `ALTER TABLE jobs
-     VALIDATE CONSTRAINT jobs_principal_id_not_null;` — the `NOT VALID` +
-     `VALIDATE CONSTRAINT` two-step is used deliberately instead of a
-     direct `ALTER COLUMN principal_id SET NOT NULL`: the former takes
-     only a `SHARE UPDATE EXCLUSIVE` lock during validation (does not
-     block concurrent reads/the claim query), the latter takes `ACCESS
-     EXCLUSIVE` for the full table scan — this is exactly the "no
-     migration may lock claim-critical tables for an incompatible
-     duration" discipline `compatibility-policy.md` already states
-     informally (formalized only in Phase 14, but sound practice to
-     follow now, verification point 13). Same treatment for
-     `workflow_instances.principal_id`.
-   - Create `idx_jobs_idempotency_scoped`, drop `idx_jobs_idempotency_key`
-     (shown above).
-   - **`down` is honest, not blanket-safe**: it drops the `NOT NULL`
-     check constraints (cheap, always safe) and *attempts* to recreate
-     `idx_jobs_idempotency_key` in its original global shape. If any
-     post-`0007` data now has two different principals sharing a
-     `(job_type, idempotency_key)` pair — the entire point of this
-     migration having shipped — that `CREATE UNIQUE INDEX` fails with a
-     PostgreSQL uniqueness-violation error, **on purpose**: this down
-     migration is documented as forward-fix-preferred (the same category
-     `compatibility-policy.md`/Phase 14 will formalize as "not
-     data-safe-reversible after real divergent data exists"), and a
-     failing rollback attempt here is correct, not a bug to work around
-     (verification point 13).
+Revision 2 of this document planned three files. The implementation ships
+six. The **schema, ordering, and guarantees are identical**; only the file
+boundaries differ, for the reason in "Why six files, not three" below.
+
+1. **`0005_create_principals_and_api_keys.{up,down}.sql`** — both new tables
+   (`api_keys` includes `scopes`), plus the system-principal seed row, all in
+   one transaction. Also carries the `api_keys_no_system_principal` CHECK
+   constraint, which makes "nothing can authenticate as the system principal"
+   true at the schema level rather than by convention. Purely additive:
+   touches no existing table. `down`: drop `api_keys` then `principals` (FK
+   order).
+2. **`0006_add_principal_id_columns.{up,down}.sql`** — adds
+   `principal_id uuid REFERENCES principals(id)` to `jobs` and
+   `workflow_instances` as **nullable**. Nothing else, deliberately.
+   Catalog-only: `ADD COLUMN` of a nullable column with no default performs no
+   table rewrite and no scan, and the foreign key needs no validation scan
+   because every value in a new column is NULL (measured: ~3 ms on an
+   800k-row / 52 MB table, against ~22 ms for a full scan of it, with the FK
+   recorded `convalidated`). `down`: `DROP COLUMN` on both.
+3. **`0007_backfill_principal_id.{up,down}.sql`** — attributes every
+   pre-Phase-12 row to `SystemPrincipalID`. A bare `UPDATE`, alone in its
+   file, so the one statement whose cost scales with table size runs under
+   `ROW EXCLUSIVE` and blocks neither reads nor writes. `down`: return exactly
+   those rows to NULL.
+4. **`0008_require_principal_id.{up,down}.sql`** — `ADD CONSTRAINT
+   … CHECK (principal_id IS NOT NULL) NOT VALID` on both tables. Catalog-only,
+   no heap access (measured ~1 ms). `down`: drop the constraints.
+5. **`0009_validate_principal_id_and_scope_idempotency.{up,down}.sql`** —
+   `VALIDATE CONSTRAINT` on both tables, then `idx_jobs_principal_id`,
+   `idx_workflow_instances_principal_id`, and `idx_jobs_idempotency_scoped`.
+   The scoped idempotency index is created **after** the validation in the
+   same file, so `principal_id` is provably non-NULL before it exists and
+   there is no NULL-widening window (OD-1). `down`: drop the three indexes.
+6. **`0010_drop_global_idempotency_index.{up,down}.sql`** — drops migration
+   0001's global `idx_jobs_idempotency_key`. Alone in its file because it
+   needs `ACCESS EXCLUSIVE`. `down` is **honest, not blanket-safe**: it
+   attempts to recreate the global index and fails loudly with a PostgreSQL
+   uniqueness violation once two principals genuinely share a
+   `(job_type, idempotency_key)` pair — the entire point of this migration
+   having shipped. That failure is correct: TaskForge cannot choose which
+   tenant's job to discard. Documented as forward-fix-preferred. It is the
+   only Phase 12 `down` that can fail, which is why it is alone: every other
+   rollback step is unconditionally safe and must not be gated on this one.
+
+#### Why six files, not three
+
+This document's own §5 (Revision 2) required the `NOT VALID` +
+`VALIDATE CONSTRAINT` two-step **specifically** so that validation would run
+under `SHARE UPDATE EXCLUSIVE` rather than `ACCESS EXCLUSIVE`. It also
+recorded, correctly, that `internal/migrate`'s `applyOne` wraps every
+`.up.sql` in its own transaction.
+
+Those two facts are incompatible in one file. PostgreSQL releases locks only
+at commit, so `ADD CONSTRAINT`'s `ACCESS EXCLUSIVE` lock would be held across
+the `VALIDATE` scan that follows it in the same transaction — producing
+exactly the blocking the two-step exists to avoid. The same applies to the
+planned `0006`: putting the backfill in the same file as `ADD COLUMN` holds
+`ACCESS EXCLUSIVE` for the backfill's entire, data-volume-dependent duration.
+
+The first implementation did both, and the first independent review measured
+the result: a table-wide outage for the length of the backfill. Splitting is
+what makes this document's stated property achievable, so the six-file layout
+serves §5's intent rather than departing from it:
+
+| Planned file | Shipped as | Why split |
+|---|---|---|
+| `0005` (tables + seed) | `0005` | unchanged |
+| `0006` (columns + backfill) | `0006` columns, `0007` backfill | `ADD COLUMN` takes `ACCESS EXCLUSIVE`; the backfill must not run under it |
+| `0007` (NOT NULL + index swap) | `0008` declare, `0009` validate + build, `0010` drop | `ADD CONSTRAINT` takes `ACCESS EXCLUSIVE`; `VALIDATE` must not run under it. `DROP INDEX` also takes `ACCESS EXCLUSIVE`; appending it to `0009` would make the whole committed-scan transaction queue for that lock and stall readers behind it |
+
+Nothing else changed: same two tables, same seed row, same columns, same
+foreign keys, same validated `NOT NULL` check constraints, same three
+indexes, same idempotency-index swap, same honest fallible rollback, same
+final state. `internal/migrate`'s
+`TestMigrations0005To0010_BackfillLegacyRowsAndConverge` proves the terminal
+state from a genuinely pre-Phase-12 database through the real `migrate.Up`,
+and `TestPhase12Migrations_NoLongRunningStatementSharesAFileWithExclusiveDDL`
+pins the structural rule so a future "tidy-up" cannot merge them back.
+
+### 5a. Locking and deployment semantics, as measured
+
+Revision 2 asserted the split would keep the migrations non-blocking. Two
+independent reviews measured the shipped behaviour and that assertion was
+wrong twice. This section states only what PostgreSQL actually does.
+
+**What the split buys, narrowly**: no `ACCESS EXCLUSIVE` lock is held across
+a full-table scan or a full-table write. That is all. It does **not** make
+the sequence online, non-blocking, or zero-downtime, and no Phase 12
+document may claim otherwise.
+
+| Migration | Locks on `jobs`, held to commit | Long? | Blocks reads? | Blocks writes, incl. the worker claim query? |
+|---|---|---|---|---|
+| `0005` | none on `jobs` | no | no | no |
+| `0006` | `ACCESS EXCLUSIVE` | no (catalog-only) | yes, while held | yes, while held |
+| `0007` | `ROW EXCLUSIVE` | **yes** | no | no |
+| `0008` | `ACCESS EXCLUSIVE` | no (catalog-only) | yes, while held | yes, while held |
+| `0009` | `SHARE UPDATE EXCLUSIVE`, then also `SHARE` | **yes** | no | **YES**, from the first index build until commit |
+| `0010` | `ACCESS EXCLUSIVE` | no (catalog-only) | yes, while held | yes, while held |
+
+Two corrections to Revision 2's language, both load-bearing:
+
+- **The worker claim query is a write.** `internal/store/claim.go`'s
+  `claimQuery` is `WITH candidate AS (SELECT … FOR UPDATE SKIP LOCKED) UPDATE
+  jobs …`. Its CTE takes `ROW SHARE`, but the statement takes `ROW
+  EXCLUSIVE`. Reasoning about the CTE's lock instead of the statement's is
+  precisely what produced the retired claim about `0009` and claiming that
+  §5a's table now corrects.
+- **`0009` blocks every write to `jobs`, the claim query included**, for the
+  whole file. `CREATE INDEX` takes `SHARE`; `SHARE` conflicts with `ROW
+  EXCLUSIVE`; and the lock is held to commit, so the stall is not "per index
+  build". Measured against the real `0009` on a 3M-row / 426 MB table, the
+  real claim query hit `lock_timeout` (SQLSTATE `55P03`) instead of claiming.
+  `CREATE INDEX CONCURRENTLY` would avoid this but cannot run inside a
+  transaction block, and every migration here runs inside one (TF-INV-013).
+
+**Deployment obligations** (operator's, not verifiable by TaskForge):
+benchmark `0007` and `0009` against a realistically-sized copy of the
+deployment's own `jobs` table — duration is data-, table-size- and
+environment-dependent and no test can establish it; set `lock_timeout` and
+retry rather than queueing traffic behind a waiting DDL statement; and run
+`0009` in a quiet or maintenance window sized by that benchmark, expecting
+worker claiming to stop for its duration.
+
+`internal/migrate/phase12_migration_test.go` asserts both directions —
+`TestPhase12Migrations_BackfillDoesNotBlockReadsOrTheClaimPath` for `0007`,
+`TestPhase12Migrations_0009BlocksWritesAndTheClaimQuery` for `0009` (which
+asserts the blocking rather than denying it) — and
+`internal/migrate/phase12_lockclaims_test.go` fails the build if any of the
+retired claims reappears in this document, `README.md`, `docs/data-model.md`,
+`docs/security-model.md`, or the migration files themselves.
 
 Both `internal/job.NewParams`/`internal/job.Job` (jobs) and
 `internal/workflow.GraphSpec`/`internal/workflow.Instance` (workflows)
@@ -618,8 +728,10 @@ Unchanged in substance from Revision 1, with the store-layer scoping from
   policy, and Phase 12 does not contradict anything it currently states).
 - **`txenqueue`'s break is likewise a hard cutover (§6b)**, for the same
   evidence-based reason (OD-4).
-- Migrations `0005`–`0007` are additive with respect to every existing
-  column; no existing column is dropped, renamed, or narrowed.
+- Migrations `0005`–`0010` are additive with respect to every existing
+  column; no existing column is dropped, renamed, or narrowed. (`0010` drops
+  an *index*, migration 0001's global `idx_jobs_idempotency_key`, replaced by
+  `0009`'s principal-scoped one — no column or data is removed.)
 - `sslmode=verify-full` remains scoped to "the enterprise reference
   deployment" only — local/dev profiles are unaffected, matching
   `security-model.md`'s existing framing exactly.
@@ -681,7 +793,7 @@ follows the existing `internal/api/handlers_phaseN_test.go` /
 
 | # | Verification point | Test(s) |
 |---|---|---|
-| 1 | `principal_id` placement/migration ordering safe for existing data | Migration test: seed pre-Phase-12 rows (no `principal_id`), run `0005`–`0007`, assert every row resolves to `SystemPrincipalID`, `NOT NULL` constraints hold, old index gone, new index enforced. |
+| 1 | `principal_id` placement/migration ordering safe for existing data | Migration test: seed pre-Phase-12 rows (no `principal_id`), run `0005`–`0010` through the real `migrate.Up`, assert every row resolves to `SystemPrincipalID`, the `NOT NULL` check constraints hold **and are `convalidated`**, old index gone, new index enforced — `TestMigrations0005To0010_BackfillLegacyRowsAndConverge`. |
 | 2 | Principal-scoped idempotency cannot be bypassed via NULL/legacy rows | Schema test asserting `jobs.principal_id` is `NOT NULL` post-migration (no row can ever reach the NULL-widening case); two-principal concurrency test (§8) proving the composite index scopes correctly with real data. |
 | 3 | API keys never stored plaintext; generation/hashing/verification/revocation/lookup precise | `internal/principal` unit tests: `Create` never returns/logs a value equal to the stored `secret_hash`'s preimage in any accessible form beyond the one-time creation response; `Verify` round-trips a freshly created key; a tampered secret against a real `key_id` fails; a revoked/expired key fails post-revocation/expiry. |
 | 4 | Credential comparison avoids timing leaks | Code-level test asserting `Verify`'s secret comparison calls `crypto/subtle.ConstantTimeCompare` (mechanism-level proof, same pattern as TF-INV-016's "schema test asserting the constraint exists" — a live timing measurement in CI is not attempted, as it would be flaky by nature). |
@@ -693,7 +805,7 @@ follows the existing `internal/api/handlers_phaseN_test.go` /
 | 10 | Logging never emits raw API keys | Log-output test (extends `internal/api/observability_test.go`'s pattern): no log line, across every §6a success/failure path, contains the raw `secret` substring; `actor` field present on submit/cancel lines. |
 | 11 | Metrics access separated from mutation access | `{jobs}`-scoped key → `403` on `GET /metrics`; `{metrics}`-scoped key → `403` on `POST /jobs`; `{admin}` → both succeed. |
 | 12 | Rate-limiting/brute-force behavior specified or classified as non-goal | No test required by this phase (§3's explicit non-goal with rationale) — the one test this phase does add is that `taskforge_auth_failures_total{reason}` increments correctly per failure reason (observability proof, not a rate-limit proof). |
-| 13 | Migrations support rollback/forward deployment safely | Up-then-down-then-up round-trip test for `0005`/`0006` (data-safe-reversible); a deliberate test proving `0007`'s `down` **fails loudly** (not silently) when post-migration cross-principal idempotency-key reuse exists, per §5's "honest, not blanket-safe" design; a `NOT VALID`/`VALIDATE CONSTRAINT` lock-duration smoke test (assert no `ACCESS EXCLUSIVE`-only-achievable blocking occurs against a concurrent read during validation, in the spirit of `compatibility-policy.md`'s discipline). |
+| 13 | Migrations support rollback/forward deployment safely | Up-then-down-then-up round-trip test for `0005`–`0008` (`TestMigrations0005To0008_AreDataSafeReversible`); a deliberate test proving **`0010`'s** `down` fails loudly (not silently), and atomically, when post-migration cross-principal idempotency-key reuse exists, per §5's "honest, not blanket-safe" design (`TestMigration0010_Down_FailsLoudlyOnDivergentData`, with `TestMigration0010_Down_SucceedsWhenNoDivergentDataExists` as its complement); plus the §5a lock tests — `TestPhase12Migrations_BackfillDoesNotBlockReadsOrTheClaimPath` (0007 blocks nothing), `TestPhase12Migrations_0009TakesNoAccessExclusive_ReadsAndCompletionContinue`, and `TestPhase12Migrations_0009BlocksWritesAndTheClaimQuery` (0009 **does** block writes and claiming — asserted, not denied). |
 | 14 | System-principal compatibility behavior narrow/named/testable/non-bypassable | Since no compatibility adapter is built in this phase (§6b), the test here is negative: assert `txenqueue.EnqueueTx` has no code path that resolves an unset/zero `PrincipalID` to `SystemPrincipalID` — i.e., assert the *absence* of an accidental default, directly contradicting Revision 1's original (rejected) design. If OD-4's contingency function is later added, it requires its own equivalent "always logs, never the default path" test at that time. |
 | 15 | Proxy/TLS trust assumptions explicit, including which forwarded headers are trusted/ignored | Code-level test asserting no production code path in `internal/api` reads `X-Forwarded-For`/`X-Forwarded-Proto`/`X-Real-IP` (or any header) for any authorization decision — an absence-of-behavior test, mirroring #14's shape. |
 | 16 | Tests prove authN, authZ, isolation, revocation, idempotency, cross-principal denial — not just happy paths | Satisfied collectively by #1–#11, #13–#14 above; every one of those is specifically an adversarial/negative case (wrong principal, revoked key, expired key, wrong scope, missing header, tampered secret, migration data divergence), not a success-path-only suite. A single aggregate "regression: all Phase 1–11 tests still pass unchanged" run is the complementary happy-path proof that nothing existing broke. |
@@ -728,7 +840,7 @@ review). Added by this revision:
 
 Unchanged list from Revision 1 (see prior version's §13 for the full
 enumeration: `internal/principal/*`, `internal/api/auth.go`,
-`internal/api/handlers_phase12_test.go`, migrations `0005`–`0007`,
+`internal/api/handlers_phase12_test.go`, migrations `0005`–`0010`,
 `internal/config`, `internal/store/*`, `internal/job`, `internal/workflow`,
 `txenqueue/*`, `cmd/api`, `cmd/worker`, doc updates), with these
 corrections from this review:
@@ -775,14 +887,21 @@ section. Remaining, narrower items surfaced by this review:
   sufficient to forge credentials). Accepted for this phase per
   `security-model.md` §3's existing framing; no secrets-manager
   integration in scope.
-- **Risk — `0007`'s `NOT VALID`/`VALIDATE CONSTRAINT` technique still
-  requires a full-table read during validation**, just without the
-  exclusive lock — on a `jobs` table grown large from Phase 9 chaos/load
-  runs, this could still run for a meaningful duration. Mitigated by
-  running it via `SHARE UPDATE EXCLUSIVE` (non-blocking to reads/writes)
-  rather than eliminated; flagged for the implementer to actually time
-  against a realistically-sized table before shipping, not assumed safe
-  by construction.
+- **Risk — `0009` is the expensive migration, and it blocks writes**
+  (restated after measurement; Revision 2 understated this). Its
+  `VALIDATE CONSTRAINT` step reads the whole table under
+  `SHARE UPDATE EXCLUSIVE`, which blocks nothing — but the three index
+  builds that share its transaction take `SHARE`, which blocks every write
+  to `jobs`, worker claims included, until the file commits. On a `jobs`
+  table grown large from Phase 9 chaos/load runs this can be a long stall.
+  It is **mitigated only by scheduling, not by construction**: benchmark
+  `0009` (and `0007`) against a realistically-sized copy of the deployment's
+  own table, set `lock_timeout`, and run it in a quiet or maintenance
+  window. `CREATE INDEX CONCURRENTLY` would remove the write block but
+  cannot run inside a transaction block, and every migration here runs
+  inside one (TF-INV-013); changing that would mean changing
+  `internal/migrate`'s per-file transaction contract, which TF-INV-013
+  fixes and this phase does not reopen. See §5a.
 - **Open, narrower question (new)**: should `internal/principal.Store`
   return a distinguishable Go error for each of the five `401` reasons
   in §6a even though the HTTP layer collapses them to one generic body?
@@ -805,9 +924,9 @@ Unchanged in shape from Revision 1, with stages re-ordered slightly to
 reflect that native TLS (OD-7) is no longer a stage at all, and OD
 resolution is no longer "stage 1: decide" but already done:
 
-1. **Schema stage**: migrations `0005`–`0007` (§5), plus the
-   backfill-correctness and honest-down-migration tests (§11 #1, #2,
-   #13). No application code changes yet.
+1. **Schema stage**: migrations `0005`–`0010` (§5), plus the
+   backfill-correctness, honest-down-migration and lock-behaviour tests
+   (§11 #1, #2, #13; §5a). No application code changes yet.
 2. **`internal/principal` package**: types, store, `Verify` (§6a), unit
    tests (§11 #3, #4) — no HTTP wiring yet.
 3. **Authentication middleware, direct hard cutover (OD-6)**:

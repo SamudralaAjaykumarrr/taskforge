@@ -13,6 +13,7 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
 )
@@ -27,6 +28,7 @@ func newStore(t *testing.T) *store.Store {
 
 func newJobParams(jobType string) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{"k":"v"}`),
 		MaxAttempts:             5,
@@ -50,7 +52,7 @@ func TestInsert_ReturnsCommittedRow(t *testing.T) {
 
 	// Independently re-read: proves the commit already happened, not
 	// merely that Insert's own connection remembers it.
-	fetched, err := s.GetByID(ctx, created.ID)
+	fetched, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, created.ID, fetched.ID)
 	require.Equal(t, jobstate.Queued, fetched.State)
@@ -82,7 +84,7 @@ func TestInsert_CancelledContextLeavesNoRow(t *testing.T) {
 // or a swallowed error.
 func TestGetByID_NotFound(t *testing.T) {
 	s := newStore(t)
-	_, err := s.GetByID(context.Background(), uuid.New())
+	_, err := s.GetByID(context.Background(), uuid.New(), testAccess)
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -214,7 +216,7 @@ func TestCompleteSuccess_RejectsWrongLeaseGeneration(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
 	// The job must be untouched: still RUNNING under the real generation.
-	current, err := s.GetByID(ctx, claimed.ID)
+	current, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, current.State)
 	require.Equal(t, claimed.LeaseGeneration, current.LeaseGeneration)
@@ -235,7 +237,7 @@ func TestCompleteSuccess_RejectsWrongLeaseOwner(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, claimed.ID, "some-other-worker", claimed.LeaseGeneration, nil)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	current, err := s.GetByID(ctx, claimed.ID)
+	current, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, current.State)
 }
@@ -274,7 +276,7 @@ func TestTerminalStates_RejectFurtherTransitions(t *testing.T) {
 		require.False(t, ok)
 		require.Nil(t, reclaimed)
 
-		final, err := s.GetByID(ctx, claimed.ID)
+		final, err := s.GetByID(ctx, claimed.ID, testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.Succeeded, final.State)
 		require.Equal(t, terminalAtBefore, *final.TerminalAt, "terminal_at must never change once set")
@@ -302,7 +304,7 @@ func TestTerminalStates_RejectFurtherTransitions(t *testing.T) {
 		require.False(t, ok)
 		require.Nil(t, reclaimed)
 
-		final, err := s.GetByID(ctx, claimed.ID)
+		final, err := s.GetByID(ctx, claimed.ID, testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.DeadLettered, final.State)
 		require.Equal(t, terminalAtBefore, *final.TerminalAt)
@@ -316,9 +318,9 @@ func TestTerminalStates_RejectFurtherTransitions(t *testing.T) {
 func TestSchema_StateCheckConstraintRejectsInvalidState(t *testing.T) {
 	db := testutil.DB(t)
 	_, err := db.Exec(`
-		INSERT INTO jobs (id, job_type, payload, state, execution_timeout_seconds)
-		VALUES ($1, 'test.invalid', '{}', 'NOT_A_REAL_STATE', 30)`,
-		uuid.New())
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, execution_timeout_seconds)
+		VALUES ($1, $2, 'test.invalid', '{}', 'NOT_A_REAL_STATE', 30)`,
+		uuid.New(), testPrincipalID)
 	require.Error(t, err)
 }
 
@@ -331,17 +333,25 @@ func TestSchema_IdempotencyKeyUniqueConstraint(t *testing.T) {
 	db := testutil.DB(t)
 	key := "dup-key"
 
-	_, err := db.Exec(`
-		INSERT INTO jobs (id, job_type, payload, state, execution_timeout_seconds, idempotency_key)
-		VALUES ($1, 'test.idem', '{}', 'QUEUED', 30, $2)`,
-		uuid.New(), key)
-	require.NoError(t, err)
+	insert := func(principalID uuid.UUID) error {
+		_, err := db.Exec(`
+			INSERT INTO jobs (id, principal_id, job_type, payload, state, execution_timeout_seconds, idempotency_key)
+			VALUES ($1, $3, 'test.idem', '{}', 'QUEUED', 30, $2)`,
+			uuid.New(), key, principalID)
+		return err
+	}
 
-	_, err = db.Exec(`
-		INSERT INTO jobs (id, job_type, payload, state, execution_timeout_seconds, idempotency_key)
-		VALUES ($1, 'test.idem', '{}', 'QUEUED', 30, $2)`,
-		uuid.New(), key)
-	require.Error(t, err, "duplicate (job_type, idempotency_key) must violate the unique constraint")
+	require.NoError(t, insert(testPrincipalID))
+	require.Error(t, insert(testPrincipalID),
+		"duplicate (principal_id, job_type, idempotency_key) must violate idx_jobs_idempotency_scoped")
+
+	// Phase 12: the SAME job_type and key under a DIFFERENT principal is
+	// a separate, legitimate submission, not a duplicate -- the whole
+	// point of migration 0009 re-scoping this index. Proved here at the
+	// schema level, independent of any application code path.
+	other := testutil.NewPrincipal(t, db, principal.KindCaller, "other tenant")
+	require.NoError(t, insert(other),
+		"two tenants using the same job_type and idempotency_key must not collide")
 }
 
 // TestFaultInjection_RollbackLeavesRowUnchanged proves TF-INV-013
@@ -356,7 +366,7 @@ func TestFaultInjection_RollbackLeavesRowUnchanged(t *testing.T) {
 
 	created, err := s.Insert(ctx, newJobParams("test.rollback"))
 	require.NoError(t, err)
-	before, err := s.GetByID(ctx, created.ID)
+	before, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -371,7 +381,7 @@ func TestFaultInjection_RollbackLeavesRowUnchanged(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, tx.Rollback())
 
-	after, err := s.GetByID(ctx, created.ID)
+	after, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, before.State, after.State)
 	require.Equal(t, before.Version, after.Version)
@@ -409,7 +419,7 @@ func TestRestart_RunningJobSurvivesFreshStoreInstance(t *testing.T) {
 	// database, with no in-memory knowledge of the job above.
 	after := store.New(db)
 
-	seen, err := after.GetByID(ctx, claimed.ID)
+	seen, err := after.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, seen.State)
 	require.Equal(t, claimed.LeaseGeneration, seen.LeaseGeneration)

@@ -23,6 +23,7 @@ import (
 
 func newJobParamsN(jobType string, maxAttempts int) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{"k":"v"}`),
 		MaxAttempts:             maxAttempts,
@@ -100,7 +101,7 @@ func TestClaim_UnexpiredLeaseIsNeverReclaimed(t *testing.T) {
 		require.False(t, ok, "an unexpired lease must never be reclaimed")
 	}
 
-	current, err := s.GetByID(ctx, claimed.ID)
+	current, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), current.LeaseGeneration)
 	require.Equal(t, "worker-A", *current.LeaseOwner)
@@ -146,7 +147,7 @@ func TestClaim_TerminalJobNeverReclaimed(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, ok, "a terminal job must never be presented to the reclaim query")
 
-			final, err := s.GetByID(ctx, created.ID)
+			final, err := s.GetByID(ctx, created.ID, testAccess)
 			require.NoError(t, err)
 			require.Equal(t, terminal, final.State)
 		})
@@ -176,7 +177,7 @@ func TestClaim_SweepDeadLettersAttemptExhaustedExpiredLease(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok, "an attempt-exhausted expired lease must be swept to DEAD_LETTERED, not reclaimed")
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.NotNil(t, final.TerminalAt)
@@ -260,7 +261,7 @@ func TestFencing_StaleWorkerCompletionRejectedAfterReclaim(t *testing.T) {
 	_, err = s.CompleteFailure(ctx, a.ID, "worker-A", a.LeaseGeneration, "late failure", job.ErrorClassPermanent)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State, "worker B's result must be untouched by worker A's stale calls")
 }
@@ -295,7 +296,7 @@ func TestFencing_StaleCompletionRejectedBeforeNewOwnerCompletes(t *testing.T) {
 
 	// The job must still be exactly as B's claim left it: RUNNING under
 	// generation 2, not disturbed by A's rejected attempt.
-	mid, err := s.GetByID(ctx, created.ID)
+	mid, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, mid.State)
 	require.Equal(t, int64(2), mid.LeaseGeneration)
@@ -373,7 +374,7 @@ func TestFencing_ArbitrarilyLateArrivalAcrossManyGenerations(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, gen1.ID, "worker-1", gen1.LeaseGeneration, nil)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, int64(generations), final.LeaseGeneration)
@@ -465,7 +466,7 @@ func TestHeartbeat_RejectsWrongOwner(t *testing.T) {
 	_, err = s.Heartbeat(ctx, claimed.ID, "some-other-worker", claimed.LeaseGeneration, 30*time.Second)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	current, err := s.GetByID(ctx, claimed.ID)
+	current, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, claimed.LeaseGeneration, current.LeaseGeneration)
 }
@@ -492,7 +493,7 @@ func TestHeartbeat_NeverResurrectsOrReopensTerminalJob(t *testing.T) {
 	_, err = s.Heartbeat(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration, 30*time.Second)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, claimed.ID)
+	final, err := s.GetByID(ctx, claimed.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 	require.Equal(t, terminalAtBefore, *final.TerminalAt)
@@ -706,7 +707,7 @@ func TestClaim_RollbackOnAttemptConflictLeavesJobRowUnchanged(t *testing.T) {
 	require.Error(t, err, "a job_attempts conflict inside the claim transaction must surface as an error")
 	require.False(t, ok)
 
-	after, err := s.GetByID(ctx, created.ID)
+	after, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Queued, after.State, "a rolled-back claim must leave the job exactly as it was")
 	require.Equal(t, int64(0), after.LeaseGeneration)

@@ -122,17 +122,57 @@ handler cooperates" is wrong and should be corrected on sight — see
 
 - Retry crash-timing analysis: [retry-semantics.md](retry-semantics.md)
 - Invariants: TF-INV-008, TF-INV-016 in [invariants.md](invariants.md)
-- Schema: `UNIQUE (job_type, idempotency_key)` in [data-model.md](data-model.md)
+- Schema: `UNIQUE (principal_id, job_type, idempotency_key)` in [data-model.md](data-model.md) — see "Principal scoping (Phase 12)" below
 
 ## Idempotency Inside a Caller-Owned Transaction (Phase 11)
 
 Status: implemented — docs/enterprise-roadmap.md Phase 11. The `txenqueue`
 package's `EnqueueTx` (docs/transactional-enqueue.md) preserves every
 guarantee in this document unchanged, including inside a caller-owned
-`pgx.Tx`: `UNIQUE(job_type, idempotency_key)` remains the sole,
-database-enforced source of truth (TF-INV-008/TF-INV-016) — there is no
-second, weaker, application-level idempotency check for the transactional
-path.
+`pgx.Tx`: the unique index remains the sole, database-enforced source of
+truth (TF-INV-008/TF-INV-016) — there is no second, weaker,
+application-level idempotency check for the transactional path.
+
+## Principal scoping (Phase 12)
+
+Status: implemented — docs/enterprise-roadmap.md Phase 12,
+docs/phase-12-plan.md. The uniqueness scope changed; nothing else in this
+document did.
+
+The constraint is now
+`UNIQUE (principal_id, job_type, idempotency_key) WHERE idempotency_key IS
+NOT NULL` (`idx_jobs_idempotency_scoped`, migration `0009`), replacing
+migration `0001`'s global `UNIQUE (job_type, idempotency_key)`. **Two
+different callers choosing the same `job_type` and the same
+`Idempotency-Key` are two independent submissions, not a false duplicate**
+— which was a real cross-tenant collision the moment principals existed
+(docs/security-model.md §7).
+
+Everything else this document specifies is unchanged: the key is still
+caller-supplied, still optional, still enforced INSERT-first with no
+check-then-act read, and first-write-wins still holds unconditionally
+within one principal's own scope.
+
+Two consequences worth stating explicitly:
+
+- **The conflict-recovery re-read is principal-scoped too**
+  (`Store.GetByIdempotencyKey` takes a principal). This is load-bearing,
+  not cosmetic: a globally-scoped read there would let caller A's INSERT
+  recover onto caller B's row and return B's job to A — the same
+  cross-tenant leak the index change exists to prevent, reintroduced one
+  layer up.
+- **There is still no global idempotency namespace**, and now there are two
+  scoping dimensions rather than one: the same key value under a different
+  `job_type`, *or* under a different principal, is an entirely unrelated
+  lookup.
+
+Migration `0009` created the scoped index only after `jobs.principal_id`
+had converged to `NOT NULL` — in that same file, immediately after its
+`VALIDATE CONSTRAINT` step — so there was never a window in which a NULL
+principal could widen the uniqueness scope. Migration `0010` then dropped
+the old global index. Both indexes are live between the two, and the
+stricter global one is the one still enforcing during that window, so no
+cross-tenant collision can slip through it.
 
 The one implementation subtlety worth naming: PostgreSQL aborts an entire
 transaction after any statement inside it fails (including a unique-

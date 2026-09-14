@@ -151,7 +151,7 @@ func TestChaos_WorkerCrashCampaign_SeededVariedCrashPoints(t *testing.T) {
 				require.ErrorIs(t, err, store.ErrStaleTransition,
 					"stale generation %d (crash point %v) must never authoritatively complete job %s after reclaim", c.staleGen, c.point, c.jobID)
 
-				got, err := s.GetByID(ctx, id)
+				got, err := s.GetByID(ctx, id, testAccess)
 				require.NoError(t, err)
 				require.Equal(t, jobstate.Succeeded, got.State)
 				require.Equal(t, c.staleGen+1, got.LeaseGeneration, "the job's authoritative generation must remain the reclaiming worker's, untouched by the stale call")
@@ -204,6 +204,7 @@ func TestChaos_HeartbeatRacesReclaim_Seeded(t *testing.T) {
 			for i := 0; i < numJobs; i++ {
 				jobType := fmt.Sprintf("chaos.hbrace.%d.%d", seed, i)
 				created, err := s.Insert(ctx, job.NewParams{
+					PrincipalID:             testPrincipalID,
 					JobType:                 jobType,
 					Payload:                 []byte(`{}`),
 					MaxAttempts:             5,

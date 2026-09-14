@@ -36,6 +36,7 @@ func TestRunOnce_ExecutionTimeout_FiresIndependentlyOfLeaseRenewal(t *testing.T)
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.timeout.fires",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -52,7 +53,7 @@ func TestRunOnce_ExecutionTimeout_FiresIndependentlyOfLeaseRenewal(t *testing.T)
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, final.State, "a timeout with attempts remaining schedules a retry, exactly like any other retryable outcome")
 	require.NotNil(t, final.LastErrorClass)
@@ -78,6 +79,7 @@ func TestRunOnce_ExecutionTimeout_HandlerIgnoresContext_StillReportsTimeout(t *t
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.timeout.ignored",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -93,7 +95,7 @@ func TestRunOnce_ExecutionTimeout_HandlerIgnoresContext_StillReportsTimeout(t *t
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, final.State)
 	require.Equal(t, "TIMEOUT", *final.LastErrorClass,
@@ -110,6 +112,7 @@ func TestRunOnce_ExecutionTimeout_HandlerFinishesJustWithinBudget_Succeeds(t *te
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.timeout.withinbudget",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -137,7 +140,7 @@ func TestRunOnce_ExecutionTimeout_HandlerFinishesJustWithinBudget_Succeeds(t *te
 	require.NoError(t, runErr)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State)
 }
@@ -152,6 +155,7 @@ func TestRunOnce_ExecutionTimeout_ExhaustionDeadLetters(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.timeout.exhaust.worker",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             2,
@@ -174,7 +178,7 @@ func TestRunOnce_ExecutionTimeout_ExhaustionDeadLetters(t *testing.T) {
 		}
 	}
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.NotNil(t, final.TerminalAt)
@@ -193,6 +197,7 @@ func TestRunOnce_ExecutionTimeout_FiresAfterLeaseAlreadyLost(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.timeout.vs.leaselost",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,

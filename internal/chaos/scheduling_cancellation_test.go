@@ -45,6 +45,7 @@ func TestChaos_ScheduledJobSurvivesSimulatedFleetRestart(t *testing.T) {
 	for i := 0; i < numJobs; i++ {
 		key := fmt.Sprintf("chaos-sched-key-%d", i)
 		created, _, err := preRestart.InsertIdempotent(ctx, job.NewParams{
+			PrincipalID:             testPrincipalID,
 			JobType:                 "chaos.scheduled",
 			Payload:                 []byte(`{}`),
 			MaxAttempts:             3,
@@ -72,7 +73,8 @@ func TestChaos_ScheduledJobSurvivesSimulatedFleetRestart(t *testing.T) {
 	for i := 0; i < numJobs; i++ {
 		key := fmt.Sprintf("chaos-sched-key-%d", i)
 		dup, created, err := postRestart.InsertIdempotent(ctx, job.NewParams{
-			JobType: "chaos.scheduled", Payload: []byte(`{}`), MaxAttempts: 3,
+			PrincipalID: testPrincipalID,
+			JobType:     "chaos.scheduled", Payload: []byte(`{}`), MaxAttempts: 3,
 			ExecutionTimeoutSeconds: 30, ScheduledAt: &future, IdempotencyKey: &key,
 		})
 		require.NoError(t, err)
@@ -100,7 +102,7 @@ func TestChaos_ScheduledJobSurvivesSimulatedFleetRestart(t *testing.T) {
 
 	checker := invariant.New(db)
 	for _, id := range jobIDs {
-		final, err := postRestart.GetByID(ctx, mustParseUUID(t, id))
+		final, err := postRestart.GetByID(ctx, mustParseUUID(t, id), testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.Succeeded, final.State)
 	}
@@ -156,7 +158,7 @@ func TestChaos_CancellationRacesClaimAndExecution_Seeded(t *testing.T) {
 					go func() {
 						defer wg.Done()
 						<-start
-						_, cancelErr = s.CancelQueuedOrRetryWait(ctx, created.ID)
+						_, cancelErr = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 					}()
 					close(start)
 					wg.Wait()
@@ -165,13 +167,13 @@ func TestChaos_CancellationRacesClaimAndExecution_Seeded(t *testing.T) {
 						require.ErrorIs(t, cancelErr, store.ErrStaleTransition)
 					}
 
-					final, err := s.GetByID(ctx, created.ID)
+					final, err := s.GetByID(ctx, created.ID, testAccess)
 					require.NoError(t, err)
 					if claimedOK {
 						// Claim won: finish it off so the pool converges.
 						_, err := s.CompleteSuccess(ctx, created.ID, fmt.Sprintf("cancelrace-claimer-%d", i), 1, nil)
 						require.NoError(t, err)
-						final, err = s.GetByID(ctx, created.ID)
+						final, err = s.GetByID(ctx, created.ID, testAccess)
 						require.NoError(t, err)
 						require.Equal(t, jobstate.Succeeded, final.State)
 					} else {
@@ -188,7 +190,7 @@ func TestChaos_CancellationRacesClaimAndExecution_Seeded(t *testing.T) {
 
 				cancelFirst := rng.Bool(0.5)
 				if cancelFirst {
-					_, err := s.RequestCancellation(ctx, claimed.ID)
+					_, err := s.RequestCancellation(ctx, claimed.ID, testAccess)
 					require.NoError(t, err)
 					compResult, compErr := s.CompleteCancelled(ctx, claimed.ID, fmt.Sprintf("cancelrace-runner-%d", i), claimed.LeaseGeneration)
 					require.NoError(t, compErr)
@@ -199,9 +201,9 @@ func TestChaos_CancellationRacesClaimAndExecution_Seeded(t *testing.T) {
 					// A cancellation request arriving after completion has
 					// already committed must find the job non-RUNNING and
 					// have no effect.
-					_, reqErr := s.RequestCancellation(ctx, claimed.ID)
+					_, reqErr := s.RequestCancellation(ctx, claimed.ID, testAccess)
 					require.ErrorIs(t, reqErr, store.ErrStaleTransition)
-					final, err := s.GetByID(ctx, claimed.ID)
+					final, err := s.GetByID(ctx, claimed.ID, testAccess)
 					require.NoError(t, err)
 					require.Equal(t, jobstate.Succeeded, final.State)
 				}
@@ -233,6 +235,7 @@ func TestChaos_TimeoutRacesLeaseAndHeartbeat(t *testing.T) {
 	for i := 0; i < numJobs; i++ {
 		jobType := fmt.Sprintf("chaos.timeout.%d", i)
 		created, err := s.Insert(ctx, job.NewParams{
+			PrincipalID:             testPrincipalID,
 			JobType:                 jobType,
 			Payload:                 []byte(`{}`),
 			MaxAttempts:             1, // exhausts on first timeout -> DEAD_LETTERED, exercising the terminal path too
@@ -262,7 +265,7 @@ func TestChaos_TimeoutRacesLeaseAndHeartbeat(t *testing.T) {
 	wg.Wait()
 
 	for _, id := range jobIDs {
-		final, err := s.GetByID(ctx, mustParseUUID(t, id))
+		final, err := s.GetByID(ctx, mustParseUUID(t, id), testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.DeadLettered, final.State, "job %s: max_attempts=1 means the first timeout must exhaust the retry budget", id)
 		require.Equal(t, "TIMEOUT", *final.LastErrorClass)

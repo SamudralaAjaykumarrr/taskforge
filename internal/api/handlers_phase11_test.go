@@ -24,6 +24,7 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
@@ -262,20 +263,22 @@ var errPoisoned = errors.New(`store: insert job: pq: SQLSTATE 23505 duplicate ke
 func (poisonStore) InsertIdempotent(context.Context, job.NewParams) (*job.Job, bool, error) {
 	return nil, false, errPoisoned
 }
-func (poisonStore) GetByID(context.Context, uuid.UUID) (*job.Job, error) { return nil, errPoisoned }
-func (poisonStore) CancelQueuedOrRetryWait(context.Context, uuid.UUID) (*job.Job, error) {
+func (poisonStore) GetByID(context.Context, uuid.UUID, principal.AccessContext) (*job.Job, error) {
 	return nil, errPoisoned
 }
-func (poisonStore) RequestCancellation(context.Context, uuid.UUID) (*job.Job, error) {
+func (poisonStore) CancelQueuedOrRetryWait(context.Context, uuid.UUID, principal.AccessContext) (*job.Job, error) {
+	return nil, errPoisoned
+}
+func (poisonStore) RequestCancellation(context.Context, uuid.UUID, principal.AccessContext) (*job.Job, error) {
 	return nil, errPoisoned
 }
 func (poisonStore) CreateWorkflow(context.Context, workflow.GraphSpec) (*workflow.Instance, error) {
 	return nil, errPoisoned
 }
-func (poisonStore) GetWorkflow(context.Context, uuid.UUID) (*workflow.Instance, error) {
+func (poisonStore) GetWorkflow(context.Context, uuid.UUID, principal.AccessContext) (*workflow.Instance, error) {
 	return nil, errPoisoned
 }
-func (poisonStore) CancelWorkflow(context.Context, uuid.UUID) (*workflow.Instance, error) {
+func (poisonStore) CancelWorkflow(context.Context, uuid.UUID, principal.AccessContext) (*workflow.Instance, error) {
 	return nil, errPoisoned
 }
 
@@ -289,8 +292,16 @@ func (poisonStore) CancelWorkflow(context.Context, uuid.UUID) (*workflow.Instanc
 // handlers.go's h.logger.Error call); only the HTTP response is
 // constrained.
 func TestCreateJob_StoreFailure_Returns500WithoutLeakingInternalDetails(t *testing.T) {
-	h := api.NewHandlers(poisonStore{}, discardLogger())
-	srv := httptest.NewServer(api.NewRouter(h))
+	// poisonStore has no database at all, so this is one of the few tests
+	// that uses a static authenticator rather than a real principals
+	// table -- its subject is the 500 response's error-leakage behaviour,
+	// not authentication. The request is still authenticated; it simply
+	// authenticates against a fixed identity.
+	ident := testIdentity{PrincipalID: uuid.New(), Credential: "keyid.secret"}
+	h := api.NewHandlers(poisonStore{}, discardLogger(), api.WithAuthenticator(staticAuthenticator{
+		ac: principal.AccessContext{PrincipalID: ident.PrincipalID, Scopes: []string{principal.ScopeJobs}},
+	}))
+	srv := httptest.NewServer(injectCredential(api.NewRouter(h), ident))
 	t.Cleanup(srv.Close)
 
 	body := `{"job_type":"email.send","payload":{}}`
