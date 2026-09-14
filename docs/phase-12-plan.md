@@ -46,6 +46,14 @@ disagree, those two documents still win.
 | OD-7 | TLS boundary | **No native TLS termination in `cmd/api`.** TLS termination is defined as an external reverse-proxy/load-balancer responsibility, documented as a required deployment boundary. TaskForge's own HTTP server continues to speak plaintext HTTP behind that boundary and makes no transport-security claim beyond it (§4a, §9). |
 | OD-8 | Invariant numbering | **No new `TF-INV-0NN` ID is allocated in this plan.** `docs/invariants.md` currently defines through `TF-INV-016`; `docs/enterprise-roadmap.md` provisionally reserves `TF-INV-017` for Phase 13's fairness property (confirmed: three citations, all in the Phase 13 section, all "tentatively"). No document reserves `018` or above, but "provisional" language in the one existing reservation means the registry itself has not been formally extended past `016`. Per the approved instruction, this plan keeps symbolic guarantee names (`G1`–`G8`, §2) and records formal ID allocation (whether Phase 12's guarantees get `TF-INV-018`+, and whether Phase 13's "tentative" `TF-INV-017` is confirmed as-is) as a **documentation-governance step**, to be resolved in its own small PR to `invariants.md` — coordinated across Phase 12 and 13 owners — before either phase's implementation PR, not decided unilaterally inside either. |
 
+> **Resolved** by the cross-phase invariant-governance pass: G2 → `TF-INV-017`,
+> G7 → `TF-INV-018`; G1/G3/G4/G5/G6/G8 remain symbolic (not allocated a
+> `TF-INV` ID — proven instead by this plan's own §11 verification points);
+> Phase 13's fairness property is confirmed as `TF-INV-019` (not `017`, since
+> `017`/`018` went to this phase's G2/G7 instead). See
+> [invariants.md](invariants.md) "Cross-Phase Governance Additions" for the
+> full rationale and proof mapping.
+
 ---
 
 ## Architecture blocker discovered during this review (§4a)
