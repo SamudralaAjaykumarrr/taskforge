@@ -34,7 +34,8 @@ func TestMain(m *testing.M) { testutil.RunMain(m) }
 
 func newParams(jobType string) job.NewParams {
 	return job.NewParams{
-		JobType: jobType, Payload: []byte(`{}`), MaxAttempts: 5, ExecutionTimeoutSeconds: 30,
+		PrincipalID: testPrincipalID,
+		JobType:     jobType, Payload: []byte(`{}`), MaxAttempts: 5, ExecutionTimeoutSeconds: 30,
 	}
 }
 
@@ -98,7 +99,7 @@ func TestCheckAll_CleanOrganicState_NoViolations(t *testing.T) {
 	_, err = s.CompleteFailure(ctx, claimed2.ID, "w2", claimed2.LeaseGeneration, "boom", job.ErrorClassPermanent)
 	require.NoError(t, err)
 
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		{NodeKey: "A", JobType: "invtest.clean.wf.a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
 		{NodeKey: "B", JobType: "invtest.clean.wf.b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
 	}})
@@ -386,7 +387,7 @@ func TestCheckAll_DetectsTerminalStateReopenedThenReterminalized(t *testing.T) {
 		// CancelQueuedOrRetryWait: reaches CANCELLED with ZERO job_attempts
 		// rows -- the case terminal_attempt_count exists specifically to
 		// still cover (see checkNoAttemptAfterTerminal's doc comment).
-		_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+		_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 
 		reopenThenReterminalize(t, ctx, db, created.ID, "forged-reopener-cancelled", "CANCELLED")
@@ -710,7 +711,7 @@ func TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily(t *testing.
 				// Never claimed -- attempt_count is 0 the whole time, and
 				// no job_attempts row is ever opened. Exactly the "zero
 				// attempt cancellation case" item 2 calls out.
-				_, err := s.CancelQueuedOrRetryWait(ctx, jobID)
+				_, err := s.CancelQueuedOrRetryWait(ctx, jobID, testAccess)
 				require.NoError(t, err)
 				return "CANCELLED"
 			},
@@ -722,7 +723,7 @@ func TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily(t *testing.
 				require.NoError(t, err)
 				require.True(t, ok)
 				require.Equal(t, jobID, claimed.ID)
-				_, err = s.RequestCancellation(ctx, claimed.ID)
+				_, err = s.RequestCancellation(ctx, claimed.ID, testAccess)
 				require.NoError(t, err)
 				_, err = s.CompleteCancelled(ctx, claimed.ID, "w-cancel", claimed.LeaseGeneration)
 				require.NoError(t, err)
@@ -790,7 +791,7 @@ func TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily(t *testing.
 
 			if c.name == "WorkflowCascadeCancellation" {
 				prefix := "invtest.family.cascade." + c.name
-				inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+				inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 					{NodeKey: "A", JobType: prefix + ".a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
 					{NodeKey: "B", JobType: prefix + ".b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
 				}})
@@ -817,7 +818,8 @@ func TestTerminalAttemptCount_CapturedOnFirstTerminalizationByFamily(t *testing.
 					maxAttempts = 1
 				}
 				created, err := s.Insert(ctx, job.NewParams{
-					JobType: "invtest.family." + c.name, Payload: []byte(`{}`), MaxAttempts: maxAttempts, ExecutionTimeoutSeconds: 30,
+					PrincipalID: testPrincipalID,
+					JobType:     "invtest.family." + c.name, Payload: []byte(`{}`), MaxAttempts: maxAttempts, ExecutionTimeoutSeconds: 30,
 				})
 				require.NoError(t, err)
 				jobID = created.ID
@@ -860,7 +862,8 @@ func TestCheckAll_IdempotencyCheck_NoFalsePositiveOnManyNullKeys(t *testing.T) {
 
 	key := "invtest-shared-key"
 	_, _, err := s.InsertIdempotent(ctx, job.NewParams{
-		JobType: "invtest.idem.keyed", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30,
+		PrincipalID: testPrincipalID,
+		JobType:     "invtest.idem.keyed", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30,
 		IdempotencyKey: &key,
 	})
 	require.NoError(t, err)
@@ -882,7 +885,7 @@ func TestCheckAll_DetectsWorkflowDependencyGatingViolation(t *testing.T) {
 	ctx := context.Background()
 	checker := invariant.New(db)
 
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		{NodeKey: "A", JobType: "invtest.gating.a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
 		{NodeKey: "B", JobType: "invtest.gating.b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
 	}})
@@ -921,7 +924,7 @@ func TestCheckAll_DetectsStuckWorkflowTerminality(t *testing.T) {
 	ctx := context.Background()
 	checker := invariant.New(db)
 
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		{NodeKey: "A", JobType: "invtest.stuck.a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
 	}})
 	require.NoError(t, err)

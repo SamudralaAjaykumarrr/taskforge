@@ -107,8 +107,9 @@ func TestEnqueueTx_Commit_BusinessDataAndJobBothDurable_ClaimableThroughNormalEn
 	require.NoError(t, err)
 
 	j, created, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{
-		JobType: "test.tx.commit",
-		Payload: json.RawMessage(`{"k":"v"}`),
+		PrincipalID: testPrincipalID,
+		JobType:     "test.tx.commit",
+		Payload:     json.RawMessage(`{"k":"v"}`),
 	})
 	require.NoError(t, err)
 	require.True(t, created)
@@ -118,7 +119,7 @@ func TestEnqueueTx_Commit_BusinessDataAndJobBothDurable_ClaimableThroughNormalEn
 
 	require.True(t, businessRowExists(t, pool, businessID), "business row must be durable after commit")
 
-	fetched, err := verify.GetByID(ctx, j.ID)
+	fetched, err := verify.GetByID(ctx, j.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Queued, fetched.State)
 
@@ -147,7 +148,7 @@ func TestEnqueueTx_Rollback_NoBusinessDataNoJob(t *testing.T) {
 	_, err = tx.Exec(ctx, `INSERT INTO txenqueue_test_business_rows (id, note) VALUES ($1, $2)`, businessID, "order-created")
 	require.NoError(t, err)
 
-	j, _, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: "test.tx.rollback"})
+	j, _, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "test.tx.rollback"})
 	require.NoError(t, err)
 	require.NotNil(t, j)
 
@@ -155,7 +156,7 @@ func TestEnqueueTx_Rollback_NoBusinessDataNoJob(t *testing.T) {
 
 	require.False(t, businessRowExists(t, pool, businessID), "business row must not survive rollback")
 
-	_, err = verify.GetByID(ctx, j.ID)
+	_, err = verify.GetByID(ctx, j.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrNotFound, "job must not survive rollback")
 }
 
@@ -174,7 +175,7 @@ func TestEnqueueTx_SuccessfulEnqueueThenLaterCallerRollback_NoOrphanJob(t *testi
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 
-	j, created, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: "test.tx.rollback.after.enqueue"})
+	j, created, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "test.tx.rollback.after.enqueue"})
 	require.NoError(t, err)
 	require.True(t, created)
 
@@ -188,7 +189,7 @@ func TestEnqueueTx_SuccessfulEnqueueThenLaterCallerRollback_NoOrphanJob(t *testi
 	require.NoError(t, tx.Rollback(ctx))
 
 	require.False(t, businessRowExists(t, pool, businessID))
-	_, err = verify.GetByID(ctx, j.ID)
+	_, err = verify.GetByID(ctx, j.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrNotFound, "a successful EnqueueTx must not leave an orphan job once the caller rolls back")
 }
 
@@ -211,7 +212,7 @@ func TestEnqueueTx_FailsOnClosedTransaction_NoFalseSuccessNoOrphanJob(t *testing
 	require.NoError(t, tx.Rollback(ctx)) // close the transaction up front
 
 	const jobType = "test.tx.closed"
-	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: jobType})
+	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType})
 	require.Error(t, err, "EnqueueTx must never report success against a transaction it cannot actually use")
 	require.ErrorIs(t, err, txenqueue.ErrInvalidTransaction, "a closed tx must classify as the public invalid-transaction error")
 	for _, leak := range []string{"pgx", "SQLSTATE", "store:", "conn"} {
@@ -235,7 +236,7 @@ func TestEnqueueTx_ValidationFailure_NoJobCreated_TxRemainsUsable(t *testing.T) 
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 
-	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: "   "})
+	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "   "})
 	require.Error(t, err)
 
 	var one int
@@ -261,7 +262,7 @@ func TestEnqueueTx_IdempotencyKey_DuplicateWithinSameTransaction(t *testing.T) {
 	require.NoError(t, err)
 
 	key := "dup-key-same-tx"
-	req := txenqueue.EnqueueRequest{JobType: "test.tx.idem.sametx", IdempotencyKey: &key}
+	req := txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "test.tx.idem.sametx", IdempotencyKey: &key}
 
 	j1, created1, err := st.EnqueueTx(ctx, tx, req)
 	require.NoError(t, err)
@@ -296,14 +297,14 @@ func TestEnqueueTx_IdempotencyKey_RollbackThenReuseSameKey_Succeeds(t *testing.T
 
 	tx1, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	j1, created1, err := st.EnqueueTx(ctx, tx1, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	j1, created1, err := st.EnqueueTx(ctx, tx1, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err)
 	require.True(t, created1)
 	require.NoError(t, tx1.Rollback(ctx))
 
 	tx2, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	j2, created2, err := st.EnqueueTx(ctx, tx2, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	j2, created2, err := st.EnqueueTx(ctx, tx2, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err)
 	require.True(t, created2, "the key must be fully reusable once the first attempt rolled back")
 	require.NotEqual(t, j1.ID, j2.ID)
@@ -356,7 +357,7 @@ func TestEnqueueTx_IdempotencyKey_ConcurrentTransactions_ExactlyOneCreates(t *te
 				errs[i] = err
 				return
 			}
-			j, created, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+			j, created, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 			if err != nil {
 				_ = tx.Rollback(ctx)
 				errs[i] = err
@@ -416,7 +417,7 @@ func TestEnqueueTx_ConcurrentCommitRollbackRace_OnlyCommittedJobsExist(t *testin
 				errs[i] = err
 				return
 			}
-			j, _, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: jobType})
+			j, _, err := st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType})
 			if err != nil {
 				_ = tx.Rollback(ctx)
 				errs[i] = err
@@ -434,7 +435,7 @@ func TestEnqueueTx_ConcurrentCommitRollbackRace_OnlyCommittedJobsExist(t *testin
 
 	for i := 0; i < n; i++ {
 		require.NoError(t, errs[i])
-		_, err := verify.GetByID(ctx, ids[i])
+		_, err := verify.GetByID(ctx, ids[i], testAccess)
 		if wantCommit[i] {
 			require.NoError(t, err, "committed job %d must exist", i)
 		} else {

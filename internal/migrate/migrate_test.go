@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
 	"github.com/SamudralaAjaykumarrr/taskforge/migrations"
 )
@@ -52,11 +53,29 @@ func TestUp_CreatesJobsTableWithExpectedConstraints(t *testing.T) {
 	).Scan(&constraintExists))
 	require.True(t, constraintExists)
 
-	var indexExists bool
-	require.NoError(t, db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_jobs_idempotency_key')`,
-	).Scan(&indexExists))
-	require.True(t, indexExists)
+	// Phase 12, migrations 0009/0010: migration 0001's global
+	// idx_jobs_idempotency_key is replaced by the principal-scoped
+	// idx_jobs_idempotency_scoped (0009 creates the new one, 0010 drops the
+	// old one -- two files because DROP INDEX needs ACCESS EXCLUSIVE and
+	// must not share a transaction with 0009's full-table scan). Both halves are asserted, because "the
+	// new index exists" alone would not catch a migration that created it
+	// but left the old, wider one in place -- which would keep enforcing
+	// global uniqueness and make two tenants' identical idempotency keys
+	// collide, exactly the bug this phase exists to fix.
+	require.False(t, indexExists(t, db, "idx_jobs_idempotency_key"),
+		"migration 0010 must DROP the global (job_type, idempotency_key) index")
+	require.True(t, indexExists(t, db, "idx_jobs_idempotency_scoped"),
+		"migration 0009 must create the principal-scoped idempotency index")
+}
+
+// indexExists reports whether a named index is present on the connected
+// database.
+func indexExists(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var exists bool
+	require.NoError(t, db.QueryRowContext(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)`, name).Scan(&exists))
+	return exists
 }
 
 // TestUp_CreatesJobAttemptsTableWithExpectedConstraints is Phase 2's
@@ -144,10 +163,20 @@ func TestUp_UpgradesPhase1SchemaToPhase2(t *testing.T) {
 	ctx := context.Background()
 
 	// Roll back to a Phase-1-only schema: drop everything migrations 2
-	// and 3 added and their schema_migrations records, leaving migration
-	// 1's jobs table (and a row in it, to prove data survives the
-	// upgrade) untouched. workflow_nodes/job_attempts must be dropped
+	// through 7 added and their schema_migrations records, leaving
+	// migration 1's jobs table (and a row in it, to prove data survives
+	// the upgrade) untouched. workflow_nodes/job_attempts must be dropped
 	// before jobs would matter, but jobs itself is never dropped here.
+	//
+	// Phase 12 is unwound FIRST, in the reverse of the order it was
+	// applied: the Phase 12 downs touch workflow_instances, which the
+	// Phase-2/3 teardown below removes entirely. Simulating a genuinely
+	// pre-Phase-12 schema this way means the "pre-existing" row below is
+	// inserted exactly as a Phase 1 deployment would have inserted it,
+	// with no principal at all, so migrate.Up has to add the column,
+	// backfill it, and re-tighten the constraint for real.
+	dropPhase12Schema(t, db)
+
 	_, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS workflow_nodes`)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, `DROP TABLE IF EXISTS workflow_instances`)
@@ -198,7 +227,16 @@ func TestUp_UpgradesPhase1SchemaToPhase2(t *testing.T) {
 		migratedVersions = append(migratedVersions, v)
 	}
 	require.NoError(t, rows.Err())
-	require.Equal(t, []int{1, 2, 3, 4}, migratedVersions)
+	require.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, migratedVersions)
+
+	// Phase 12's own half of this upgrade: the pre-existing row, inserted
+	// with no principal at all, must come out of migrate.Up attributed to
+	// the system principal -- not left NULL, and not dropped.
+	var backfilled uuid.UUID
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT principal_id FROM jobs WHERE job_type = 'test.phase1.preexisting'`).Scan(&backfilled))
+	require.Equal(t, principal.SystemPrincipalID, backfilled,
+		"migration 0007 must backfill a pre-Phase-12 row to the system principal")
 }
 
 // TestUp_UpgradesPhase6SchemaToPhase7 is Phase 7's analogue: starting from
@@ -211,6 +249,10 @@ func TestUp_UpgradesPhase1SchemaToPhase2(t *testing.T) {
 func TestUp_UpgradesPhase6SchemaToPhase7(t *testing.T) {
 	db := testutil.DB(t)
 	ctx := context.Background()
+
+	// Phase 12 first: its down migrations touch workflow_instances, which
+	// this teardown removes.
+	dropPhase12Schema(t, db)
 
 	_, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS workflow_nodes`)
 	require.NoError(t, err)
@@ -273,6 +315,7 @@ func TestMigration0004_BackfillsTerminalAttemptCount(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 4`)
 	require.NoError(t, err)
+	dropPhase12Schema(t, db)
 
 	terminalWithAttempts := uuid.New()
 	_, err = db.ExecContext(ctx, `
@@ -377,11 +420,11 @@ func TestMigration0004_BackfillsTerminalAttemptCount(t *testing.T) {
 	require.False(t, columnExistsAfterDown, "0004's down migration must remove jobs.terminal_attempt_count")
 }
 
-// TestFiles_ExactlyFourMigrationsEmbedded is a light guard against a
+// TestFiles_ExactlySevenMigrationsEmbedded is a light guard against a
 // migration file being accidentally left out of, or duplicated in, the
 // embedded set — mostly useful as a canary if migrations/embed.go's glob
 // pattern is ever changed.
-func TestFiles_ExactlyFourMigrationsEmbedded(t *testing.T) {
+func TestFiles_ExactlySevenMigrationsEmbedded(t *testing.T) {
 	entries, err := migrations.Files.ReadDir(".")
 	require.NoError(t, err)
 
@@ -391,5 +434,84 @@ func TestFiles_ExactlyFourMigrationsEmbedded(t *testing.T) {
 			upFiles++
 		}
 	}
-	require.Equal(t, 4, upFiles)
+	// Phase 12 adds six: 0005 (principals + api_keys), 0006 (principal_id
+	// columns), 0007 (backfill), 0008 (NOT NULL check, NOT VALID), 0009
+	// (VALIDATE + the principal and scoped-idempotency indexes) and 0010
+	// (drop the old global idempotency index). Six rather than three
+	// because internal/migrate holds every lock a file takes until that
+	// file commits -- see docs/phase-12-plan.md §5 "Why six files, not
+	// three".
+	require.Equal(t, 10, upFiles)
+}
+
+// dropPhase12Schema rewinds a migrated database to its pre-Phase-12 shape:
+// principal_id and its NOT NULL check constraint removed from jobs and
+// workflow_instances, the scoped idempotency index replaced by migration
+// 0001's global one, and migrations 0005-0010 unrecorded.
+//
+// It exists so the upgrade tests above insert their "pre-existing" rows
+// exactly as a real pre-Phase-12 deployment would have -- with no
+// principal at all -- rather than quietly supplying one and testing an
+// upgrade path nobody will ever run. It uses the real .down.sql files
+// (read from the embedded set) wherever they apply, so a down migration
+// that stops working is caught here too.
+func dropPhase12Schema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	// The embedded PostgreSQL instance is shared by every test in this
+	// binary, and testutil.DB only truncates tables -- it does not undo
+	// schema changes. A test that rewinds migrations must therefore put
+	// the schema back, or every later test in this package inherits a
+	// half-migrated database.
+	restorePhase12Schema(t, db)
+	for _, name := range []string{
+		"0010_drop_global_idempotency_index.down.sql",
+		"0009_validate_principal_id_and_scope_idempotency.down.sql",
+		"0008_require_principal_id.down.sql",
+		"0007_backfill_principal_id.down.sql",
+		"0006_add_principal_id_columns.down.sql",
+		"0005_create_principals_and_api_keys.down.sql",
+	} {
+		sqlText, err := migrations.Files.ReadFile(name)
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, string(sqlText))
+		require.NoError(t, err, "applying %s", name)
+	}
+	_, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10)`)
+	require.NoError(t, err)
+}
+
+// restorePhase12Schema re-applies migrations 0005-0010 on cleanup, so a
+// test that deliberately rewinds or rolls back the Phase 12 schema does
+// not leave the shared test database in that state for the tests that run
+// after it.
+//
+// It is idempotent-safe rather than relying on the .up.sql files being so:
+// 0008 adds check constraints with no IF NOT EXISTS guard (the migration
+// runner only ever applies each file once, so it does not need one), which
+// means they have to be cleared before they can be re-applied.
+func restorePhase12Schema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		stmts := []string{
+			// Divergent rows left behind by a rollback test would make
+			// 0009's unique index un-creatable.
+			`TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs, api_keys`,
+			`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_principal_id_not_null`,
+			`ALTER TABLE workflow_instances DROP CONSTRAINT IF EXISTS workflow_instances_principal_id_not_null`,
+			`DROP INDEX IF EXISTS idx_jobs_idempotency_scoped`,
+			`DROP INDEX IF EXISTS idx_jobs_principal_id`,
+			`DROP INDEX IF EXISTS idx_workflow_instances_principal_id`,
+			`DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10)`,
+		}
+		for _, stmt := range stmts {
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				t.Logf("restorePhase12Schema: %s: %v", stmt, err)
+			}
+		}
+		if err := migrate.Up(ctx, db); err != nil {
+			t.Errorf("restorePhase12Schema: re-applying migrations failed, later tests would inherit a broken schema: %v", err)
+		}
+	})
 }

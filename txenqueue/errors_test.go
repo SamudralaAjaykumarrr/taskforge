@@ -31,7 +31,7 @@ func TestEnqueueTx_NilTransaction_NoPanicReturnsInvalidTransactionError(t *testi
 
 	var tx pgx.Tx // ordinary nil interface, not a custom typed-nil implementation
 	require.NotPanics(t, func() {
-		j, created, err := st.EnqueueTx(context.Background(), tx, txenqueue.EnqueueRequest{JobType: "test.tx.niltx"})
+		j, created, err := st.EnqueueTx(context.Background(), tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "test.tx.niltx"})
 		require.Error(t, err)
 		require.ErrorIs(t, err, txenqueue.ErrInvalidTransaction)
 		require.Nil(t, j)
@@ -55,7 +55,7 @@ func TestEnqueueTx_ValidationFailure_ClassifiesAsErrInvalidRequest(t *testing.T)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: "   "})
+	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "   "})
 	require.Error(t, err)
 	require.ErrorIs(t, err, txenqueue.ErrInvalidRequest)
 	require.Contains(t, err.Error(), "job_type is required", "the safe validation detail must still be present")
@@ -79,7 +79,7 @@ func TestEnqueueTx_UnexpectedInsertFailure_ClassifiesAsErrEnqueueFailed_NoLeak(t
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{JobType: "bad\x00type"})
+	_, _, err = st.EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: "bad\x00type"})
 	require.Error(t, err)
 	require.ErrorIs(t, err, txenqueue.ErrEnqueueFailed)
 	require.False(t, errors.Is(err, txenqueue.ErrInvalidRequest), "a NUL byte is not rejected by internal/job.ValidateSubmission -- this must fail at the database, not validation")
@@ -111,14 +111,14 @@ func TestEnqueueTx_ReadCommitted_DuplicateAcrossSeparateTransactions_ResolvesToE
 
 	txA, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err)
 	require.True(t, createdA)
 	require.NoError(t, txA.Commit(ctx))
 
 	txB, err := pool.Begin(ctx) // default isolation: READ COMMITTED
 	require.NoError(t, err)
-	jB, createdB, err := st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	jB, createdB, err := st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err, "READ COMMITTED must always resolve a cross-transaction idempotency conflict, never require a retry")
 	require.False(t, createdB)
 	require.Equal(t, jA.ID, jB.ID)
@@ -157,12 +157,12 @@ func TestEnqueueTx_RepeatableRead_IdempotencyConflictOutsideSnapshot_MapsToMustR
 
 	txA, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err)
 	require.True(t, createdA)
 	require.NoError(t, txA.Commit(ctx))
 
-	_, _, err = st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	_, _, err = st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.Error(t, err, "B's fixed snapshot cannot see A's post-snapshot commit -- this must not be reported as success")
 	require.ErrorIs(t, err, txenqueue.ErrMustRetryTransaction)
 	require.False(t, errors.Is(err, store.ErrNotFound), "must never surface store.ErrNotFound's \"job doesn't exist\" meaning -- the job exists, just outside this snapshot")
@@ -210,12 +210,12 @@ func TestEnqueueTx_Serializable_IdempotencyConflictOutsideSnapshot_MapsToMustRet
 
 	txA, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	jA, createdA, err := st.EnqueueTx(ctx, txA, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.NoError(t, err)
 	require.True(t, createdA)
 	require.NoError(t, txA.Commit(ctx))
 
-	_, _, err = st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{JobType: jobType, IdempotencyKey: &key})
+	_, _, err = st.EnqueueTx(ctx, txB, txenqueue.EnqueueRequest{PrincipalID: testPrincipalID, JobType: jobType, IdempotencyKey: &key})
 	require.Error(t, err)
 	require.ErrorIs(t, err, txenqueue.ErrMustRetryTransaction)
 	require.False(t, errors.Is(err, store.ErrNotFound))

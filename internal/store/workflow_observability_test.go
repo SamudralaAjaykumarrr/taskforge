@@ -62,7 +62,7 @@ func TestWorkflowLogging_FinalizedExactlyOnceOnSuccess(t *testing.T) {
 	s, _, buf := newStoreWithMetricsAndLog(t)
 	ctx := context.Background()
 
-	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A")}})
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A")}})
 	require.NoError(t, err)
 
 	require.NotContains(t, buf.String(), `"event":"workflow_finalized"`)
@@ -97,7 +97,7 @@ func TestWorkflowLogging_FinalizedOnceOnCascadeFailure(t *testing.T) {
 	s, _, buf := newStoreWithMetricsAndLog(t)
 	ctx := context.Background()
 
-	spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A"), wfNode("C", "B")}}
+	spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{wfNode("A"), wfNode("B", "A"), wfNode("C", "B")}}
 	inst, err := s.CreateWorkflow(ctx, spec)
 	require.NoError(t, err)
 

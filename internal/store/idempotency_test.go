@@ -22,6 +22,7 @@ import (
 
 func newJobParamsWithKey(jobType, key string) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{"k":"v"}`),
 		MaxAttempts:             5,
@@ -62,7 +63,7 @@ func TestInsertIdempotent_FirstSubmission_CreatesJob(t *testing.T) {
 	require.NotNil(t, j.IdempotencyKey)
 	require.Equal(t, "key-1", *j.IdempotencyKey)
 
-	found, err := s.GetByIdempotencyKey(ctx, "test.idem.first", "key-1")
+	found, err := s.GetByIdempotencyKey(ctx, testPrincipalID, "test.idem.first", "key-1")
 	require.NoError(t, err)
 	require.Equal(t, j.ID, found.ID)
 }
@@ -122,6 +123,7 @@ func TestInsertIdempotent_ConflictingPayloadSameKey_FirstWriteWins(t *testing.T)
 
 	key := "conflict-key"
 	first, created1, err := s.InsertIdempotent(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.idem.conflict",
 		Payload:                 json.RawMessage(`{"version":"original"}`),
 		MaxAttempts:             5,
@@ -132,6 +134,7 @@ func TestInsertIdempotent_ConflictingPayloadSameKey_FirstWriteWins(t *testing.T)
 	require.True(t, created1)
 
 	second, created2, err := s.InsertIdempotent(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.idem.conflict",
 		Payload:                 json.RawMessage(`{"version":"DIFFERENT"}`),
 		MaxAttempts:             5,
@@ -275,13 +278,13 @@ func TestInsertIdempotent_RollbackLeavesNoPartialIdempotencyState(t *testing.T) 
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key)
-		VALUES ($1, 'test.idem.rollback', '{}', 'QUEUED', 5, 30, $2)`,
-		uuid.New(), key)
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key)
+		VALUES ($1, $3, 'test.idem.rollback', '{}', 'QUEUED', 5, 30, $2)`,
+		uuid.New(), key, testPrincipalID)
 	require.NoError(t, err)
 	require.NoError(t, tx.Rollback())
 
-	_, err = s.GetByIdempotencyKey(ctx, "test.idem.rollback", key)
+	_, err = s.GetByIdempotencyKey(ctx, testPrincipalID, "test.idem.rollback", key)
 	require.ErrorIs(t, err, store.ErrNotFound,
 		"a rolled-back submission must leave no durable job row and no durable idempotency mapping")
 
@@ -305,6 +308,6 @@ func TestGetByIdempotencyKey_NotFound(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.GetByIdempotencyKey(ctx, "test.idem.missing", "never-submitted")
+	_, err := s.GetByIdempotencyKey(ctx, testPrincipalID, "test.idem.missing", "never-submitted")
 	require.ErrorIs(t, err, store.ErrNotFound)
 }

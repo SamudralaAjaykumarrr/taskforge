@@ -184,17 +184,18 @@ Once implemented, TaskForge targets (each backed by a numbered invariant in
 | Area | Status |
 |---|---|
 | Architecture & invariant documentation | **Done** (this repository, current state) |
-| PostgreSQL schema | **Phase 2 done, still sufficient through Phase 6; extended in Phase 7** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`scheduled_at`/`cancel_requested`/`cancel_requested_at`/`terminal_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`/`TIMED_OUT`/`CANCELLED`. Phase 3, Phase 4, and Phase 6 all required **no new migration**. Phase 7 adds migration `0003_create_workflow_tables` — `workflow_instances`/`workflow_nodes` — with **no changes to the `jobs` table itself**: dependency gating reuses the existing `eligible_at` column with a far-future sentinel value — see "Phase 7: What's Implemented" below) |
-| API server | **Phase 1 done, extended in Phase 6 and Phase 7** (`POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status — Phase 6 added `scheduled_at` request/response support and the cancel endpoint. Phase 7 adds `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel` with no change to any existing job endpoint) |
+| PostgreSQL schema | **Phase 2 done, still sufficient through Phase 6; extended in Phase 7 and Phase 12** (`jobs` table per Phase 1 already included `RETRY_WAIT`/`eligible_at`/`scheduled_at`/`cancel_requested`/`cancel_requested_at`/`terminal_at`/`last_error_class`; `job_attempts` added in Phase 2, migration `0002_create_job_attempts_table`, already allowed `FAILED_RETRYABLE`/`TIMED_OUT`/`CANCELLED`. Phase 3, Phase 4, and Phase 6 all required **no new migration**. Phase 7 adds migration `0003_create_workflow_tables` — `workflow_instances`/`workflow_nodes` — with **no changes to the `jobs` table itself**: dependency gating reuses the existing `eligible_at` column with a far-future sentinel value — see "Phase 7: What's Implemented" below. Phase 12 adds migrations `0005`–`0010`: the `principals`/`api_keys` tables, a mandatory `principal_id` on `jobs` and `workflow_instances` with every pre-Phase-12 row backfilled to a seeded system principal, and the re-scoping of the idempotency constraint to `(principal_id, job_type, idempotency_key)`) |
+| API server | **Phase 1 done, extended in Phase 6, Phase 7 and Phase 12** (`POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`; `GET /jobs/{id}` already surfaced `state`/`attempt_count`/`eligible_at`/`last_error`/`last_error_class`, so it needed no change to expose `RETRY_WAIT` and retry/DLQ status — Phase 6 added `scheduled_at` request/response support and the cancel endpoint. Phase 7 adds `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel` with no change to any existing job endpoint. Phase 12 adds **no route at all** — it adds authentication and per-principal authorization to every existing one, which is a breaking change: an unauthenticated request now receives `401`) |
 | Worker / claim / lease protocol | **Phase 2 done, hardened under load in Phase 5, extended in Phase 6, unchanged (by design) in Phase 7**: multiple concurrent worker processes, lease expiration/reclaim, heartbeat renewal, fencing proven under real concurrent workers (not just the stale-credential mechanism), cooperative cancellation observation, and a fixed per-attempt execution-timeout ceiling distinct from lease renewal — see "Phase 2", "Phase 5", and "Phase 6: What's Implemented" below. Phase 7 introduces no new claiming mechanism: a workflow node's job is claimed by the exact same, byte-for-byte unmodified claim query |
 | Retry / backoff / DLQ | **Phase 3 done**: durable exponential backoff with equal jitter, retryable-vs-permanent failure classification via the handler contract, `RETRY_WAIT` claimable via the same claim query as `QUEUED`, and exhaustion-driven `DEAD_LETTERED` with preserved attempt history — see "Phase 3: What's Implemented" below |
-| Idempotency enforcement | **Phase 4 done**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below |
+| Idempotency enforcement | **Phase 4 done, re-scoped per tenant in Phase 12**: `Idempotency-Key` request header, database-unique-constraint-enforced deduplication (no check-then-act read), proven under 60-goroutine concurrent duplicate submissions and simulated process restarts; execution-side `job_id` identity documented and demonstrated — see "Phase 4: What's Implemented" below. Phase 12 scopes the uniqueness constraint to `(principal_id, job_type, idempotency_key)` so two tenants choosing the same key are two independent submissions, not a false duplicate |
 | Concurrency hardening | **Phase 5 done**: tens-of-workers/hundreds-of-jobs claim/reclaim/fencing/retry stress suites against real PostgreSQL, a connection-pool-constrained claim test, and a repeated-seed randomized crash/retry/success simulation — no new product code required, since Phase 1–4's short-transaction, fenced-lease design already satisfied every property tested; see "Phase 5: What's Implemented" below |
 | Scheduling | **Phase 6 done**: `scheduled_at`/`eligible_at` future-execution semantics, PostgreSQL-authoritative eligibility (no in-memory scheduler), survives full process/fleet restart — see "Phase 6: What's Implemented" below |
 | Cancellation / timeouts | **Phase 6 done**: `POST /jobs/{id}/cancel`, deterministic cancel-vs-completion race resolution (TF-INV-010), a real `execution_timeout` ceiling distinct from lease TTL, cooperative cancellation observation via heartbeat — see "Phase 6: What's Implemented" below for the explicit, documented limits (cooperative only, no forced termination of uncooperative handler code) |
 | Workflow / DAG execution | **Phase 7 done**: `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/cancel`; dependency-gated eligibility, fan-out, fan-in (including concurrent completion), retry/dead-letter/cancellation propagation, workflow-level cancellation, atomic workflow creation — see "Phase 7: What's Implemented" below |
 | Observability | **Phase 8 done**: every metric in [docs/observability.md](docs/observability.md) implemented (Prometheus-compatible, `GET /metrics`), structured event/correlation logging across submission/claim/reclaim/retry/dead-letter/cancellation/timeout/workflow, durable-state gauges computed at scrape time (no drift across restart) — see "Phase 8: What's Implemented" below. Tracing not implemented (explicit, documented deferral — see that section) |
 | Test suite (unit/integration/concurrency/chaos) | **Phase 9 done**: unit (including a randomized property test), state-machine table, PostgreSQL integration, and real multi-goroutine concurrency tests (claim races, reclaim races, retry-eligibility races, idempotency-key submission races, scheduling races, cancellation races, concurrent fan-in races) at small scale (Phase 1–4) extended with tens-of-workers/hundreds-of-jobs stress variants (Phase 5), scheduling/cancellation/timeout scenario coverage including SF-011/SF-012/SF-013 (Phase 6), DAG scenario coverage SF-019 through SF-030 (Phase 7), metric-assertion tests attached to SF-001/SF-005/SF-007 through SF-012 plus a cardinality/race audit (Phase 8), and a CI-safe seeded chaos suite (`internal/chaos`) plus a manual stress/soak harness (`cmd/chaos`) driving every documented failure class in combination with continuous durable-invariant checking (Phase 9) — see "Phase 9: What's Implemented" below for what has and has not actually been run |
+| Security & trust boundaries | **Phase 12 done**: API-key authentication (`Authorization: Bearer <key_id>.<secret>`, HMAC-peppered storage, constant-time verification, revocation and rotation-with-overlap with no redeploy) on all six job/workflow routes (both `/v1` and legacy) plus `GET /metrics`; deny-by-default by router construction; per-principal resource isolation enforced **in SQL, in the same statement that mutates** — with a direct-database proof that an unauthorized cancel mutates zero rows; tenant-scoped idempotency landed in the same migration set as principals; `actor` audit field; least-privilege PostgreSQL roles. **Breaking change**: unauthenticated callers now receive `401`, with no grace period. Rate limiting/quota remain absent (Phase 13) — see "Phase 12: What's Implemented" below for the full non-scope list |
 | Chaos / load / soak testing | **Phase 9 done** (Hardening, not yet Stable): deterministic seeded fault injection (`internal/chaos`), a durable TF-INV-* checker (`internal/invariant`), and a manually invoked stress/soak CLI (`cmd/chaos`) — see "Phase 9: What's Implemented" below for exact campaigns, seeds, and the honest gap to the roadmap's multi-hour Stable bar |
 
 See [docs/roadmap.md](docs/roadmap.md) for the full phased plan, from
@@ -857,16 +858,20 @@ guarantee exactly-once execution of arbitrary side effects.
   and [ADR-0004](docs/adr/0004-idempotency-for-exactly-once-effects.md)
   require — the INSERT (with `idempotency_key` set in the SAME statement
   as the rest of the row, never a separate mapping write) is attempted
-  directly; a unique-constraint violation against
-  `idx_jobs_idempotency_key` is caught and resolved by re-reading and
-  returning the already-committed existing row, never by a preceding
-  `SELECT`. `Store.Insert` (all pre-Phase-4 callers) is now a thin wrapper
+  directly; a unique-constraint violation against the idempotency index is
+  caught and resolved by re-reading and returning the already-committed
+  existing row, never by a preceding `SELECT`. (Phase 12 re-scoped that
+  index to `(principal_id, job_type, idempotency_key)` and renamed it
+  `idx_jobs_idempotency_scoped`; the mechanism described here is otherwise
+  unchanged.) `Store.Insert` (all pre-Phase-4 callers) is now a thin wrapper
   around this with `IdempotencyKey` left `nil`, so no existing behavior or
-  call site changed. **No new migration was required** — migration
-  0001's `idx_jobs_idempotency_key` unique index
+  call site changed. **No new migration was required for Phase 4** —
+  migration 0001's `idx_jobs_idempotency_key` unique index
   (`UNIQUE (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL`)
   was deliberately created ahead of this phase specifically so it would
-  need none, exactly as that migration's own comment says.
+  need none, exactly as that migration's own comment says. (Phase 12 later
+  replaced that index with the principal-scoped
+  `idx_jobs_idempotency_scoped` — see "Phase 12: What's Implemented".)
 - **First-write-wins, no conflict detection, per the documented v1
   decision**: a retried submission under the same key with a *different*
   payload is not rejected, not flagged, and does not update the existing
@@ -2684,6 +2689,307 @@ docs/transactional-enqueue.md for the full design.
   uses the exact same durable representation and execution path as any
   other job.
 
+## Phase 12: What's Implemented
+
+**Status: Complete.** Phase 12 (docs/enterprise-roadmap.md "Security &
+Trust Boundaries", docs/security-model.md, docs/phase-12-plan.md) closes the
+single most-cited gap in every review document: before this phase TaskForge
+had **no authentication, no authorization, and no identity concept
+anywhere** — any client that could reach the API could submit, inspect, and
+cancel any job or workflow, and scrape `GET /metrics`.
+
+**This is a breaking API change, deliberately and without a grace period.**
+Every previously-open endpoint now returns `401` without a credential. There
+is no `observe`/`enforce` dual mode and no flag that disables
+authentication. `txenqueue.EnqueueRequest` likewise gains a **required**
+`PrincipalID`. Both hard cutovers are evidence-based: `txenqueue` had zero
+callers outside its own tests, and the project is labelled Experimental.
+
+### Authentication
+
+- **Transport**: `Authorization: Bearer <key_id>.<secret>`. One credential
+  shape, checked in one place. There is deliberately no `X-API-Key` header
+  and no second accepted transport.
+- **Key format**: `key_id` is 16 random bytes hex-encoded and is **not a
+  secret** — it exists so a key can be looked up, rotated, and revoked
+  without ever comparing raw secrets, and so the verification lookup is
+  keyed on a non-secret value. The secret is 32 bytes (256 bits) from
+  `crypto/rand`, base64url-encoded, **shown exactly once** at creation and
+  never recoverable afterwards.
+- **Storage**: `secret_hash = HMAC-SHA256(pepper, secret)` — never the raw
+  secret, and never a bare digest. The pepper (`TASKFORGE_API_KEY_PEPPER`)
+  lives only in the process environment, so a stolen `api_keys` table alone
+  is insufficient to forge *or offline-verify* a credential. `cmd/api`
+  refuses to start without it.
+- **Verification**: parse → indexed lookup by `key_id` → revoked/expired
+  check → `crypto/subtle.ConstantTimeCompare` of the HMAC → owning
+  principal's revocation check. `last_used_at` is recorded best-effort, off
+  the request's critical path.
+- **Uniform failure**: all six internal rejection reasons produce the
+  **byte-identical** `401` body, so a caller cannot enumerate which
+  `key_id`s exist or which have been retired. The reason survives only
+  server-side, as a `taskforge_auth_failures_total{reason}` label and a log
+  field.
+- **Revocation and rotation** need no redeploy, restart, or cache
+  invalidation: revocation is read from the database on every request, and
+  rotation-with-overlap falls out of simply having two live keys.
+
+### Authorization
+
+- **Deny-by-default by construction.** Every route is registered through a
+  single `mount` helper that applies the middleware unconditionally and
+  requires a scope in its signature; a source-scanning test asserts no
+  handler is mounted any other way. A `Handlers` built without an
+  authenticator rejects everything rather than serving openly.
+- All six job/workflow routes — on **both** the `/v1` and the legacy
+  unprefixed surfaces — require the `jobs` scope. A deprecated route is not
+  an unauthenticated one.
+- `GET /metrics` **on `cmd/api`** requires the `metrics` scope. A jobs-only
+  key gets `403` there; a metrics-only key gets `403` on every job route. A
+  scope mismatch is `403`, deliberately distinguishable from `401` and from
+  the `404` used for ownership — a scope check has no per-resource id at
+  stake, so it discloses nothing.
+- **`cmd/worker`'s standalone metrics listener (`TASKFORGE_METRICS_ADDR`,
+  default `:9090`) is NOT authenticated**, and cannot be in this phase:
+  checking an API key there would require the worker to read the
+  `principals`/`api_keys` tables, which OD-3 and the least-privilege role
+  model explicitly forbid. It is a deployment obligation — bind or firewall
+  it to a private network — in the same category as the TLS proxy boundary.
+  docs/security-model.md §5 states this in full; the operational-volume
+  disclosure finding is therefore closed on the API surface and open on the
+  worker listener, not closed outright.
+
+### Resource isolation, enforced in SQL rather than in handlers
+
+A caller may read and cancel only what it submitted. The ownership
+predicate is part of the **same statement** that does the work —
+`WHERE id = $1 AND ($2::boolean OR jobs.principal_id = $3)` — not a
+handler-level check preceding it.
+
+That distinction is the whole point, and it was an architecture blocker the
+plan's review caught: `POST /jobs/{id}/cancel`'s very first action is a
+*mutating* `UPDATE`. A "check the owner, then call the store" design would
+have let an unauthorized caller flip `cancel_requested` on another
+principal's `RUNNING` job **before any check could run**, and adding a
+read-first step would have introduced exactly the check-then-act race this
+codebase avoids everywhere else. Putting the predicate in the statement
+closes the window structurally, and makes "not found" and "not yours" the
+same `ErrNotFound` through the same code path — so no handler has to
+remember to collapse them.
+
+The tests prove the durable claim, not the HTTP one:
+`TestCancelJob_CrossPrincipal_MutatesZeroRows` snapshots every mutable
+column of the victim's row straight from PostgreSQL — including `version`,
+which any matching fenced `UPDATE` would have incremented — and asserts it
+is unchanged after the attempt.
+
+**The one documented exception** is an `admin`-**kind** principal, which may
+read and cancel any principal's resources. Note the deliberate separation:
+the `admin` **scope** widens a *credential's* capabilities but grants no
+ownership bypass — only the principal's kind does. So minting a powerful key
+for an ordinary caller cannot accidentally hand it cross-tenant reads.
+
+### Tenant-scoped idempotency
+
+`UNIQUE(job_type, idempotency_key)` became
+`UNIQUE(principal_id, job_type, idempotency_key)` — in the **same migration
+set** that introduced principals, never as a follow-up, so there is no
+release in which principals exist but idempotency is still global. Two
+tenants choosing the same `job_type` and `Idempotency-Key` are two
+independent submissions. The conflict-recovery re-read is principal-scoped
+too, which is load-bearing rather than cosmetic: a global read there would
+have handed tenant B's job back to tenant A.
+
+### Migrations (applied in this exact order)
+
+| Migration | What it does | Strongest lock on `jobs` | Long-running? |
+|---|---|---|---|
+| `0005_create_principals_and_api_keys` | Both new tables, plus the seeded **system principal** (`00000000-0000-0000-0000-000000000001`). Purely additive — touches no existing table. | none on `jobs` | no |
+| `0006_add_principal_id_columns` | Adds `principal_id` (nullable) to `jobs` and `workflow_instances`. Nothing else. | `ACCESS EXCLUSIVE` (catalog-only) | no |
+| `0007_backfill_principal_id` | **Backfills every pre-Phase-12 row to the system principal.** | `ROW EXCLUSIVE` | **yes** |
+| `0008_require_principal_id` | Adds the `NOT NULL` check constraints as `NOT VALID`. | `ACCESS EXCLUSIVE` (catalog-only) | no |
+| `0009_validate_principal_id_and_scope_idempotency` | `VALIDATE CONSTRAINT`s both, then builds the principal indexes and the principal-scoped idempotency index. | `SHARE UPDATE EXCLUSIVE` / `SHARE` | **yes** |
+| `0010_drop_global_idempotency_index` | Drops migration 0001's global idempotency index. | `ACCESS EXCLUSIVE` (catalog-only) | no |
+
+Six small files rather than three larger ones, for one reason:
+`internal/migrate` wraps each `.up.sql` in a single transaction and
+PostgreSQL releases locks only at commit, so **every lock a file takes is
+held until that whole file finishes**. Splitting keeps each `ACCESS
+EXCLUSIVE` statement alone in its own file, so no `ACCESS EXCLUSIVE` lock is
+ever held across a full-table scan or a full-table write.
+
+**What the split buys, stated narrowly**: the two table-size-dependent files
+(`0007`'s backfill, `0009`'s validation scan plus index builds) take no
+`ACCESS EXCLUSIVE` lock. That is all it buys. It does **not** make the
+sequence online, non-blocking, or zero-downtime.
+
+**What is deliberately not claimed.** Two earlier revisions of this README
+claimed more than PostgreSQL delivers and were each measured to be false, so
+this is stated flatly:
+
+- **`0009` blocks every write to `jobs`, including the worker claim
+  query**, from its first `CREATE INDEX` until the migration commits.
+  `CREATE INDEX` takes `SHARE`; `SHARE` conflicts with the `ROW EXCLUSIVE`
+  that every write needs; and `internal/store/claim.go`'s claim query is a
+  `WITH candidate AS (SELECT … FOR UPDATE SKIP LOCKED) UPDATE jobs …` — a
+  **write**, despite the `SELECT` in its CTE. Measured against the real
+  `0009` on a 3M-row / 426 MB table, the real claim query hit `lock_timeout`
+  (SQLSTATE `55P03`) instead of claiming. Reads are unaffected.
+  `CREATE INDEX CONCURRENTLY` would avoid this but cannot run inside a
+  transaction block, and every migration here runs inside one.
+- `0006`, `0008` and `0010` take `ACCESS EXCLUSIVE`; they are catalog-only
+  and O(1) once acquired (measured: `0006` ~3 ms and `0008` ~1 ms on an
+  800k-row table, versus ~22 ms for a full scan of it), but like all DDL
+  they must *wait* for any conflicting lock already held, and queue new
+  requests — readers included — behind them while waiting.
+- `0007` takes only `ROW EXCLUSIVE`, which conflicts with neither reads nor
+  other writes, so the claim query keeps running throughout it.
+- **Duration is data-, table-size- and environment-dependent and is bounded
+  by nothing here.** Benchmark `0007` and `0009` against a realistically
+  sized copy of your own `jobs` table, set `lock_timeout`, and run `0009` in
+  a quiet or maintenance window sized by that benchmark — expecting worker
+  claiming to stop for its duration. Those are deployment obligations
+  TaskForge cannot discharge for you.
+
+Full per-statement detail, including the lock-conflict reasoning, is in
+[docs/data-model.md](docs/data-model.md) "Phase 12 migration lock profile."
+
+`principal_id` being nullable through `0006`–`0007` is a *transitional step
+isolating a data-volume-dependent backfill from constraint tightening* — not
+a compatibility design. `NOT NULL` is the steady state, reached in `0009`
+before the scoped index is created in that same migration, so there is never
+a window in which a NULL could widen that index's uniqueness scope.
+
+`0010`'s **down migration is honest rather than blanket-safe**: it attempts
+to recreate the global unique index, and fails loudly with a PostgreSQL
+uniqueness violation once two principals genuinely share a key — because
+TaskForge cannot choose which tenant's job to discard. It is the only Phase
+12 down that can fail, which is why it is alone in its own file: every other
+rollback step is unconditionally safe and must not be gated on this one's
+outcome. A test asserts that failure, and asserts it is atomic (nothing
+half-reverted).
+
+### Trust boundaries kept distinct
+
+- **Worker identity is not an application principal** (and `principals.kind`
+  has no `'worker'` value, enforced by a `CHECK` constraint). A worker's
+  identity is its PostgreSQL role credential, verified by PostgreSQL itself
+  at connection time — a different mechanism, in a different layer, checked
+  by a different system. Workers never call the HTTP API.
+  `lease_owner`/`lease_generation` fencing is completely unchanged.
+- **TLS terminates externally.** `cmd/api` speaks plaintext HTTP behind a
+  reverse proxy or load balancer, which is a **required** deployment
+  boundary for any untrusted network. Correspondingly TaskForge trusts
+  **no** forwarded header — `X-Forwarded-For`, `X-Forwarded-Proto`,
+  `X-Real-IP` or any other — for any security decision. A source-scanning
+  test asserts the production code does not even *read* one, so the property
+  cannot erode via a change that reads it "just for logging."
+- **Least-privilege database roles**: `deploy/postgres-roles.sql` provisions
+  `taskforge_api` and `taskforge_worker` with disjoint, minimal grants
+  (workers get no access to the credential tables at all; neither role may
+  `DELETE` anything). This bounds a compromised process's blast radius; it
+  explicitly does **not** contain hostile worker code.
+
+### Operator tooling (no new HTTP surface)
+
+Key lifecycle is a separate binary, `cmd/taskforge-admin` — deliberately not
+an endpoint. Phase 12 adds **zero new routes**; it adds middleware and
+scoping to existing ones.
+
+```bash
+export TASKFORGE_DATABASE_URL=... TASKFORGE_API_KEY_PEPPER=...
+
+go run ./cmd/taskforge-admin create-principal -kind=caller -name="orders service"
+go run ./cmd/taskforge-admin create-key -principal=<uuid> -scopes=jobs
+#   -> prints the credential ONCE; it is not recoverable afterwards
+
+curl -H "Authorization: Bearer <key_id>.<secret>" \
+     -H "Content-Type: application/json" \
+     -d '{"job_type":"email.send","payload":{}}' \
+     localhost:8080/v1/jobs
+
+go run ./cmd/taskforge-admin revoke-key -key-id=<key_id>
+#   -> stops authenticating on its very next use, with no redeploy
+```
+
+### Audit trail
+
+Every submit and cancel log line carries an `actor` field holding the
+authenticated principal's ID — a non-secret identifier. The credential that
+proved it never appears in any log line or error, on any success or failure
+path; a log-output test audits every path in the verification sequence for
+the raw secret rather than trusting review.
+
+### Not implemented / explicit non-scope
+
+Stated as decisions with reasons, not omissions:
+
+- **No rate limiting, brute-force lockout, or per-tenant quota.** Deferred
+  to Phase 13 by name in docs/enterprise-roadmap.md. The rationale is that
+  this credential is a 256-bit random token, not a guessable password, so
+  the online-guessing threat model differs qualitatively from a login form.
+  What this phase provides instead is **observability only**
+  (`taskforge_auth_failures_total{reason}`) — a signal an operator can act
+  on, explicitly not a control. This is a deferral, not a solved problem.
+- **No native TLS termination in `cmd/api`** (see above). TaskForge cannot
+  verify from inside the process that the operator actually deployed the
+  required proxy — that stays a deployment-review item.
+- **No self-service HTTP API for key creation/rotation/revocation.**
+- **No full RBAC, permission graph, OIDC/SSO, or per-`job_type` policy
+  engine** — a flat per-key scope list plus an ownership check, nothing
+  more. An authenticated caller may still submit any `job_type`.
+- **No application-level worker principal**, and no mTLS for API callers.
+- **No `txenqueue` compatibility adapter.** `EnqueueTxUnscoped` is
+  documented as a *contingency* and deliberately not built; a test asserts
+  the package contains no reference to the system principal at all, so a
+  default-to-system fallback cannot appear by accident.
+- **`last_used_at` telemetry is unbounded per authenticated request —
+  known follow-up, not fixed here.** Each successful verification starts a
+  goroutine that takes a *second* pooled connection to write
+  `api_keys.last_used_at`, and `cmd/api` sets no `SetMaxOpenConns`, so Phase
+  12 roughly doubles the authenticated path's connection demand against an
+  unbounded pool. A burst can exhaust `max_connections`. The write itself is
+  genuinely best-effort; its concurrency is not bounded, and bounding it is
+  deferred. Availability risk only — no confidentiality or integrity impact.
+- **A database outage during credential verification returns `401`, not a
+  `5xx` — known follow-up, not fixed here.** Every `Verify` error, including
+  a database error, produces the uniform `401`, so a caller cannot tell "bad
+  credential, stop retrying" from "credential store down, retry later". It
+  fails *closed*, and server-side the case is distinguishable as
+  `taskforge_auth_failures_total{reason="internal_error"}`. Mapping it to
+  `503` is deferred, not done.
+- **No payload/`result_metadata` classification or encryption**, and no
+  cancel-replay nonce (accepted, documented low-severity risk).
+- **`docs/invariants.md` is deliberately not modified by this phase.**
+  Phase 12's guarantees are carried as symbolic names (G1–G8) in
+  docs/phase-12-plan.md; allocating formal `TF-INV-0NN` IDs is a separate
+  documentation-governance change to be coordinated across the Phase 12 and
+  Phase 13 owners, not decided unilaterally inside either phase's
+  implementation.
+
+### Upgrading an existing deployment
+
+1. Generate a pepper (`openssl rand -base64 48`) and set
+   `TASKFORGE_API_KEY_PEPPER` for `cmd/api`.
+2. Apply `migrations/` as a privileged (owner-role) step — start `cmd/api`
+   once under the owner role, or run `migrations/` with `psql` — to apply
+   `0005`–`0010`. **Benchmark `0007` (the backfill) and `0009` (the
+   validation scan and index builds) against a realistically-sized copy of
+   your own `jobs` table first**: both read or write the whole table, and
+   that duration is data-dependent and cannot be meaningfully reproduced in
+   a test — see those migrations' own comments. Neither blocks reads, and
+   `0007` blocks no writes either; but **`0009` blocks every write to
+   `jobs`, so workers cannot claim, complete, or heartbeat for its whole
+   duration**. Set `lock_timeout` and run it in a quiet or maintenance
+   window sized by your benchmark. Once migrated, `cmd/api` and `cmd/worker`
+   start normally under the least-privilege roles.
+3. Mint a principal and key per calling service with
+   `cmd/taskforge-admin`, and update each caller to send the `Bearer`
+   header. Until they do, they receive `401`.
+4. Existing jobs and workflows are attributed to the system principal, which
+   holds no credential — so they are readable only by an `admin`-kind
+   principal.
+
 ## Documentation Map
 
 | Document | Contents |
@@ -2704,10 +3010,12 @@ docs/transactional-enqueue.md for the full design.
 | [docs/scenario-corpus.md](docs/scenario-corpus.md) | 36 named, deterministic test scenarios (SF-001 through SF-036) |
 | [docs/roadmap.md](docs/roadmap.md) | Phased implementation plan with entry/exit criteria per phase |
 | [docs/adr/](docs/adr/README.md) | Architecture decision records — the real tradeoffs behind the design |
-| [docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) | Phases 10–18: the enterprise-readiness sequencing plan (Phases 10–11 implemented; 12–18 proposed) |
+| [docs/enterprise-roadmap.md](docs/enterprise-roadmap.md) | Phases 10–18: the enterprise-readiness sequencing plan (Phases 10–12 implemented; 13–18 proposed) |
 | [docs/supply-chain-security.md](docs/supply-chain-security.md) | Phase 10: dependency scanning, SBOM, provenance attestation, release process and verification, limitations |
 | [docs/transactional-enqueue.md](docs/transactional-enqueue.md) | Phase 11: the `txenqueue` package, same-PostgreSQL-transaction atomicity, and the transactional-outbox pattern for the cross-database case |
 | [docs/compatibility-policy.md](docs/compatibility-policy.md) | API/schema evolution rules — API versioning, unknown-field tolerance, and body-size limits implemented (Phase 11); rolling-upgrade proof still proposed (Phase 14) |
+| [docs/security-model.md](docs/security-model.md) | Threat model by category — authentication, ownership authorization, tenant-scoped idempotency, metrics auth and the audit trail implemented (Phase 12); rate limiting/quota (Phase 13) and an incident runbook still absent |
+| [docs/phase-12-plan.md](docs/phase-12-plan.md) | Phase 12: the principal/API-key design, the store-layer authorization decision and the architecture blocker it resolves, the migration sequence, and the full proof matrix |
 
 ## Technology Direction
 

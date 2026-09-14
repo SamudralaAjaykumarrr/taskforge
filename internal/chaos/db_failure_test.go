@@ -56,7 +56,7 @@ func TestChaos_DatabaseRollback_ClaimAndRetryTransitionsSurviveInjectedFailure(t
 				require.Error(t, err, "a poisoned attempt insert must surface as an error, not silently succeed")
 				require.False(t, ok)
 
-				after, err := s.GetByID(ctx, created.ID)
+				after, err := s.GetByID(ctx, created.ID, testAccess)
 				require.NoError(t, err)
 				require.Equal(t, jobstate.Queued, after.State, "TF-INV-013: a rolled-back claim must leave the job exactly as it was")
 				require.Equal(t, 0, after.AttemptCount)
@@ -137,7 +137,7 @@ func TestChaos_ConnectionInterruption_TerminatedBackendDoesNotCorruptState(t *te
 		// The row must be completely unaffected: the connection died
 		// before commit, so PostgreSQL guarantees the transaction never
 		// took effect (TF-INV-013).
-		after, err := s.GetByID(ctx, created.ID)
+		after, err := s.GetByID(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.Running, after.State)
 		require.Equal(t, int64(1), after.LeaseGeneration)

@@ -111,7 +111,7 @@ func TestChaos_ObservabilityDuringFailure_MetricsReflectEveryFaultClass(t *testi
 	cc, ok, err := claimUntilResolved(t, ctx, s, "obs-cancel-w")
 	require.NoError(t, err)
 	require.True(t, ok)
-	_, err = s.RequestCancellation(ctx, cancelJob.ID)
+	_, err = s.RequestCancellation(ctx, cancelJob.ID, testAccess)
 	require.NoError(t, err)
 	_, err = s.CompleteCancelled(ctx, cc.ID, "obs-cancel-w", cc.LeaseGeneration)
 	require.NoError(t, err)

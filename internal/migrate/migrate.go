@@ -95,8 +95,56 @@ func Up(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// ensureMigrationsTable creates the ledger if, and only if, it is not
+// already there.
+//
+// The existence probe is not an optimisation -- it is what makes Up
+// runnable by a least-privilege role (Phase 12, G4). PostgreSQL performs
+// the schema-level CREATE privilege check for `CREATE TABLE IF NOT EXISTS`
+// BEFORE the IF NOT EXISTS short-circuit, so issuing that statement
+// unconditionally fails with "permission denied for schema public" for any
+// role that has been correctly denied CREATE -- even when the table plainly
+// exists and there is nothing whatsoever to create.
+//
+// cmd/api and cmd/worker call Up on every startup, and
+// deploy/postgres-roles.sql points them at roles that (deliberately) cannot
+// create objects, so the unconditional form made the documented
+// least-privilege deployment impossible to start. Probing pg_catalog first
+// needs no privilege beyond the SELECT on schema_migrations those roles
+// already hold, and leaves the privilege boundary itself untouched: a role
+// without CREATE still cannot create anything, and a genuinely pending
+// migration still fails loudly against it (see
+// TestMigrateUp_UnderLeastPrivilegeRole_CannotApplyAPendingMigration).
+//
+// to_regclass resolves through search_path, exactly as the unqualified
+// CREATE and SELECT below and above it do, and returns NULL rather than
+// raising when the relation does not exist. The advisory lock Up already
+// holds serialises the check-then-create against concurrently starting
+// processes, so the probe introduces no race the IF NOT EXISTS was covering.
 func ensureMigrationsTable(ctx context.Context, db execQuerier) error {
-	_, err := db.ExecContext(ctx, `
+	rows, err := db.QueryContext(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	exists := false
+	if rows.Next() {
+		if err := rows.Scan(&exists); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version     BIGINT PRIMARY KEY,
 			name        TEXT NOT NULL,

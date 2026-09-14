@@ -129,7 +129,7 @@ func TestChaos_RetryStorm_SeededManyJobsUnderContention(t *testing.T) {
 			require.Less(t, round, maxRounds, "retry storm did not converge within the round budget")
 
 			for _, sc := range scripts {
-				final, err := s.GetByID(ctx, mustParseUUID(t, sc.jobID))
+				final, err := s.GetByID(ctx, mustParseUUID(t, sc.jobID), testAccess)
 				require.NoError(t, err)
 				require.True(t, final.IsTerminal(), "job %s did not reach a terminal state", sc.jobID)
 				require.LessOrEqual(t, final.AttemptCount, sc.maxAttempts, "TF-INV-006: attempt_count must never exceed max_attempts")

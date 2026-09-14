@@ -18,6 +18,7 @@ The single durable record of a logical unit of work.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `uuid` PRIMARY KEY | Generated at submission time (client-supplied or server-generated — see [worker-protocol.md](worker-protocol.md) API contract). |
+| `principal_id` | `uuid` NOT NULL REFERENCES `principals(id)` (migrations 0006–0009) | The API caller that submitted this job (Phase 12). Populated exactly once per submission, from the authenticated credential — never from a request body, header, or query parameter. `NOT NULL` is a steady state, not a transitional convenience, and it is reached across four migrations for transaction-boundary reasons (see "Phase 12 migration lock profile" below): `0006` adds the column nullable, `0007` backfills every pre-Phase-12 row to `principal.SystemPrincipalID`, `0008` adds the `NOT NULL` check constraint as `NOT VALID`, and `0009` validates it — and only then, in that same file, creates the principal-scoped idempotency index. So there is never a window in which a NULL could widen that index's uniqueness scope. Every principal-scoped read and cancellation matches on this column *inside the same statement* that does the work — see [phase-12-plan.md](phase-12-plan.md) §4a. |
 | `job_type` | `text` NOT NULL | Identifies which handler executes this job. Indexed as part of the idempotency constraint. |
 | `payload` | `jsonb` NOT NULL | Opaque to TaskForge; interpreted by the job handler. |
 | `state` | `text` NOT NULL | One of `QUEUED`, `RETRY_WAIT`, `RUNNING`, `SUCCEEDED`, `CANCELLED`, `DEAD_LETTERED`. See [execution-semantics.md](execution-semantics.md). Enforced via `CHECK` constraint, not a separate enum table (simplicity — see [ADR-0005](adr/0005-durable-job-state-machine.md)). |
@@ -47,7 +48,9 @@ The single durable record of a logical unit of work.
 
 - `PRIMARY KEY (id)`
 - `CHECK (state IN ('QUEUED','RETRY_WAIT','RUNNING','SUCCEEDED','CANCELLED','DEAD_LETTERED'))`
-- `UNIQUE (job_type, idempotency_key) WHERE idempotency_key IS NOT NULL` — enforces TF-INV-008/016.
+- `UNIQUE (principal_id, job_type, idempotency_key) WHERE idempotency_key IS NOT NULL` (`idx_jobs_idempotency_scoped`, migration 0009) — enforces TF-INV-008/016, **scoped per principal as of Phase 12**. This replaced migration 0001's global `UNIQUE (job_type, idempotency_key)` (`idx_jobs_idempotency_key`, dropped by migration 0010) so two different tenants choosing the same `job_type` and `Idempotency-Key` are two independent submissions, not a false duplicate. `internal/store/idempotency.go`'s `idempotencyKeyIndexName` constant must always name this index exactly: the conflict-recovery path matches it against `pgErr.ConstraintName` by string, and a drift between the two would silently turn idempotency conflicts into generic insert failures.
+- `CHECK (principal_id IS NOT NULL)` (`jobs_principal_id_not_null`) — added `NOT VALID` by migration 0008 and `VALIDATE CONSTRAINT`ed by migration 0009, rather than via `ALTER COLUMN ... SET NOT NULL`. The two steps are in **separate migration files on purpose**: `internal/migrate` wraps each file in one transaction and PostgreSQL releases locks only at commit, so keeping them together would hold `ADD CONSTRAINT`'s `ACCESS EXCLUSIVE` lock across `VALIDATE`'s full-table scan — exactly the blocking behaviour the two-step form exists to avoid. Split across files, the `VALIDATE CONSTRAINT` statement itself takes only `SHARE UPDATE EXCLUSIVE` and blocks neither reads nor writes. That is a statement about *that statement*, not about migration `0009` as a whole: `0009` goes on to build three indexes under `SHARE` in the same transaction, which **does** block every write to `jobs`, the worker claim query included. See "Phase 12 migration lock profile" below for the file-level behaviour.
+- `CREATE INDEX idx_jobs_principal_id ON jobs (principal_id);` (migration 0009) — supports the ownership predicate every scoped read and cancellation carries.
 - `CHECK (attempt_count <= max_attempts OR state IN ('DEAD_LETTERED'))` — a defense-in-depth check (application logic is the primary enforcement of TF-INV-006; this constraint catches regressions).
 - Partial index for the claim query (the most performance-critical query in
   the system):
@@ -108,6 +111,7 @@ One row per workflow execution. Carries the workflow-level state, a
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `uuid` PRIMARY KEY | |
+| `principal_id` | `uuid` NOT NULL REFERENCES `principals(id)` (migrations 0006–0009) | The API caller that submitted this workflow (Phase 12), with the same four-migration story as `jobs.principal_id` (`0006` adds, `0007` backfills, `0008` declares `NOT VALID`, `0009` validates). `CreateWorkflow` writes one principal across the instance row and every node's underlying `jobs` row in a single transaction, so a workflow and its nodes can never end up owned by different principals — which is what makes the workflow-level ownership check sufficient to protect the node jobs too. |
 | `state` | `text` NOT NULL DEFAULT `'RUNNING'` | One of `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`. Enforced via `CHECK` constraint. |
 | `cancel_requested` | `boolean` NOT NULL DEFAULT `false` | Set by `POST /workflows/{id}/cancel`. Distinguishes an explicit workflow-level cancellation from a workflow that reaches `FAILED` organically via node failure propagation — both drive every affected node through job-level `CANCELLED`/`DEAD_LETTERED`, but only the former's workflow-level terminal state is `CANCELLED` rather than `FAILED`. |
 | `cancel_requested_at` | `timestamptz` NULL | Set when `cancel_requested` becomes true. |
@@ -119,7 +123,9 @@ One row per workflow execution. Carries the workflow-level state, a
 
 - `PRIMARY KEY (id)`
 - `CHECK (state IN ('RUNNING','SUCCEEDED','FAILED','CANCELLED'))`
+- `CHECK (principal_id IS NOT NULL)` (`workflow_instances_principal_id_not_null`, migrations 0008/0009)
 - `CREATE INDEX idx_workflow_instances_state ON workflow_instances (state);`
+- `CREATE INDEX idx_workflow_instances_principal_id ON workflow_instances (principal_id);` (migration 0009)
 
 ## Table: `workflow_nodes` (Phase 7)
 
@@ -168,6 +174,64 @@ identical to how an ordinary job's `eligible_at` is set at submission
 time. See [workflows.md](workflows.md)'s "Dependency Satisfaction
 Semantics" for the full propagation algorithm.
 
+## Table: `principals` (Phase 12)
+
+One row per API-caller identity. This is the **application/API** trust
+boundary only — see [security-model.md](security-model.md) and
+[phase-12-plan.md](phase-12-plan.md) OD-3 for why worker identity is
+deliberately *not* modeled here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PRIMARY KEY | |
+| `kind` | `text` NOT NULL | `CHECK (kind IN ('caller', 'admin'))`. There is deliberately **no `'worker'` value**: a worker process's identity is its PostgreSQL role credential, verified by PostgreSQL itself at connection time — a different mechanism in a different layer, checked by a different system. Adding a worker kind "for symmetry" would create exactly the conflation that decision rejects. `admin` is the single documented exception to ownership scoping. |
+| `display_name` | `text` NOT NULL | Operator-assigned. Never used for lookup, authentication, or authorization. |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `revoked_at` | `timestamptz` NULL | A revoked principal's keys are **all** treated as revoked regardless of their own `revoked_at`, so revoking a compromised caller is one write rather than one per credential. |
+
+One row is seeded by migration `0005` itself: the **system principal**,
+`id = '00000000-0000-0000-0000-000000000001'` (exported as
+`principal.SystemPrincipalID`, so no code path ever needs a runtime lookup),
+`kind = 'caller'`. It is never deleted, never revoked, and deliberately has
+**no `api_keys` row** — nothing can authenticate *as* it. It exists purely as
+the foreign-key target for migration `0007`'s backfill of pre-Phase-12 rows,
+which means those legacy rows are not reachable by any credential a caller
+could present. No application code path ever assigns it: a submission that
+cannot name a principal is rejected, not defaulted.
+
+### Constraints and Indexes on `principals`
+
+- `PRIMARY KEY (id)`
+- `CHECK (kind IN ('caller', 'admin'))`
+
+## Table: `api_keys` (Phase 12)
+
+Credentials belonging to a principal. Multiple live rows per principal are
+ordinary — that *is* the rotation-with-overlap mechanism, with no separate
+machinery.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PRIMARY KEY | |
+| `principal_id` | `uuid` NOT NULL REFERENCES `principals(id)` | |
+| `key_id` | `text` NOT NULL UNIQUE | The **non-secret** half of the `Authorization: Bearer <key_id>.<secret>` credential: 16 random bytes, hex-encoded. It exists so a key can be looked up, rotated, and revoked without ever comparing raw secrets, and so verification's database lookup is keyed on a non-secret value — a raw secret is never used as a lookup key. |
+| `secret_hash` | `bytea` NOT NULL | `HMAC-SHA256(pepper, secret)`. **Never the raw secret, and never a bare digest of it.** The pepper lives only in the running process's environment (`TASKFORGE_API_KEY_PEPPER`), never in this database, so a stolen dump of this table alone is insufficient to forge or offline-verify a credential. |
+| `scopes` | `text[]` NOT NULL DEFAULT `'{}'` | A flat per-key capability list: `jobs`, `metrics`, `admin`. Not a role, not a policy language. Deliberately has **no database `CHECK`** — the same precedent migration 0004 sets for `terminal_attempt_count`: where an invariant is fully owned by trusted application code, validation lives once, centrally, in `internal/principal.ValidateScopes`. |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `expires_at` | `timestamptz` NULL | Optional operator-set expiry. |
+| `revoked_at` | `timestamptz` NULL | Takes effect on the key's very next verification — there is no cache and no TTL anywhere in the verification path, so revocation never requires a restart or redeploy. |
+| `last_used_at` | `timestamptz` NULL | Best-effort telemetry, written off the request's critical path with errors ignored. **Never** read as a correctness signal by anything. |
+
+### Constraints and Indexes on `api_keys`
+
+- `PRIMARY KEY (id)`
+- `UNIQUE (key_id)`
+- `CREATE INDEX idx_api_keys_principal_id ON api_keys (principal_id);`
+
+Credential lifecycle (create, rotate, revoke) is **operator tooling**
+(`cmd/taskforge-admin`), deliberately not an HTTP API — Phase 12 adds no new
+endpoint anywhere.
+
 ## Tables Deferred to Later Phases (documented now, not built yet)
 
 ### `job_events` (Phase 8, optional)
@@ -210,3 +274,112 @@ query's `ORDER BY`, so the planner can satisfy the query without a sort or a
 full-table scan even as the `jobs` table accumulates millions of terminal
 rows over time. `idx_jobs_expired_lease` keeps the (rare) reclaim path
 similarly cheap without polluting the primary claim index.
+
+Phase 12's `idx_jobs_principal_id` is deliberately **not** folded into
+`idx_jobs_claimable`: the claim query is worker-side and has no principal
+predicate at all (a worker claims whatever is eligible, regardless of who
+submitted it), so adding `principal_id` to the claim index would widen the
+system's hottest index for no query that uses it. The ownership predicate
+appears only on the caller-facing read/cancel statements, which are
+point lookups by `id` — `idx_jobs_principal_id` supports the tenant-scoped
+scans (and the composite idempotency index) rather than the claim path.
+
+## Phase 12 migration lock profile
+
+Phase 12 adds `principal_id` to two live tables and re-scopes an existing
+unique index. `internal/migrate` runs each `.up.sql` inside a single
+transaction (TF-INV-013) and PostgreSQL releases locks only at commit, so
+**every lock a migration file takes is held until that whole file
+finishes** — including locks taken by an earlier statement in the same file.
+
+The six-file split exists because of that rule. It keeps each
+`ACCESS EXCLUSIVE` statement in a file of its own, so no `ACCESS EXCLUSIVE`
+lock is ever held across a full-table scan or a full-table write. It does
+**not** make the sequence non-blocking, and this document does not claim it
+does: `0009` still takes `SHARE`, which blocks every write to `jobs` — the
+worker claim query included — for as long as that file runs.
+
+Note when reading the table below: **the worker claim query is a write.**
+`internal/store/claim.go`'s `claimQuery` is a `WITH candidate AS (SELECT …
+FOR UPDATE SKIP LOCKED) UPDATE jobs …` — the CTE takes `ROW SHARE`, but the
+statement as a whole takes `ROW EXCLUSIVE`. Anything that blocks writes to
+`jobs` therefore blocks claiming, completing, and heartbeating, not just
+submissions.
+
+| Migration | Statements | Locks on `jobs` (held to commit) | Scans/writes the table? | Blocks reads? | Blocks writes, incl. the worker claim query? |
+|---|---|---|---|---|---|
+| `0005_create_principals_and_api_keys` | new tables + seed row | none on `jobs` | no | no | no |
+| `0006_add_principal_id_columns` | `ADD COLUMN` ×2 | `ACCESS EXCLUSIVE` | **no** (catalog-only) | yes, while held | yes, while held |
+| `0007_backfill_principal_id` | `UPDATE` ×2 | `ROW EXCLUSIVE` | **yes** (writes every row) | **no** | **no** (`ROW EXCLUSIVE` does not self-conflict) |
+| `0008_require_principal_id` | `ADD CONSTRAINT … NOT VALID` ×2 | `ACCESS EXCLUSIVE` | **no** (catalog-only) | yes, while held | yes, while held |
+| `0009_validate_principal_id_and_scope_idempotency` | `VALIDATE CONSTRAINT` ×2, `CREATE INDEX` ×3 | `SHARE UPDATE EXCLUSIVE`, then **also** `SHARE` | **yes** (scan + three builds) | **no** | **YES** — from the first `CREATE INDEX` until the file commits |
+| `0010_drop_global_idempotency_index` | `DROP INDEX` | `ACCESS EXCLUSIVE` | **no** (catalog-only) | yes, while held | yes, while held |
+
+**What the split does buy, stated narrowly**: no `ACCESS EXCLUSIVE` lock is
+held across a full-table scan or a full-table write. `0006`, `0008` and
+`0010` are catalog-only, and the two table-size-dependent files (`0007`,
+`0009`) take no `ACCESS EXCLUSIVE` lock at all. That is the whole of the
+guarantee. It is a statement about which lock is held during long work — not
+a claim that the sequence is online, non-blocking, or safe to run under load
+without a maintenance decision.
+
+**What is NOT claimed**, stated because earlier revisions of this document
+claimed more than PostgreSQL delivers and were measured to be wrong — twice:
+
+- These migrations are **not** online, non-blocking, or zero-downtime, and
+  no Phase 12 document should be read as saying otherwise.
+- **`0009` blocks every write to `jobs`, including the worker claim query.**
+  Its three `CREATE INDEX` statements each take `SHARE`, `SHARE` conflicts
+  with the `ROW EXCLUSIVE` that every write — claim, complete, heartbeat,
+  submit — requires, and `internal/migrate` holds that lock until the whole
+  file commits. So the write stall is not "per build": it runs from the
+  first `CREATE INDEX` to the end of the migration. Reads are unaffected
+  (`ACCESS SHARE` is compatible with `SHARE`). Measured directly against
+  this repository's real `0009` file: on a 3M-row / 426 MB `jobs` table the
+  real claim query hit `lock_timeout` (SQLSTATE `55P03`) rather than
+  claiming. `CREATE INDEX CONCURRENTLY` would avoid the write block but
+  cannot run inside a transaction block, and every migration here runs
+  inside one (TF-INV-013).
+- The `VALIDATE CONSTRAINT` step, taken on its own, takes only
+  `SHARE UPDATE EXCLUSIVE`, which conflicts with neither reads nor writes —
+  that is why the `NOT VALID`/`VALIDATE` two-step is used and why `0008` is a
+  separate file. That is a property of **that statement**, not of migration
+  `0009`: `VALIDATE` shares a transaction with the three index builds that
+  follow it, so the file's observable behaviour is the blocking one above.
+- `0006`, `0008` and `0010` take `ACCESS EXCLUSIVE`. They are catalog-only
+  and finish in O(1) once acquired (measured: `0006`'s
+  `ADD COLUMN … REFERENCES` ~3 ms on an 800k-row / 52 MB table, against
+  ~22 ms for a full scan of the same table, with the foreign key recorded
+  `convalidated` without a scan; `0008`'s `ADD CONSTRAINT … NOT VALID`
+  ~1 ms). But like all DDL they must *wait* for any conflicting lock already
+  held, and while waiting PostgreSQL queues new lock requests — readers
+  included — behind them.
+- `0007` writes every row under `ROW EXCLUSIVE`, which does not conflict
+  with reads or with other writes, so the claim query keeps running
+  throughout. It does take ordinary row-level locks and will wait behind a
+  worker currently holding one of those rows: bounded MVCC contention on a
+  single row, which the claim query skips by design (`SKIP LOCKED`), not a
+  table-wide stall.
+- **Duration is unbounded by any of the above and is entirely
+  data/table-size/environment dependent.** `0007` writes and `0009` reads
+  the whole table; on a `jobs` table grown large by Phase 9 chaos/load runs
+  either can run for a long time, and `0009`'s share of that time is time
+  during which no worker can claim. No test can establish that duration for
+  your data.
+
+**Deployment obligations this section does not discharge** (they are the
+operator's, and TaskForge cannot verify them from inside the process):
+
+- **Benchmark `0007` and `0009` against a realistically-sized copy of your
+  own `jobs` table before running them against production.** The numbers
+  above are from synthetic tables and are illustrative only.
+- Set `lock_timeout` and retry rather than letting a DDL statement queue
+  readers behind it indefinitely.
+- Schedule `0009` (and, where `jobs` is large or busy, the whole sequence)
+  in a quiet window or maintenance window, sized by the benchmark above,
+  and expect worker claiming to stop for `0009`'s duration.
+
+`internal/migrate`'s `TestPhase12Migrations_BackfillDoesNotBlockReadsOrTheClaimPath`
+and `TestPhase12Migrations_0009BlocksWritesAndTheClaimQuery` measure both
+behaviours through the real `migrate.Up`; the latter asserts the write block
+rather than denying it.

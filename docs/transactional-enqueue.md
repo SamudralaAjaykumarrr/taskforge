@@ -27,8 +27,9 @@ type error) the caller already owns:
 tx, err := pool.Begin(ctx)
 // ... caller's own business-data write, using tx ...
 job, created, err := txenqueue.New().EnqueueTx(ctx, tx, txenqueue.EnqueueRequest{
-    JobType: "invoice.charge",
-    Payload: payload,
+    PrincipalID: callerPrincipalID, // required as of Phase 12 -- see below
+    JobType:     "invoice.charge",
+    Payload:     payload,
 })
 // ... caller decides commit or rollback ...
 err = tx.Commit(ctx) // or tx.Rollback(ctx)
@@ -55,11 +56,15 @@ subject to the same leases, fencing, retries, dead-lettering, scheduling,
 and workflow mechanisms as a job submitted via `POST /jobs`. There is no
 second queue table and no parallel execution path.
 
-Submission-idempotency (docs/idempotency.md, TF-INV-008/TF-INV-016) is
-unchanged, including inside a caller-owned transaction: the same
-`UNIQUE(job_type, idempotency_key)` database constraint is authoritative,
-not a second, weaker application check, and this holds under concurrent
-transactions racing on the same key.
+Submission-idempotency (docs/idempotency.md, TF-INV-008/TF-INV-016) works
+the same way here as everywhere else, including inside a caller-owned
+transaction: the database unique index is authoritative, not a second,
+weaker application check, and this holds under concurrent transactions
+racing on the same key. As of Phase 12 that index is
+`UNIQUE (principal_id, job_type, idempotency_key)` — so two callers
+supplying different `PrincipalID`s with the same `JobType` and
+`IdempotencyKey` get two independent jobs (see "Principal identity"
+below).
 
 ## Isolation level and idempotency conflicts
 
@@ -105,8 +110,8 @@ as exactly one of four sentinels (`txenqueue/errors.go`), or is
 caller's existing ctx-cancellation checks keep working:
 
 - `ErrInvalidRequest` -- `req` failed ordinary submission validation
-  (`internal/job.ValidateSubmission`, the same rules `POST /jobs` uses);
-  `tx` was never touched. `Error()` additionally includes the specific,
+  (`internal/job.ValidateSubmission`, the same rules `POST /jobs` uses, plus
+  the Phase 12 `PrincipalID` requirement below); `tx` was never touched. `Error()` additionally includes the specific,
   safe, human-readable validation reason (the same stable wording a `POST
   /jobs` 400 body would show).
 - `ErrInvalidTransaction` -- `tx` itself cannot be used: it is `nil` (an
@@ -191,9 +196,10 @@ TaskForge does **not** claim, via this phase or any other:
 - `type Store struct{}` / `func New() *Store` — no database connection or
   other state of its own.
 - `func (*Store) EnqueueTx(ctx, tx pgx.Tx, req EnqueueRequest) (*Job, bool, error)`
-- `type EnqueueRequest struct{ JobType, Payload, MaxAttempts, ExecutionTimeoutSeconds, IdempotencyKey, ScheduledAt }`
+- `type EnqueueRequest struct{ PrincipalID, JobType, Payload, MaxAttempts, ExecutionTimeoutSeconds, IdempotencyKey, ScheduledAt }`
   — field-for-field the same contract as `POST /jobs` (docs/worker-protocol.md),
   validated by the exact same shared rules (`internal/job.ValidateSubmission`).
+  `PrincipalID` is required as of Phase 12 — see the section below.
 - `type Job struct{ ID uuid.UUID }` — a small, package-owned projection of
   the durable row's identity, **not** a type alias onto
   `internal/job.Job` (Phase 11 audit correction: an earlier draft of this
@@ -213,6 +219,50 @@ unimportable outside this module by construction) and it is not a general
 TaskForge client library or a replacement for the HTTP API — it is one
 additional, narrow, optional entry point for the specific same-database
 integration shape described above.
+
+## Principal identity (Phase 12) — a breaking change
+
+`EnqueueRequest.PrincipalID` is **required**. A zero value is rejected with
+the existing `ErrInvalidRequest` sentinel (no new error type — this is an
+invalid request, and that sentinel already means exactly that), and the
+check runs alongside ordinary submission validation, **before `tx` is
+touched at all** — so this method's documented "`tx` was never touched"
+contract for `ErrInvalidRequest` holds unchanged. It is also checked
+*before* the `nil`-`tx` check, so an invalid request against a `nil`
+transaction is still reported as an invalid request, consistent with every
+other validation-first path here.
+
+**There is no default.** TaskForge does not resolve an unset `PrincipalID`
+to a system principal, to "the first principal it finds," or to anything
+else. A caller that cannot say who it is enqueuing for does not enqueue.
+The system principal (`00000000-...-0001`) exists solely as the identity
+that migration `0007` backfills pre-Phase-12 rows to; it holds no API key,
+nothing can authenticate as it, and no application code path ever assigns
+it, and it cannot be given one -- migration `0005`'s
+`api_keys_no_system_principal` CHECK constraint and
+`principal.Store.CreateAPIKey`'s guard both refuse. A test asserts this
+package's source contains no reference to it at all, so a fallback cannot
+appear by accident rather than by decision.
+
+Idempotency is scoped to the principal accordingly: two different callers
+using the same `JobType` and `IdempotencyKey` get two independent jobs
+(`UNIQUE(principal_id, job_type, idempotency_key)`), and the
+conflict-recovery re-read is principal-scoped too — a globally-scoped read
+there would have handed one caller the other's job.
+
+**Why this is a hard break with no compatibility shim**, stated as a
+decision rather than an oversight: a repository-wide search found zero
+callers of this package outside its own tests when Phase 12 was
+implemented, and the project is labelled Experimental. A separately named
+`EnqueueTxUnscoped`-style adapter that resolves to the system principal and
+logs on every call is documented as a **contingency** for a real integrator
+who genuinely cannot supply a principal yet — it is deliberately **not
+built**, and if it ever is, it must be a function whose name says what it
+does, never something reachable by accident through `EnqueueTx`.
+
+The caller decides where `PrincipalID` comes from. A service handling its
+own authenticated traffic should pass the principal it authenticated, not a
+hardcoded constant.
 
 ## Cross-references
 

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
 )
@@ -25,8 +26,10 @@ func newBufferLoggingServer(t *testing.T) (*httptest.Server, *bytes.Buffer) {
 	db := testutil.DB(t)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	h := api.NewHandlers(store.New(db, store.WithLogger(logger)), logger)
-	srv := httptest.NewServer(api.NewRouter(h))
+	ps := newPrincipalStore(t, db)
+	ident := newIdentity(t, ps, principal.KindCaller, "observability suite caller", principal.ScopeJobs)
+	h := api.NewHandlers(store.New(db, store.WithLogger(logger)), logger, api.WithAuthenticator(ps))
+	srv := httptest.NewServer(injectCredential(api.NewRouter(h), ident))
 	t.Cleanup(srv.Close)
 	return srv, &buf
 }

@@ -7,7 +7,10 @@ import (
 	"time"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/chaos"
+	"github.com/google/uuid"
+
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
@@ -30,8 +33,8 @@ const (
 // duplicated here (rather than imported, since it lives in a _test.go
 // file) so this command can submit real workflow chaos load without
 // depending on test-only code.
-func diamondSpec(prefix string) workflow.GraphSpec {
-	return workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+func diamondSpec(principalID uuid.UUID, prefix string) workflow.GraphSpec {
+	return workflow.GraphSpec{PrincipalID: principalID, Nodes: []workflow.NodeSpec{
 		{NodeKey: "A", JobType: prefix + ".a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 10},
 		{NodeKey: "B", JobType: prefix + ".b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 10, DependsOn: []string{"A"}},
 		{NodeKey: "C", JobType: prefix + ".c", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 10, DependsOn: []string{"A"}},
@@ -95,7 +98,12 @@ func resolveClaim(ctx context.Context, s *store.Store, rng *chaos.Rand, j *job.J
 		r.recordOutcome(outcomeCrashed) // abandon: leave RUNNING, recovered once its lease expires
 		return
 	case 4:
-		if _, rerr := s.RequestCancellation(ctx, j.ID); rerr != nil {
+		// Phase 12: the claimed job carries its own owning principal, so
+		// the cancellation this simulated caller issues is scoped to that
+		// principal explicitly -- no admin bypass, and no
+		// unscoped/privileged access context. It is exactly the authz a
+		// real owner of this job would present.
+		if _, rerr := s.RequestCancellation(ctx, j.ID, principal.AccessContext{PrincipalID: j.PrincipalID}); rerr != nil {
 			return // lost the race to a concurrent terminal transition -- not an error
 		}
 		_, err = s.CompleteCancelled(ctx, j.ID, owner, j.LeaseGeneration)

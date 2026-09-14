@@ -15,7 +15,13 @@ import (
 
 // Job is the full durable row for a single logical unit of work.
 type Job struct {
-	ID                      uuid.UUID
+	ID uuid.UUID
+	// PrincipalID is the API caller that submitted this job (Phase 12,
+	// migrations 0006-0009 -- NOT NULL). Every principal-scoped read and
+	// cancellation in internal/store matches on this column inside the
+	// same statement that does the work, never as a separate check
+	// (docs/phase-12-plan.md §4a).
+	PrincipalID             uuid.UUID
 	JobType                 string
 	Payload                 json.RawMessage
 	State                   jobstate.State
@@ -60,6 +66,24 @@ func (j *Job) IsTerminal() bool {
 // intent, immutable, audit-only) and the job's initial eligible_at (the
 // live gating timestamp the claim query actually consults).
 type NewParams struct {
+	// PrincipalID is the authenticated API caller this job is submitted
+	// on behalf of (Phase 12, docs/phase-12-plan.md §5). It is
+	// mandatory: jobs.principal_id is NOT NULL (migrations 0008/0009), so a
+	// zero value is rejected by PostgreSQL rather than silently stored,
+	// and nothing anywhere resolves an unset value to
+	// principal.SystemPrincipalID -- that identity is assigned by
+	// migration 0007's backfill alone.
+	//
+	// It is typed uuid.UUID rather than internal/principal's own type to
+	// keep internal/job free of a dependency on the identity package: a
+	// job row records WHICH principal owns it, and needs to know nothing
+	// else about principals.
+	//
+	// It is populated exactly once per submission, from the
+	// authenticated principal.AccessContext, and never from a request
+	// body, query parameter, or header (docs/phase-12-plan.md §6a,
+	// verification point 6).
+	PrincipalID             uuid.UUID
 	JobType                 string
 	Payload                 json.RawMessage
 	MaxAttempts             int

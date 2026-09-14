@@ -32,6 +32,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -39,9 +40,11 @@ import (
 	"time"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 )
 
 const envDatabaseURL = "TASKFORGE_TEST_DATABASE_URL"
@@ -185,8 +188,21 @@ func DB(t *testing.T) *sql.DB {
 	// workflow_instances — all four must be truncated in the same
 	// statement (or in dependency order) — TRUNCATE jobs alone fails once
 	// these constraints exist.
-	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs`); err != nil {
+	//
+	// Phase 12 adds api_keys to the same statement (nothing references
+	// it, but credentials must not leak between tests) and principals
+	// afterwards, in dependency order: jobs and workflow_instances both
+	// reference principals, so they have to be emptied first.
+	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs, api_keys`); err != nil {
 		t.Fatalf("testutil: truncate tables: %v", err)
+	}
+	// The system principal (migration 0005's seed row) is deliberately
+	// preserved: it is schema, not test data, and migration 0007's
+	// backfill contract depends on it existing. Everything else a
+	// previous test created is removed.
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM principals WHERE id <> $1`, principal.SystemPrincipalID); err != nil {
+		t.Fatalf("testutil: reset principals: %v", err)
 	}
 
 	return db
@@ -205,4 +221,52 @@ func DSN(t *testing.T) string {
 	dsn := resolveDSN(t)
 	DB(t) // migrates and truncates; t.Cleanup already closes the *sql.DB this opens
 	return dsn
+}
+
+// NewPrincipal creates a real principals row and returns its id, for
+// tests that need durable, distinct caller identities (Phase 12). kind is
+// principal.KindCaller or principal.KindAdmin.
+//
+// Tests whose subject predates Phase 12 -- the Phase 1-11 suite -- do not
+// call this: they attribute their jobs to principal.SystemPrincipalID,
+// which migration 0005 always seeds. That is a deliberate choice, not an
+// oversight: those tests are about state transitions, leases, retries, and
+// workflows, and giving each of them a bespoke principal would add setup
+// noise without testing anything Phase 12's own suite does not already
+// cover directly.
+func NewPrincipal(t *testing.T, db *sql.DB, kind principal.Kind, displayName string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	_, err := db.ExecContext(context.Background(),
+		`INSERT INTO principals (id, kind, display_name) VALUES ($1, $2, $3)`,
+		id, string(kind), displayName)
+	if err != nil {
+		t.Fatalf("testutil: create principal: %v", err)
+	}
+	return id
+}
+
+// DSNAsRole returns this test binary's PostgreSQL DSN rewritten to connect
+// as role/password instead of as the owner the rest of the suite uses.
+//
+// It exists for the Phase 12 least-privilege role audit
+// (internal/migrate/phase12_roles_test.go): asserting privileges with
+// has_table_privilege proves what the catalog says, but only an actual
+// connection as taskforge_api/taskforge_worker -- running the same
+// migrate.Up that cmd/api and cmd/worker run on startup -- proves the
+// documented deployment path actually works. That gap is exactly what an
+// independent review found: every grant was correct and the process still
+// could not start.
+//
+// It deliberately does NOT migrate or truncate anything: the caller
+// already holds an owner-scoped *sql.DB from DB for that. The returned DSN
+// points at the same database.
+func DSNAsRole(t *testing.T, role, password string) string {
+	t.Helper()
+	u, err := url.Parse(resolveDSN(t))
+	if err != nil {
+		t.Fatalf("testutil: parse test DSN: %v", err)
+	}
+	u.User = url.UserPassword(role, password)
+	return u.String()
 }

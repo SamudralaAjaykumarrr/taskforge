@@ -17,18 +17,30 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
 // JobStore is the persistence contract this package depends on.
+//
+// Phase 12 (docs/phase-12-plan.md §4a): every read and every cancellation
+// method takes a principal.AccessContext, which internal/store folds into
+// the WHERE clause of the same statement that does the work. The handlers
+// in this package do not branch on ownership at all -- they obtain the
+// AccessContext from the request (auth.go's accessContext) and pass it
+// through. There is deliberately no handler-level authorizeJobAccess
+// helper: an ownership check that is separate from the statement it
+// guards is a check-then-act race, and for CancelJob specifically it would
+// have run only AFTER a mutating store call had already fired.
 type JobStore interface {
 	InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job, bool, error)
-	GetByID(ctx context.Context, id uuid.UUID) (*job.Job, error)
+	GetByID(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error)
 	// CancelQueuedOrRetryWait and RequestCancellation were added in
 	// Phase 6 — see docs/worker-protocol.md's POST /jobs/{id}/cancel
 	// contract and internal/store/cancellation.go.
-	CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job.Job, error)
-	RequestCancellation(ctx context.Context, id uuid.UUID) (*job.Job, error)
+	CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error)
+	RequestCancellation(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error)
 	// CreateWorkflow, GetWorkflow, and CancelWorkflow were added in Phase
 	// 7 — see docs/workflows.md and internal/store/workflow.go. Kept on
 	// the same interface as the job methods (rather than a separate
@@ -36,8 +48,8 @@ type JobStore interface {
 	// Handlers has no reason to depend on two interfaces for one
 	// underlying store.
 	CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*workflow.Instance, error)
-	GetWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error)
-	CancelWorkflow(ctx context.Context, id uuid.UUID) (*workflow.Instance, error)
+	GetWorkflow(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*workflow.Instance, error)
+	CancelWorkflow(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*workflow.Instance, error)
 }
 
 // Default values applied when a submission omits them. docs/data-model.md
@@ -96,16 +108,59 @@ const (
 
 // Handlers holds the dependencies for the job HTTP endpoints.
 type Handlers struct {
-	store  JobStore
-	logger *slog.Logger
+	store   JobStore
+	logger  *slog.Logger
+	auth    Authenticator
+	metrics *metrics.Metrics
 }
 
-// NewHandlers constructs the Phase 1 HTTP handlers.
-func NewHandlers(store JobStore, logger *slog.Logger) *Handlers {
+// NewHandlers constructs the HTTP handlers.
+//
+// Phase 12: opts supply the authenticator (WithAuthenticator) and the
+// metrics recorder the auth-failure counter is written to (WithMetrics).
+// Neither is required to construct a Handlers, and both have fail-safe
+// defaults: without an authenticator, every request is rejected
+// (denyAllAuthenticator), and without a metrics recorder, auth failures
+// are counted into a private, unregistered instance -- the same pattern
+// internal/store.New already uses, so no call site needs a nil check.
+func NewHandlers(store JobStore, logger *slog.Logger, opts ...HandlersOption) *Handlers {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handlers{store: store, logger: logger}
+	h := &Handlers{store: store, logger: logger, auth: denyAllAuthenticator{}, metrics: metrics.New()}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// HandlersOption configures optional Handlers dependencies.
+type HandlersOption func(*Handlers)
+
+// WithAuthenticator attaches the credential verifier every route's
+// middleware calls (auth.go). Production wiring passes a
+// *principal.Store built from the same *sql.DB as the JobStore.
+//
+// Omitting it does not disable authentication -- it makes every request
+// fail. There is no "authentication off" mode (OD-6: hard cutover, no
+// observe/enforce dual mode).
+func WithAuthenticator(a Authenticator) HandlersOption {
+	return func(h *Handlers) {
+		if a != nil {
+			h.auth = a
+		}
+	}
+}
+
+// WithMetrics attaches the shared metrics recorder, so
+// taskforge_auth_failures_total lands in the same registry the process
+// serves at GET /metrics.
+func WithMetrics(m *metrics.Metrics) HandlersOption {
+	return func(h *Handlers) {
+		if m != nil {
+			h.metrics = m
+		}
+	}
 }
 
 // NewRouter wires the HTTP endpoints onto a fresh http.ServeMux using
@@ -121,11 +176,66 @@ func NewHandlers(store JobStore, logger *slog.Logger) *Handlers {
 // remain fully functional -- this phase does not remove or redirect them;
 // removal is a future, separately-decided contract change, never silently
 // bundled into introducing the new prefix.
-func NewRouter(h *Handlers) *http.ServeMux {
+// Phase 12 (docs/phase-12-plan.md §6a): every route registered here is
+// mounted through the single mount helper below, which wraps it in
+// authentication and a scope requirement. NewRouter adds no route of its
+// own and this phase adds no new endpoint anywhere -- key lifecycle
+// management is operator tooling, deliberately not an HTTP surface
+// (docs/phase-12-plan.md §3).
+//
+// It returns http.Handler rather than *http.ServeMux specifically so a
+// caller cannot reach past the returned value and attach an unprotected
+// route to the mux afterwards -- which is how GET /metrics was wired
+// before this phase. That endpoint is now supplied through
+// WithMetricsEndpoint and mounted through the same helper as everything
+// else.
+func NewRouter(h *Handlers, opts ...RouterOption) http.Handler {
+	cfg := routerConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	mux := http.NewServeMux()
 	registerJobRoutes(mux, h, "")
 	registerJobRoutes(mux, h, "/v1")
+	if cfg.metricsHandler != nil {
+		// GET /metrics requires the metrics scope, not the jobs scope
+		// (OD-5): an ordinary job-submission key must not be able to read
+		// a deployment's operational volume, which is exactly
+		// docs/security-model.md §5's "operational volume disclosure"
+		// finding. A metrics-only key correspondingly cannot submit jobs.
+		mount(mux, h, "GET /metrics", principal.ScopeMetrics, cfg.metricsHandler.ServeHTTP)
+	}
 	return mux
+}
+
+// RouterOption configures NewRouter.
+type RouterOption func(*routerConfig)
+
+type routerConfig struct {
+	metricsHandler http.Handler
+}
+
+// WithMetricsEndpoint mounts h as GET /metrics, behind authentication and
+// the metrics scope. Omitting it leaves the router with no /metrics route
+// at all (a 404), which is what internal/api's own tests want and is never
+// a silently-unauthenticated endpoint either way.
+func WithMetricsEndpoint(handler http.Handler) RouterOption {
+	return func(c *routerConfig) { c.metricsHandler = handler }
+}
+
+// mount is the ONLY place in this package where a handler is attached to a
+// mux. Routing every registration through one function is what makes
+// deny-by-default structural rather than a per-handler convention: a new
+// route cannot be added without choosing a required scope, because mount's
+// signature demands one, and cannot skip authentication, because mount
+// applies it unconditionally.
+//
+// TestRouter_AllHandlersMountedThroughAuth enforces this by scanning this
+// package's own source for any other mux.Handle/mux.HandleFunc call, so
+// the property is checked mechanically and not just asserted here.
+func mount(mux *http.ServeMux, h *Handlers, pattern, requiredScope string, handler http.HandlerFunc) {
+	mux.HandleFunc(pattern, h.requireAuth(requiredScope, handler))
 }
 
 // registerJobRoutes mounts every job/workflow endpoint under prefix ("" for
@@ -139,13 +249,17 @@ func registerJobRoutes(mux *http.ServeMux, h *Handlers, prefix string) {
 			return deprecationWarning(h.logger, route, next)
 		}
 	}
-	mux.HandleFunc("POST "+prefix+"/jobs", wrap("POST /jobs", h.CreateJob))
-	mux.HandleFunc("GET "+prefix+"/jobs/{id}", wrap("GET /jobs/{id}", h.GetJob))
-	mux.HandleFunc("POST "+prefix+"/jobs/{id}/cancel", wrap("POST /jobs/{id}/cancel", h.CancelJob))
+	// All six job/workflow routes require the jobs scope, on both the
+	// legacy unprefixed surface and the canonical /v1 one
+	// (docs/phase-12-plan.md §7): a deprecated route is not an
+	// unauthenticated route.
+	mount(mux, h, "POST "+prefix+"/jobs", principal.ScopeJobs, wrap("POST /jobs", h.CreateJob))
+	mount(mux, h, "GET "+prefix+"/jobs/{id}", principal.ScopeJobs, wrap("GET /jobs/{id}", h.GetJob))
+	mount(mux, h, "POST "+prefix+"/jobs/{id}/cancel", principal.ScopeJobs, wrap("POST /jobs/{id}/cancel", h.CancelJob))
 	// Phase 7 — see docs/workflows.md and internal/api/workflow_handlers.go.
-	mux.HandleFunc("POST "+prefix+"/workflows", wrap("POST /workflows", h.CreateWorkflow))
-	mux.HandleFunc("GET "+prefix+"/workflows/{id}", wrap("GET /workflows/{id}", h.GetWorkflow))
-	mux.HandleFunc("POST "+prefix+"/workflows/{id}/cancel", wrap("POST /workflows/{id}/cancel", h.CancelWorkflow))
+	mount(mux, h, "POST "+prefix+"/workflows", principal.ScopeJobs, wrap("POST /workflows", h.CreateWorkflow))
+	mount(mux, h, "GET "+prefix+"/workflows/{id}", principal.ScopeJobs, wrap("GET /workflows/{id}", h.GetWorkflow))
+	mount(mux, h, "POST "+prefix+"/workflows/{id}/cancel", principal.ScopeJobs, wrap("POST /workflows/{id}/cancel", h.CancelWorkflow))
 }
 
 // deprecationWarning wraps a legacy, unprefixed-route handler: it sets an

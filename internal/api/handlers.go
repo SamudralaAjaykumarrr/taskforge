@@ -14,6 +14,16 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 )
 
+// createJobRequest is the POST /jobs body.
+//
+// Phase 12 (docs/phase-12-plan.md §6a, verification point 6): this struct
+// deliberately has NO principal_id/tenant_id/actor field, and must never
+// gain one. The submitting principal is read exactly once, from the
+// authenticated AccessContext, in CreateJob. Phase 11 made the decoder
+// tolerant of unknown fields, so a body carrying "principal_id":"<someone
+// else's uuid>" decodes fine and is simply ignored -- the job is still
+// attributed to whoever presented the credential. That behaviour is
+// asserted directly by TestCreateJob_RequestBodyPrincipalIDFieldIgnored.
 type createJobRequest struct {
 	JobType                 string          `json:"job_type"`
 	Payload                 json.RawMessage `json:"payload"`
@@ -102,6 +112,11 @@ const idempotencyKeyHeader = "Idempotency-Key"
 // TestCreateJob_UnknownFieldsAreIgnored_RoundTrip and
 // TestCreateJob_OversizedBodyRejected413 in handlers_phase11_test.go.
 func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
 
 	var req createJobRequest
@@ -127,6 +142,11 @@ func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params.IdempotencyKey = idemKey
+	// The ONLY assignment of PrincipalID on this path, and it comes from
+	// the verified credential -- never from req, never from a header,
+	// never defaulted to principal.SystemPrincipalID
+	// (docs/phase-12-plan.md §6a/§6b).
+	params.PrincipalID = authz.PrincipalID
 
 	j, created, err := h.store.InsertIdempotent(r.Context(), params)
 	if err != nil {
@@ -140,14 +160,20 @@ func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 	// guidance: "Never emit the raw idempotency key into metrics labels.
 	// Avoid logging it unless docs explicitly permit safe
 	// redaction/hashing," which docs/idempotency.md does not.
+	// Phase 12 (G6, docs/phase-12-plan.md §10): every submit/cancel log
+	// line carries an actor -- the authenticated principal's ID, which is
+	// a non-secret identifier -- and never any part of the credential
+	// that proved it. TestSubmissionLogging_RawCredentialNeverLogged
+	// audits every one of these call sites for the raw secret.
+	actor := authz.PrincipalID.String()
 	if idemKey != nil {
 		if created {
-			h.logger.Info("new idempotent submission", "event", "submission", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
+			h.logger.Info("new idempotent submission", "event", "submission", "actor", actor, "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
 		} else {
-			h.logger.Info("duplicate submission detected; returning existing job", "event", "duplicate_submission_hit", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
+			h.logger.Info("duplicate submission detected; returning existing job", "event", "duplicate_submission_hit", "actor", actor, "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", true)
 		}
 	} else {
-		h.logger.Info("job submitted", "event", "submission", "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", false)
+		h.logger.Info("job submitted", "event", "submission", "actor", actor, "job_id", j.ID.String(), "job_type", j.JobType, "state", string(j.State), "had_idempotency_key", false)
 	}
 
 	writeJSON(w, http.StatusCreated, toJobResponse(j))
@@ -203,7 +229,20 @@ func isMaxBytesError(err error) bool {
 
 // GetJob handles GET /jobs/{id}. It is a plain read against durable state
 // — no locking, no side effects — per docs/worker-protocol.md.
+//
+// Phase 12: the read is principal-scoped in SQL (internal/store.GetByID).
+// A job that exists but belongs to another, non-admin principal returns
+// ErrNotFound from the store and is reported here through the exact same
+// branch as a genuinely nonexistent id -- so the 404 body is
+// byte-identical and this handler contains no ownership logic at all
+// (G2). TestGetJob_CrossPrincipal_IndistinguishableFromNonexistent
+// compares the two responses byte for byte.
 func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	idParam := r.PathValue("id")
 	id, err := uuid.Parse(idParam)
 	if err != nil {
@@ -211,7 +250,7 @@ func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j, err := h.store.GetByID(r.Context(), id)
+	j, err := h.store.GetByID(r.Context(), id, authz)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "job not found")
 		return
@@ -248,6 +287,11 @@ func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
 // snapshot. The final GetByID only ever supplies the response body for
 // an already-resolved (terminal, or genuinely nonexistent) job.
 func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
+	authz, ok := h.accessContext(w, r)
+	if !ok {
+		return
+	}
+
 	idParam := r.PathValue("id")
 	id, err := uuid.Parse(idParam)
 	if err != nil {
@@ -262,17 +306,17 @@ func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 	// request pending a running worker's acknowledgement from a no-op
 	// against an already-terminal (or nonexistent) job.
 	path := "direct"
-	j, err := h.store.CancelQueuedOrRetryWait(r.Context(), id)
+	j, err := h.store.CancelQueuedOrRetryWait(r.Context(), id, authz)
 	if errors.Is(err, store.ErrStaleTransition) {
 		path = "requested_pending_worker"
-		j, err = h.store.RequestCancellation(r.Context(), id)
+		j, err = h.store.RequestCancellation(r.Context(), id, authz)
 	}
 	if errors.Is(err, store.ErrStaleTransition) {
 		// Neither QUEUED/RETRY_WAIT nor RUNNING matched: the job is
 		// already terminal (or does not exist at all) — report reality
 		// rather than a generic rejection, per the documented contract.
 		path = "already_terminal"
-		j, err = h.store.GetByID(r.Context(), id)
+		j, err = h.store.GetByID(r.Context(), id, authz)
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "job not found")
 			return
@@ -284,6 +328,7 @@ func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.logger.Info("cancellation requested", "event", "cancellation_requested",
+		"actor", authz.PrincipalID.String(),
 		"job_id", id.String(), "job_type", j.JobType, "state", string(j.State), "path", path)
 
 	writeJSON(w, http.StatusOK, toJobResponse(j))

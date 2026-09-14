@@ -27,7 +27,7 @@ import (
 )
 
 func diamondSpec(prefix string) workflow.GraphSpec {
-	return workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+	return workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 		{NodeKey: "A", JobType: prefix + ".a", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30},
 		{NodeKey: "B", JobType: prefix + ".b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
 		{NodeKey: "C", JobType: prefix + ".c", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
@@ -150,7 +150,7 @@ func TestChaos_WorkflowFanIn_ConcurrentPredecessorCompletion_Seeded(t *testing.T
 				_, err = s.CompleteSuccess(ctx, claimedD.ID, "wf-fanin-d", claimedD.LeaseGeneration, nil)
 				require.NoError(t, err)
 
-				final, err := s.GetWorkflow(ctx, inst.ID)
+				final, err := s.GetWorkflow(ctx, inst.ID, testAccess)
 				require.NoError(t, err)
 				require.Equal(t, workflow.Succeeded, final.State)
 			}
@@ -180,7 +180,7 @@ func TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent(t *testing.T) {
 			const numWorkflows = 20
 			for i := 0; i < numWorkflows; i++ {
 				prefix := fmt.Sprintf("chaos.wf.predretry.%d", i)
-				spec := workflow.GraphSpec{Nodes: []workflow.NodeSpec{
+				spec := workflow.GraphSpec{PrincipalID: testPrincipalID, Nodes: []workflow.NodeSpec{
 					{NodeKey: "A", JobType: prefix + ".a", Payload: []byte(`{}`), MaxAttempts: 6, ExecutionTimeoutSeconds: 30},
 					{NodeKey: "B", JobType: prefix + ".b", Payload: []byte(`{}`), MaxAttempts: 3, ExecutionTimeoutSeconds: 30, DependsOn: []string{"A"}},
 				}}
@@ -206,7 +206,7 @@ func TestChaos_WorkflowPredecessorRetry_DoesNotUnblockDependent(t *testing.T) {
 					// CompleteRetryableFailure's delay=0 makes A itself
 					// immediately re-eligible -- would otherwise just
 					// re-claim A and prove nothing about B.
-					gotB, err := s.GetByID(ctx, b.JobID)
+					gotB, err := s.GetByID(ctx, b.JobID, testAccess)
 					require.NoError(t, err)
 					require.Equal(t, jobstate.Queued, gotB.State, "workflow %s: B must remain QUEUED (dependency-blocked) while A is still RETRY_WAIT", inst.ID)
 					require.Equal(t, 0, gotB.AttemptCount, "workflow %s: B must never have been claimed while A is still RETRY_WAIT", inst.ID)
@@ -301,10 +301,10 @@ func TestChaos_StaleWorkflowNodeCompletion_NeverUnblocksOrCancelsDependents(t *t
 			require.True(t, ok)
 			require.ElementsMatch(t, []uuid.UUID{b.JobID, c.JobID}, []uuid.UUID{firstClaim.ID, secondClaim.ID})
 		} else {
-			got, err := s.GetByID(ctx, b.JobID)
+			got, err := s.GetByID(ctx, b.JobID, testAccess)
 			require.NoError(t, err)
 			require.Equal(t, "CANCELLED", string(got.State), "workflow %s: B must be cancelled by A's genuine permanent failure, never by the rejected stale one", inst.ID)
-			got, err = s.GetByID(ctx, c.JobID)
+			got, err = s.GetByID(ctx, c.JobID, testAccess)
 			require.NoError(t, err)
 			require.Equal(t, "CANCELLED", string(got.State))
 		}

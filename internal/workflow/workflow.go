@@ -69,6 +69,17 @@ type NodeSpec struct {
 
 // GraphSpec is a full workflow submission: every node in one logical DAG.
 type GraphSpec struct {
+	// PrincipalID is the authenticated API caller submitting this
+	// workflow (Phase 12, docs/phase-12-plan.md §5). It is recorded on
+	// the workflow_instances row and on every node's underlying jobs row,
+	// so a workflow and its nodes can never end up owned by different
+	// principals. Mandatory: both columns are NOT NULL (migrations 0008/0009).
+	//
+	// Like internal/job.NewParams.PrincipalID, it is populated exactly
+	// once, from the authenticated principal.AccessContext, and never
+	// from the request body.
+	PrincipalID uuid.UUID
+
 	Nodes []NodeSpec
 }
 
@@ -233,7 +244,10 @@ func cyclePathString(stack []string, closeAt string) string {
 // -- the read model internal/store's workflow methods return, and
 // internal/api serializes for POST/GET /workflows responses.
 type Instance struct {
-	ID                uuid.UUID
+	ID uuid.UUID
+	// PrincipalID is the API caller that submitted this workflow (Phase
+	// 12, migrations 0006-0009 -- NOT NULL).
+	PrincipalID       uuid.UUID
 	State             State
 	CancelRequested   bool
 	CancelRequestedAt *time.Time

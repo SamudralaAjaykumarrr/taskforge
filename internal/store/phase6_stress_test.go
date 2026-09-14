@@ -75,7 +75,7 @@ func TestStress_CancellationSurvivesConcurrentCompletionAttemptsAcrossManyGenera
 		require.True(t, ok)
 		require.Equal(t, int64(staleGenerationsPerJob+1), final.LeaseGeneration)
 
-		_, err = s.RequestCancellation(ctx, created.ID)
+		_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 		result, err := s.CompleteCancelled(ctx, created.ID, owner, final.LeaseGeneration)
 		require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestStress_CancellationSurvivesConcurrentCompletionAttemptsAcrossManyGenera
 	require.Equal(t, int64(jobCount*(staleGenerationsPerJob*4+1)), rejectedCount)
 
 	for _, c := range cases {
-		final, err := s.GetByID(ctx, c.id)
+		final, err := s.GetByID(ctx, c.id, testAccess)
 		require.NoError(t, err)
 		require.Equal(t, jobstate.Cancelled, final.State, "job %s must remain CANCELLED after sustained concurrent stale-generation pressure", c.id)
 	}
@@ -182,7 +182,7 @@ func TestStress_ManyEligibleScheduledJobsClaimedExactlyOnceUnderPressure(t *test
 		future := time.Now().Add(1 * time.Hour)
 		created, err := s.Insert(ctx, newScheduledJobParams("test.stress.sched.cancelled", &future))
 		require.NoError(t, err)
-		_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+		_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 		require.NoError(t, err)
 	}
 

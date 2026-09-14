@@ -34,6 +34,7 @@ func TestRunOnce_CooperativeHandler_AcknowledgesCancellation(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.cancel.cooperative",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -56,14 +57,14 @@ func TestRunOnce_CooperativeHandler_AcknowledgesCancellation(t *testing.T) {
 	}()
 
 	<-started
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	<-runDone
 	require.NoError(t, runErr)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, final.State)
 	require.NotNil(t, final.TerminalAt)
@@ -108,6 +109,7 @@ func TestRunOnce_HandlerIgnoresCancellation_StillAcknowledgesCancelled(t *testin
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.cancel.uncooperative",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -133,14 +135,14 @@ func TestRunOnce_HandlerIgnoresCancellation_StillAcknowledgesCancelled(t *testin
 	// before the first heartbeat tick (~666ms) and well before the
 	// handler's own 1200ms sleep completes -- guaranteeing the worker
 	// observes it before the handler returns.
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	<-runDone
 	require.NoError(t, runErr)
 	require.True(t, claimed)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, final.State,
 		"a durable cancellation observed during execution must win even when the handler itself ignored ctx and reported success")
@@ -159,6 +161,7 @@ func TestRunOnce_LeaseLostTakesPriorityOverPendingCancellation(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := s.Insert(ctx, job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 "test.cancel.vs.leaselost",
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -185,7 +188,7 @@ func TestRunOnce_LeaseLostTakesPriorityOverPendingCancellation(t *testing.T) {
 	// A cancellation is requested, but before worker-1's heartbeat loop
 	// gets a chance to observe it, its lease is force-expired and
 	// genuinely reclaimed by a simulated second worker.
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	forceExpireLeaseWT(t, db, created.ID)
 	reclaimed, ok, err := s.Claim(ctx, "worker-2")

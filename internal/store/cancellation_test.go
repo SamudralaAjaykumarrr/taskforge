@@ -28,6 +28,7 @@ import (
 
 func newCancelJobParams(jobType string) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             5,
@@ -49,7 +50,7 @@ func TestCancelQueuedOrRetryWait_Queued_TransitionsDirectlyToCancelled(t *testin
 	created, err := s.Insert(ctx, newCancelJobParams("test.cancel.queued"))
 	require.NoError(t, err)
 
-	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID)
+	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cancelled.State)
 	require.NotNil(t, cancelled.TerminalAt)
@@ -81,7 +82,7 @@ func TestCancelQueuedOrRetryWait_RetryWait_TransitionsDirectlyToCancelled(t *tes
 	require.NoError(t, err)
 	require.Equal(t, jobstate.RetryWait, result.State)
 
-	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID)
+	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cancelled.State)
 	require.NotNil(t, cancelled.TerminalAt)
@@ -110,7 +111,7 @@ func TestCancelQueuedOrRetryWait_RetryWait_NeverBecomesClaimableAfterEligibility
 	_, err = s.CompleteRetryableFailure(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration, "transient", 10*time.Second)
 	require.NoError(t, err)
 
-	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID)
+	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cancelled.State)
 
@@ -148,7 +149,7 @@ func TestRequestCancellation_Running_SetsFlagWithoutChangingState(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	result, err := s.RequestCancellation(ctx, created.ID)
+	result, err := s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, result.State, "requesting cancellation must not itself change state")
 	require.True(t, result.CancelRequested)
@@ -171,11 +172,11 @@ func TestRequestCancellation_Duplicate_IsIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	first, err := s.RequestCancellation(ctx, created.ID)
+	first, err := s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.NotNil(t, first.CancelRequestedAt)
 
-	second, err := s.RequestCancellation(ctx, created.ID)
+	second, err := s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.True(t, second.CancelRequested)
 	require.NotNil(t, second.CancelRequestedAt)
@@ -195,7 +196,7 @@ func TestRequestCancellation_NotRunning_RejectedAsStale(t *testing.T) {
 	created, err := s.Insert(ctx, newCancelJobParams("test.cancel.notrunning"))
 	require.NoError(t, err)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 }
 
@@ -207,7 +208,7 @@ func TestRequestCancellation_MissingJob_RejectedAsStale(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	_, err := s.RequestCancellation(ctx, uuid.New())
+	_, err := s.RequestCancellation(ctx, uuid.New(), testAccess)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 }
 
@@ -226,7 +227,7 @@ func TestCompleteCancelled_AcknowledgesAndFinalizesAttempt(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	result, err := s.CompleteCancelled(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration)
@@ -259,7 +260,7 @@ func TestCompleteCancelled_WithoutRequestFirst_RejectedAsStale(t *testing.T) {
 	_, err = s.CompleteCancelled(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	still, err := s.GetByID(ctx, created.ID)
+	still, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, still.State)
 }
@@ -280,7 +281,7 @@ func TestCompleteCancelled_RejectsStaleGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	forceExpireLease(t, db, created.ID)
@@ -295,7 +296,7 @@ func TestCompleteCancelled_RejectsStaleGeneration(t *testing.T) {
 	_, err = s.CompleteCancelled(ctx, created.ID, "worker-A", gen1.LeaseGeneration)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	still, err := s.GetByID(ctx, created.ID)
+	still, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Running, still.State, "the reclaimed job must remain RUNNING under generation 2, untouched by worker A's stale ack")
 	require.Equal(t, int64(2), still.LeaseGeneration)
@@ -321,7 +322,7 @@ func TestSF012_CancelCommitsFirst_CompletionRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	// Cancel wins: acknowledge and commit first.
@@ -334,7 +335,7 @@ func TestSF012_CancelCommitsFirst_CompletionRejected(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, claimed.ID, "worker-A", claimed.LeaseGeneration, nil)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, final.State, "the job must remain CANCELLED -- a losing completion must never overwrite it")
 }
@@ -355,7 +356,7 @@ func TestSF012_CompletionCommitsFirst_CancellationRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	// Success wins: complete and commit first.
@@ -368,7 +369,7 @@ func TestSF012_CompletionCommitsFirst_CancellationRejected(t *testing.T) {
 	_, err = s.CompleteCancelled(ctx, claimed.ID, "worker-A", claimed.LeaseGeneration)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State, "the job must remain SUCCEEDED -- a losing cancellation must never overwrite a completed job")
 }
@@ -387,7 +388,7 @@ func TestSF012_CancelRacesRetryableFailure_FirstCommitWins(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	result, err := s.CompleteCancelled(ctx, claimed.ID, "worker-A", claimed.LeaseGeneration)
@@ -412,7 +413,7 @@ func TestSF012_CancelRacesDeadLetter_FirstCommitWins(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	result, err := s.CompleteCancelled(ctx, claimed.ID, "worker-A", claimed.LeaseGeneration)
@@ -444,7 +445,7 @@ func TestCancelRacesReclaim_StaleGenerationCannotAcknowledge(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	forceExpireLease(t, db, created.ID)
@@ -487,12 +488,12 @@ func TestCancelQueuedOrRetryWait_AlreadyTerminal_RejectedAsStale(t *testing.T) {
 	_, err = s.CompleteSuccess(ctx, claimed.ID, "worker-1", claimed.LeaseGeneration, nil)
 	require.NoError(t, err)
 
-	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
-	_, err = s.RequestCancellation(ctx, created.ID)
+	_, err = s.RequestCancellation(ctx, created.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 
-	final, err := s.GetByID(ctx, created.ID)
+	final, err := s.GetByID(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Succeeded, final.State, "a completed job must never be reopened by a subsequent cancellation attempt")
 }
@@ -509,10 +510,10 @@ func TestCancelQueuedOrRetryWait_DuplicateOnAlreadyCancelled_RejectedAsStale(t *
 
 	created, err := s.Insert(ctx, newCancelJobParams("test.cancel.duplicate.terminal"))
 	require.NoError(t, err)
-	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 
-	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID)
+	_, err = s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.ErrorIs(t, err, store.ErrStaleTransition)
 }
 
@@ -535,7 +536,7 @@ func TestInsertIdempotent_DuplicateSubmissionAfterCancellation_ReturnsExistingJo
 	require.NoError(t, err)
 	require.True(t, created1)
 
-	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID)
+	cancelled, err := s.CancelQueuedOrRetryWait(ctx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, jobstate.Cancelled, cancelled.State)
 
@@ -570,10 +571,10 @@ func TestCompleteCancelled_RollbackLeavesRowUnchanged(t *testing.T) {
 	claimed, ok, err := s.Claim(bgCtx, "worker-1")
 	require.NoError(t, err)
 	require.True(t, ok)
-	_, err = s.RequestCancellation(bgCtx, created.ID)
+	_, err = s.RequestCancellation(bgCtx, created.ID, testAccess)
 	require.NoError(t, err)
 
-	before, err := s.GetByID(bgCtx, created.ID)
+	before, err := s.GetByID(bgCtx, created.ID, testAccess)
 	require.NoError(t, err)
 
 	cancelCtx, cancel := context.WithCancel(bgCtx)
@@ -582,7 +583,7 @@ func TestCompleteCancelled_RollbackLeavesRowUnchanged(t *testing.T) {
 	_, err = s.CompleteCancelled(cancelCtx, claimed.ID, "worker-1", claimed.LeaseGeneration)
 	require.Error(t, err)
 
-	after, err := s.GetByID(bgCtx, created.ID)
+	after, err := s.GetByID(bgCtx, created.ID, testAccess)
 	require.NoError(t, err)
 	require.Equal(t, before.State, after.State, "a failed transaction must leave state completely unchanged")
 	require.Equal(t, before.Version, after.Version, "a failed transaction must not advance the optimistic-concurrency version counter")

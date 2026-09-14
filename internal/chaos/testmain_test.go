@@ -96,6 +96,7 @@ func newChaosStore(t *testing.T) *store.Store {
 // exhaustion is exactly what several campaigns exercise.
 func newChaosParams(jobType string, maxAttempts int) job.NewParams {
 	return job.NewParams{
+		PrincipalID:             testPrincipalID,
 		JobType:                 jobType,
 		Payload:                 json.RawMessage(`{}`),
 		MaxAttempts:             maxAttempts,

@@ -46,6 +46,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/job"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/jobstate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 )
 
 // attemptOutcomeCancelled is the job_attempts.outcome value recorded when
@@ -67,7 +68,19 @@ const attemptOutcomeCancelled = "CANCELLED"
 // and leaves the row untouched -- callers (see internal/api.CancelJob)
 // fall through to RequestCancellation next, per
 // docs/worker-protocol.md's documented per-state cancellation semantics.
-func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job.Job, error) {
+//
+// Phase 12 (docs/phase-12-plan.md §4a): authz's ownership predicate is
+// part of the UPDATE's own WHERE clause, so a job belonging to a
+// different, non-admin principal simply does not match and is never
+// mutated -- there is no window between an authorization check and the
+// mutation, because they are the same statement. "Not yours" is therefore
+// indistinguishable from "wrong state" and from "does not exist": all
+// three are ErrStaleTransition here, and the handler's fall-through
+// eventually reports the same 404 it reports for a nonexistent id.
+// internal/api's TestCancelJob_CrossPrincipal_MutatesZeroRows proves the
+// zero-mutation half directly, by reading the row back from PostgreSQL
+// rather than trusting the HTTP response.
+func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error) {
 	if !jobstate.IsValidTransition(jobstate.Queued, jobstate.Cancelled) {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, jobstate.Queued, jobstate.Cancelled)
 	}
@@ -88,9 +101,9 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
-		WHERE id = $1 AND state IN ('QUEUED', 'RETRY_WAIT')
+		WHERE id = $1 AND state IN ('QUEUED', 'RETRY_WAIT') AND `+principalScopeClause(2, 3)+`
 		RETURNING `+jobColumns,
-		id,
+		append([]any{id}, scopeArgs(authz)...)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: cancel queued/retry_wait job: %w", err)
@@ -149,7 +162,14 @@ func (s *Store) CancelQueuedOrRetryWait(ctx context.Context, id uuid.UUID) (*job
 // CompleteCancelled, once the current lease holder observes this flag
 // (see internal/worker) and acknowledges it -- see that method's doc
 // comment and TF-INV-010.
-func (s *Store) RequestCancellation(ctx context.Context, id uuid.UUID) (*job.Job, error) {
+//
+// Phase 12: as for CancelQueuedOrRetryWait, authz's ownership predicate is
+// part of this UPDATE's own WHERE clause. This is the specific statement
+// docs/phase-12-plan.md §4a identified as the architecture blocker in
+// Revision 1's design -- it is what an unauthorized caller would otherwise
+// have been able to use to flip cancel_requested = true on another
+// principal's RUNNING job before any handler-level check could run.
+func (s *Store) RequestCancellation(ctx context.Context, id uuid.UUID, authz principal.AccessContext) (*job.Job, error) {
 	// RUNNING -> RUNNING (self-loop) is already a legal edge in
 	// docs/execution-semantics.md's transition table (it also covers
 	// reclaim and heartbeat renewal) -- checked here purely as the same
@@ -165,9 +185,9 @@ func (s *Store) RequestCancellation(ctx context.Context, id uuid.UUID) (*job.Job
 			cancel_requested_at = COALESCE(cancel_requested_at, now()),
 			updated_at = now(),
 			version = version + 1
-		WHERE id = $1 AND state = 'RUNNING'
+		WHERE id = $1 AND state = 'RUNNING' AND `+principalScopeClause(2, 3)+`
 		RETURNING `+jobColumns,
-		id,
+		append([]any{id}, scopeArgs(authz)...)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: request cancellation: %w", err)

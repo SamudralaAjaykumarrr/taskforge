@@ -159,6 +159,33 @@ type Metrics struct {
 	// count of InsertIdempotent calls that resolved to an existing row
 	// via idempotency key rather than creating a new one.
 	IdempotentSubmissionHitsTotal prometheus.Counter
+
+	// AuthFailuresTotal is taskforge_auth_failures_total (counter,
+	// labeled by reason): the number of HTTP requests rejected by Phase
+	// 12's authentication middleware, broken down by why
+	// (docs/phase-12-plan.md §10).
+	//
+	// This is the SERVER-SIDE half of a deliberate split: the caller
+	// always receives one uniform 401 body regardless of reason, so no
+	// client can enumerate which key_ids exist or which have been
+	// revoked, while an operator still gets the diagnostic breakdown they
+	// need to tell "someone is stuffing credentials" apart from "one
+	// deployment is still using a rotated-out key."
+	//
+	// Cardinality: reason is a fixed, small enum owned by
+	// internal/principal (malformed, unknown_key, revoked, expired,
+	// bad_secret, principal_revoked, internal_error) -- never a raw
+	// credential, key_id, principal id, IP address, or error string, per
+	// docs/observability.md's Cardinality Policy and
+	// docs/security-model.md's "never let a raw credential enter a metric
+	// label" requirement.
+	//
+	// It is explicitly NOT a rate limiter and not an input to one:
+	// automated brute-force lockout is a reasoned Phase 13 deferral
+	// (docs/phase-12-plan.md §3), and this counter is the observability
+	// this phase provides instead, not a claim that the problem is
+	// solved.
+	AuthFailuresTotal *prometheus.CounterVec
 }
 
 // New constructs a fresh Metrics instance backed by its own private
@@ -233,6 +260,11 @@ func New() *Metrics {
 			Name: "taskforge_idempotent_submission_hits_total",
 			Help: "Count of POST /jobs calls that resolved to an existing row via idempotency key.",
 		}),
+
+		AuthFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "taskforge_auth_failures_total",
+			Help: "HTTP requests rejected by authentication, labeled by reason.",
+		}, []string{"reason"}),
 	}
 
 	reg.MustRegister(
@@ -247,6 +279,7 @@ func New() *Metrics {
 		m.RetryCount,
 		m.HeartbeatsTotal,
 		m.IdempotentSubmissionHitsTotal,
+		m.AuthFailuresTotal,
 	)
 
 	return m
