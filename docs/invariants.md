@@ -538,6 +538,223 @@ concurrency test for TF-INV-008 doubles as a regression test for this.
 
 ---
 
+## Cross-Phase Governance Additions (Phase 12 / Phase 13 reconciliation)
+
+Phase 12 ([phase-12-plan.md](phase-12-plan.md) OD-8) and Phase 13
+([phase-13-plan.md](phase-13-plan.md) OD-3) both deferred formal
+`TF-INV-0NN` allocation to a dedicated, cross-phase governance pass rather
+than deciding it unilaterally inside either phase's implementation PR.
+This section is that pass's result.
+
+**Method**: not every acceptance test, security control, or operational
+expectation becomes a numbered invariant. An existing `TF-INV-*` entry
+proves a durable, checkable property of the job/workflow state machine
+itself — "this exact row-level condition can never hold" — verified
+directly against PostgreSQL state, independent of which code path got
+there. A new ID is allocated only when a candidate guarantee is of that
+same kind: a durable state-machine safety property, not a request-time
+access-control gate, a deployment/config requirement, a compatibility
+contract, or an SLO. Phase 12's own [phase-12-plan.md](phase-12-plan.md)
+§11 "16 verification points" already proves this distinction is real in
+practice: most of them (deny-by-default auth, credential hygiene, TLS
+boundary, audit logging, least-privilege roles) are proven by dedicated
+non-`TF-INV` test suites and are not weakened, duplicated, or renumbered
+by being left out of this registry.
+
+### Phase 12's G1–G8: disposition
+
+| Guarantee | Disposition | Why |
+|---|---|---|
+| G1 — No unauthenticated read/write | **Not an invariant.** Security requirement. | Request-time access-control gate, not a durable state property; already proven by `internal/api/structure_phase12_test.go`'s structural absence-of-behavior tests and verification point 5 — the same rigor class as a `TF-INV`, deliberately kept in its own category so this document stays scoped to job/workflow state-machine correctness. |
+| **G2 — Ownership-scoped access** | **Invariant. → TF-INV-017.** | Durable, SQL-enforced, zero-row-affected property of the exact kind TF-INV-002/003 already are. See below. |
+| G3 — Distinct trust boundaries | **Not an invariant.** Architectural/security design decision. | Not a runtime-checkable state property — a statement about which layer authenticates whom, documented in `security-model.md` "Trust Domains" and `phase-12-plan.md` §4. |
+| G4 — Least-privilege PostgreSQL roles | **Not an invariant.** Security/operational configuration requirement. | Provable against `deploy/postgres-roles.sql`'s grants (`internal/migrate/phase12_roles_test.go`), but it bounds blast radius rather than stating a job-state safety property; a compromised-but-scoped worker role is a defense-in-depth control, not a "this state can never occur" guarantee. |
+| G5 — Transport security | **Not an invariant.** Operational/deployment expectation. | Explicitly not enforced by TaskForge itself (`phase-12-plan.md` G5: "TaskForge does not terminate TLS itself") — an external deployment requirement, not a property of this system's own state. |
+| G6 — Audit trail | **Not an invariant.** Operational/observability expectation. | A logging-completeness requirement, not a state-machine safety property. |
+| **G7 — Tenant-scoped idempotency** | **Invariant. → TF-INV-018.** | Extends TF-INV-008/016's durable, DB-constraint-enforced uniqueness guarantee to the tenant-scoped key. See below. |
+| G8 — Credential hygiene | **Not an invariant.** Security requirement. | Proven by verification points 3/4/10 (never-plaintext, constant-time comparison, never-logged); a credential-handling discipline, not a job-state property. |
+
+`TF-INV-001` through `TF-INV-016` are unchanged by this reconciliation —
+not one word of their existing text is altered. Where a Phase 12
+guarantee narrows or extends the *scope* of an existing invariant (G7 on
+TF-INV-008/016) rather than stating a wholly new property, that narrowing
+is recorded as its own new ID below rather than by editing the original
+entry, per this document's own append-only convention (see header).
+
+---
+
+### TF-INV-017 — A principal can act only on the jobs and workflows it owns
+
+**Property**: For a non-admin principal, every read, cancel, and list
+operation against a job or workflow is scoped to
+`jobs.principal_id = <authenticated caller>` (or the workflow-instance
+equivalent) at the SQL statement itself. An attempt by principal B against
+a resource owned by principal A affects zero durable rows and is
+indistinguishable, in its response, from the resource not existing at
+all. An admin principal is the sole documented exception.
+
+**Why it matters**: Without this, one tenant's credentials could read or
+cancel another tenant's jobs — a direct confidentiality and integrity
+breach, and exactly the failure mode multi-tenancy exists to prevent. It
+is the durable-state counterpart to Phase 12's authentication guarantee
+(G1): authentication proves *who* is asking; this invariant proves the
+data layer itself, not just a handler check, refuses to answer for anyone
+but the asker.
+
+**Violating example**: Principal B calls `POST /jobs/{A's job id}/cancel`.
+If the query lacked a `principal_id` predicate (or checked it only in a
+handler, after an unscoped read), B's request could mutate A's job, or a
+response could leak that a given ID belongs to *someone* even if not to B.
+
+**Implementation mechanism**: The ownership predicate lives in the same
+SQL statement that reads or mutates the row — `internal/store`'s
+`GetByID`, `CancelQueuedOrRetryWait`, `RequestCancellation`, `GetWorkflow`,
+and `CancelWorkflow` all carry an `AND ($n::boolean OR principal_id =
+$n+1)` clause (admin bypass OR ownership match), not a handler-level
+filter applied after the fact. `txenqueue.EnqueueTx` requires a non-zero
+`PrincipalID` and attributes the job to exactly that principal, with no
+fallback/default path. See [phase-12-plan.md](phase-12-plan.md) §4a, G2.
+
+**Test strategy**: Store-layer, zero-row-mutation proofs in
+`internal/store/principal_scoping_phase12_test.go`
+(`TestGetByID_IsPrincipalScoped`,
+`TestCancelQueuedOrRetryWait_IsPrincipalScoped_MutatesZeroRows`,
+`TestRequestCancellation_IsPrincipalScoped_MutatesZeroRows`,
+`TestGetWorkflow_IsPrincipalScoped`,
+`TestCancelWorkflow_IsPrincipalScoped_TouchesNoNodeJob`,
+`TestCreateWorkflow_AttributesInstanceAndEveryNodeJobToOnePrincipal`);
+HTTP-boundary, indistinguishable-from-nonexistent proofs in
+`internal/api/handlers_phase12_test.go`
+(`TestGetJob_CrossPrincipal_IndistinguishableFromNonexistent`,
+`TestGetWorkflow_CrossPrincipal_IndistinguishableFromNonexistent`,
+`TestCancelJob_CrossPrincipal_MutatesZeroRows`,
+`TestCancelJob_CrossPrincipal_RunningJob_NeverSetsCancelRequested`,
+`TestCancelWorkflow_CrossPrincipal_MutatesZeroRows`,
+`TestAdminPrincipal_MayReadAndCancelAnyPrincipalsResources`); enqueue-path
+proofs in `txenqueue/principal_phase12_test.go`
+(`TestEnqueueTx_AttributesJobToSuppliedPrincipal`,
+`TestEnqueueTx_PrincipalID_Required_RejectsZeroValue`,
+`TestEnqueueTx_NoDefaultSystemPrincipalPath`,
+`TestTxenqueuePackage_ContainsNoSystemPrincipalFallback`). These are
+Phase 12 verification points 6, 7, and 8
+([phase-12-plan.md](phase-12-plan.md) §11), already passing at merge; this
+entry only assigns them a formal invariant ID, adding no new test.
+
+---
+
+### TF-INV-018 — Idempotency keys are unique within their tenant scope
+
+**Property**: Within the scope `(principal_id, job_type, idempotency_key)`,
+a given idempotency key maps to exactly one job row, regardless of how
+many times a submission with that key is retried, including concurrently
+and including by two different principals presenting the *same*
+`(job_type, idempotency_key)` pair. `principal_id` is `NOT NULL`, so no
+NULL-widening collision window exists across tenants or for
+not-yet-authenticated submissions.
+
+**Why it matters**: This is TF-INV-008/016's guarantee, carried forward
+under multi-tenancy. Without the tenant dimension in the uniqueness scope,
+two different callers who happen to choose the same `idempotency_key` for
+the same `job_type` would collide into a single job row — one tenant's
+retry-safety key silently becoming a cross-tenant confused-deputy bug,
+letting one principal observe or cancel a job it did not submit.
+
+**Violating example**: Principal A and principal B both submit
+`job_type="send_email"` with `idempotency_key="user-42-welcome"`
+(coincidentally identical, or supplied by a shared client library with a
+predictable key scheme). Without tenant scoping, B's request would be
+treated as a duplicate of A's and return A's job.
+
+**Implementation mechanism**: `UNIQUE (principal_id, job_type,
+idempotency_key)` — the same unique-constraint-not-application-logic
+pattern TF-INV-016 already establishes, re-keyed to include
+`principal_id`; `jobs.principal_id NOT NULL` closes the NULL-widening
+case. See [phase-12-plan.md](phase-12-plan.md) §5, G7 ("Idempotency
+constraint change").
+
+**Test strategy**: `internal/store/principal_scoping_phase12_test.go`
+(`TestGetByIdempotencyKey_IsPrincipalScoped`,
+`TestInsertIdempotent_ConflictRecoveryStillWorksAfterIndexRename`,
+`TestInsert_ZeroPrincipalIDIsRejectedByTheDatabase`,
+`TestConcurrentTwoPrincipalIdempotency_ExactlyOneRowPerPrincipal`);
+`internal/api/handlers_phase12_test.go`
+(`TestIdempotency_IsScopedPerPrincipal`);
+`txenqueue/principal_phase12_test.go`
+(`TestEnqueueTx_IdempotencyIsScopedPerPrincipal`). Phase 12 verification
+point 2 ([phase-12-plan.md](phase-12-plan.md) §11), already passing at
+merge; this entry only assigns it a formal invariant ID.
+
+---
+
+### TF-INV-019 — No queue/tenant is starved beyond its documented bound
+
+Status: **Reserved, algorithm-independent.** Phase 13
+([phase-13-plan.md](phase-13-plan.md)) has not been implemented; this ID
+is confirmed now, ahead of implementation, so Phase 13's implementation PR
+has a stable, non-tentative ID to cite. `docs/enterprise-roadmap.md` and
+`docs/phase-13-plan.md` previously cited this property as "tentatively
+TF-INV-017" — see the reconciliation note above for why `017`/`018` went
+to Phase 12's G2/G7 instead, pushing this property to the next available
+ID. Confirming the ID now does **not** decide, endorse, or foreclose any
+candidate fairness/concurrency mechanism — that choice remains Phase 13
+OD-1's mandatory ADR, still unwritten.
+
+**Property**: No queue or tenant with pending, capacity-eligible work is
+starved beyond the bound that Phase 13's governing ADR proves for its
+selected algorithm, under that ADR's own stated assumptions (run
+duration, load shape, queue count), while another queue or tenant
+continues to make progress. This is never claimed as an unconditional or
+indefinite guarantee — only the bound the ADR actually proves.
+
+**Why it matters**: Without a bounded fairness guarantee, a single
+high-volume queue or tenant can monopolize worker capacity indefinitely,
+starving every other queue/tenant even though they have eligible,
+capacity-respecting work waiting — the core failure mode Phase 13's
+governance work exists to close.
+
+**Violating example**: Queue "bulk-export" floods the claim pool; queue
+"user-notifications" has pending, capacity-eligible work but is never
+claimed for the duration of a test run long enough to exceed whatever
+bound the ADR's algorithm is supposed to guarantee.
+
+**Implementation mechanism**: Not yet decided — Phase 13 OD-1 (mandatory
+ADR, [phase-13-plan.md](phase-13-plan.md) §18) selects the concurrency/
+fairness mechanism; this invariant governance pass deliberately does not
+select one on the ADR's behalf.
+
+**Test strategy**: A Phase-5-style concurrency stress test with two or
+more queues — one flooded, one starved under the pre-Phase-13 model —
+asserting both make bounded-wait-time progress under the selected
+mechanism, over the tested run's duration (per
+[phase-13-plan.md](phase-13-plan.md) §10 and
+[enterprise-roadmap.md](enterprise-roadmap.md) Phase 13 "Invariants /
+proof obligations"). The exact test does not exist yet and is Phase 13
+implementation-PR scope, not this governance pass's.
+
+---
+
+### Phase 13 guarantees NOT allocated a `TF-INV` ID
+
+Recorded here so the reconciliation is complete, not just the additions:
+
+| Candidate | Disposition | Why |
+|---|---|---|
+| Concurrency-limit exactness (never more than N concurrently `RUNNING` jobs for a capped queue) | **Not a new invariant.** Proof obligation, tested the same way Phase 5 already proves exclusivity (TF-INV-002-style `SKIP LOCKED` stress test). | [phase-13-plan.md](phase-13-plan.md) §10 already states this explicitly: "not itself a new numbered invariant, but a proof obligation." This governance pass ratifies that call. |
+| Backpressure liveness (`429`/`503` + `Retry-After` eventually succeeds; a queue merely at its cap does not itself trigger either code) | **Not an invariant.** Operational/SLO expectation. | A retry-eventually-succeeds liveness property and a status-code-classification rule, not a durable state-machine safety property. |
+| Retention/idempotency "no second clock" interaction | **Not a new invariant.** Proof obligation against the existing TF-INV-008/TF-INV-016/TF-INV-018 uniqueness guarantee. | Retention must not let cleanup outpace the idempotency window; this is a correctness requirement *on* the existing idempotency invariants once Phase 13 implements retention, not a new property in its own right. |
+| Retention/TF-INV-005 interaction (pruning `job_attempts` must not disable the historical-reopen check) | **Not a new invariant.** Proof obligation against TF-INV-005. | [phase-13-plan.md](phase-13-plan.md) §10 identifies this as a required test (its SF-045) against TF-INV-005's existing durable check, not a new property. |
+| `queue_name` validation, retention sweeper role scoping, `503` admission semantics | **Not invariants.** Ordinary acceptance criteria / operational configuration. | Implementation-detail acceptance tests once Phase 13 is built; none states a durable state-machine safety property in its own right. |
+
+This governance pass resolves [phase-12-plan.md](phase-12-plan.md) OD-8
+and [phase-13-plan.md](phase-13-plan.md) OD-3: the invariant namespace is
+now one coherent sequence, `TF-INV-001` through `TF-INV-019`, with `017`
+and `018` allocated to Phase 12's already-merged G2/G7 and `019` confirmed
+(non-tentative) for Phase 13's still-unimplemented fairness property.
+Phase 13's concurrency/fairness *algorithm* (OD-1) remains open and is
+explicitly not decided by this pass.
+
+---
+
 ## Summary Table
 
 | ID | Property (short) | Terminal to state machine? |
@@ -558,6 +775,9 @@ concurrency test for TF-INV-008 doubles as a regression test for this.
 | TF-INV-014 | Stale generations always fenced | No |
 | TF-INV-015 | Heartbeats only extend, never transfer | No |
 | TF-INV-016 | Idempotency enforced by DB constraint | No |
+| TF-INV-017 | Principal isolation (ownership-scoped access) | No |
+| TF-INV-018 | Idempotency uniqueness is tenant-scoped | No |
+| TF-INV-019 | No queue/tenant starved beyond documented bound (Phase 13, reserved) | No |
 
 See [testing-strategy.md](testing-strategy.md) for the full
 invariant-to-test matrix and [execution-semantics.md](execution-semantics.md)

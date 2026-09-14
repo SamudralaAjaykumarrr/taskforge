@@ -719,9 +719,13 @@ retention can safely prune rows) and Phase 11 (stable, versioned API to add
 queue/rate-limit fields to).
 
 ### Invariants / proof obligations
-- A new invariant, tentatively TF-INV-017: "no queue/tenant with pending,
-  capacity-eligible work is starved beyond the documented bound while
-  another queue/tenant is making progress" — the *bound* is defined by the
+- A new invariant, **TF-INV-019** (confirmed by the cross-phase invariant
+  governance pass — see [invariants.md](invariants.md) "Cross-Phase
+  Governance Additions"; previously cited here tentatively as TF-INV-017,
+  before `017`/`018` were allocated to Phase 12's G2/G7 instead): "no
+  queue/tenant with pending, capacity-eligible work is starved beyond the
+  documented bound while another queue/tenant is making progress" — the
+  *bound* is defined by the
   ADR's chosen algorithm and its stated assumptions, not claimed as
   unconditional. Provable under a Phase-5-style concurrency stress test
   with two queues, one flooded and one starved under the old model, both
@@ -880,9 +884,10 @@ never actually changed would be a hollow proof).
 ### Invariants / proof obligations
 - An old worker binary and a new worker binary can run concurrently against
   one database (mid-rolling-deploy, for the full expand/migrate/contract
-  window) with zero invariant violations (TF-INV-001 through the new
-  TF-INV-017 from Phase 13), checked via the same invariant-checker harness
-  Phase 9's `internal/chaos` already provides.
+  window) with zero invariant violations (TF-INV-001 through TF-INV-019,
+  the full set once Phase 12/13 are allocated per
+  [invariants.md](invariants.md)), checked via the same invariant-checker
+  harness Phase 9's `internal/chaos` already provides.
 - A down migration, where one is claimed (data-safe-reversible label),
   actually reverses its up migration's schema effect (verified by
   re-running the up migration's own test suite against the down-then-up-
@@ -1289,9 +1294,10 @@ and Phase 16 (so HTTP-domain and split claim/queue-wait metrics exist to
 measure).
 
 ### Invariants / proof obligations
-- Zero invariant violations across the entire multi-hour run (the existing
-  TF-INV-001–016 set, plus TF-INV-017 from Phase 13), checked continuously
-  by the existing `internal/chaos` invariant checker exactly as Phase 9
+- Zero invariant violations across the entire multi-hour run (TF-INV-001
+  through TF-INV-019 — see [invariants.md](invariants.md) for the current
+  allocation), checked continuously by the existing `internal/chaos`
+  invariant checker exactly as Phase 9
   already does at shorter duration.
 - Zero invariant violations across the multi-process SIGKILL/restart/
   reclaim campaign specifically — this is a distinct proof obligation from

@@ -684,6 +684,7 @@ no existing test's assertions weakened.
 | **State-machine table tests** | Enumerate every `(from_state, to_state)` pair and assert the transition function accepts exactly the allowed set and rejects every other pair, including all combinations involving terminal states. | Table-driven test iterating all 6×6 state pairs. |
 | **PostgreSQL integration tests** | Real Postgres (via a throwaway test database/container), exercising actual SQL from [worker-protocol.md](worker-protocol.md) against real transactions and constraints. | Claim query against a seeded `jobs` table, assert `RETURNING` row shape and side effects. |
 | **Concurrency tests** | Multiple real goroutines/processes racing against the same rows, asserting exclusivity properties. | N workers claiming from a pool of M jobs; assert each job claimed exactly once. |
+| **Principal-scoping tests** | Durable, zero-row-mutation proofs that an ownership/tenant predicate is enforced in the SQL statement itself, not a handler-level filter applied after an unscoped read. | Principal B's cancel against principal A's job affects zero rows and reads back byte-identical to a nonexistent-ID response. |
 | **Property-based tests** | Randomized inputs (attempt counts, max_attempts, failure sequences) checked against invariants rather than fixed examples. | For random `max_attempts` and random failure/success sequences, assert `attempt_count` never exceeds `max_attempts` before a terminal state. |
 | **Fuzz tests** | Randomized malformed/edge-case inputs at the API boundary (payload shapes, header values) to find panics/crashes, not correctness-of-business-logic. | Fuzzing `POST /jobs` payload parsing. |
 | **Fault-injection tests** | Deliberately induced failures (killed connections, forced rollbacks, injected errors mid-transaction) to verify TF-INV-013 and related atomicity properties. | Kill the DB connection mid-transaction and assert the row is unchanged afterward. |
@@ -720,10 +721,16 @@ scenario from [scenario-corpus.md](scenario-corpus.md).
 | TF-INV-014 | Stale-worker fencing tests (multi-generation) | SF-008 |
 | TF-INV-015 | Fencing tests (heartbeat-specific) | SF-016, SF-017 |
 | TF-INV-016 | Schema tests + idempotency tests; transactional-idempotency tests | SF-005, SF-034 |
+| TF-INV-017 | Principal-scoping tests (store-layer zero-row-mutation proofs; HTTP cross-principal indistinguishability tests) | Phase 12 verification points 6-8 ([phase-12-plan.md](phase-12-plan.md) §11); no `scenario-corpus.md` SF number assigned — see [invariants.md](invariants.md) for exact test names |
+| TF-INV-018 | Idempotency tests (tenant-scoped); transactional-idempotency tests | Phase 12 verification point 2 ([phase-12-plan.md](phase-12-plan.md) §11); no `scenario-corpus.md` SF number assigned — see [invariants.md](invariants.md) for exact test names |
+| TF-INV-019 | Concurrency tests (Phase-5-style two-queue stress harness; mechanism TBD by Phase 13 OD-1's ADR) | Not yet implemented — Phase 13 has not been built; see [phase-13-plan.md](phase-13-plan.md) §10 |
 
 Every row in this table must remain populated as the project moves into
 implementation; a code change that would leave any invariant without a
 passing test is a regression regardless of what other tests pass.
+TF-INV-019's row is the one documented exception until Phase 13 lands: it
+exists to give the property a stable ID ahead of implementation, per
+[invariants.md](invariants.md)'s Cross-Phase Governance Additions section.
 
 ## What "Proving an Invariant" Means Here
 

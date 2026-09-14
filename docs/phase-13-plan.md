@@ -26,6 +26,16 @@ commitment this plan did not create and cannot unilaterally waive or
 resolve (OD-3). Nothing here allocates or renumbers an invariant ID beyond
 what the roadmap already, explicitly, tentatively names.
 
+> **Post-planning update**: the cross-phase governance pass OD-3 named as a
+> blocker has since landed in [invariants.md](invariants.md). This phase's
+> fairness property is confirmed as **`TF-INV-019`**, not `TF-INV-017` as
+> tentatively named below and in `enterprise-roadmap.md` — `017`/`018` were
+> allocated to Phase 12's already-merged G2 (principal isolation) and G7
+> (tenant-scoped idempotency) instead. The property's wording and its
+> algorithm-independence are unchanged; only the ID moved. This update does
+> not otherwise alter this plan's content, so the "tentative"/"TF-INV-017"
+> language below is left as originally written except where noted.
+
 **A note on sourcing, added by this correction pass**: this plan draws on
 three distinct kinds of requirement and does not treat them as
 interchangeable. (1) **Roadmap-defined requirements** — stated directly in
@@ -112,7 +122,7 @@ Two secondary prerequisites, both already satisfied:
 | Tenant-starvation P0 finding, `max_attempts` shared-resource-contention deferral | [security-model.md](security-model.md) §1 |
 | Rate limiting explicitly deferred from Phase 12 by name | [phase-12-plan.md](phase-12-plan.md) §3; [observability.md](observability.md) `taskforge_auth_failures_total` note |
 | `principal_id` schema, tenant-scoped idempotency mechanics | [data-model.md](data-model.md) "Table: `jobs`", "Idempotency constraint change (G7)" in [phase-12-plan.md](phase-12-plan.md) |
-| TF-INV-001 through TF-INV-016, and the tentative reservation of TF-INV-017 | [invariants.md](invariants.md) (current registry, ends at 016); [enterprise-roadmap.md](enterprise-roadmap.md) Phase 13 section (three "tentative" citations) |
+| TF-INV-001 through TF-INV-019 (fairness property confirmed as TF-INV-019, not the roadmap's original tentative TF-INV-017 — see post-planning update above) | [invariants.md](invariants.md) (current registry, now through 019 via the cross-phase governance pass); [enterprise-roadmap.md](enterprise-roadmap.md) Phase 13 section (citations updated to match) |
 | Invariant-ID allocation must be a cross-phase governance PR, not decided unilaterally | [phase-12-plan.md](phase-12-plan.md) OD-8 |
 | Expand/migrate/contract migration model, lock-safety discipline for `jobs`/`job_attempts` | [compatibility-policy.md](compatibility-policy.md) "PROPOSED: Database Migrations"; [data-model.md](data-model.md) "Phase 12 migration lock profile" (the precedent this phase's migrations must match) |
 | Claim query shape or the "candidate" CTE + `FOR UPDATE SKIP LOCKED` idiom | `internal/store/claim.go` (`claimQuery`); [worker-protocol.md](worker-protocol.md) |
@@ -651,8 +661,10 @@ pattern):**
 
 ## 10. Invariant / proof obligations
 
-**New invariant (tentative ID; see §18 OD-3 for why the ID itself is not
-finalized in this plan):** the roadmap tentatively names **TF-INV-017**:
+**New invariant (ID confirmed by the post-planning cross-phase governance
+pass — see the note at the top of this document and §18 OD-3):**
+**TF-INV-019** (the roadmap originally, tentatively, named this
+TF-INV-017; that number went to Phase 12's G2 instead):
 *"no queue/tenant with pending, capacity-eligible work is starved beyond
 the documented bound while another queue/tenant is making progress"* — the
 bound is whatever §6a's ADR proves for its selected algorithm, under stated
@@ -1060,7 +1072,7 @@ opportunistically during implementation.
 |---|---|---|---|
 | **OD-1** *(blocker)* | Concurrency-limit enforcement mechanism + fairness algorithm | **Blocked on a mandatory ADR** ([enterprise-roadmap.md](enterprise-roadmap.md) explicit requirement) | Not decided here by design. §6a lays out three concurrency-mechanism candidates and two fairness candidates for that ADR to evaluate after a concurrency/performance analysis this plan does not itself perform. |
 | **OD-2** | Per-principal (not just per-queue) concurrency/rate limits | Open | Roadmap hedges with "where supported." Schema (§7) supports both from day one (`queue_limits` keyed by `(queue_name, principal_id)`); whether principal-scoped enforcement ships in the same implementation PR or a fast-follow is the ADR's/implementer's call, not fixed here. |
-| **OD-3** *(blocker)* | Formal `TF-INV-0NN` allocation for Phase 13's fairness property (and Phase 12's still-unallocated G1–G8) | **Blocked on the cross-phase documentation-governance PR** [phase-12-plan.md](phase-12-plan.md) OD-8 already named as a prerequisite "before either phase's implementation PR" | Not resolved here — this plan does not allocate or renumber `docs/invariants.md`, per this planning task's own explicit constraint. The roadmap's tentative "TF-INV-017" naming is used descriptively (§10) but is not treated as final. **This governance PR has evidently not yet happened** (confirmed: `invariants.md` still ends at TF-INV-016) and must land before Phase 13's implementation PR is opened. |
+| **OD-3** *(blocker, now resolved)* | Formal `TF-INV-0NN` allocation for Phase 13's fairness property (and Phase 12's still-unallocated G1–G8) | **Resolved** — the cross-phase governance pass landed in [invariants.md](invariants.md) "Cross-Phase Governance Additions": Phase 12's G2 → `TF-INV-017`, G7 → `TF-INV-018`; G1/G3/G4/G5/G6/G8 remain symbolic guarantees proven by verification points, not invariants; Phase 13's fairness property is confirmed as `TF-INV-019` (not the roadmap's tentative `TF-INV-017`, since `017`/`018` went to Phase 12 instead). | This blocker is cleared. The property's wording is unchanged from §10 below; only its ID moved from tentative `TF-INV-017` to confirmed `TF-INV-019`. The concurrency/fairness *algorithm* itself (OD-1) remains open — this governance pass deliberately did not decide it. |
 | **OD-4** | Default worker queue-subscription semantics | Recommended, not yet approved | §14: unset `TASKFORGE_WORKER_QUEUES` means "claim everything," for compatibility. Recommended with a firm rationale; still listed as open pending explicit sign-off since it is a behavioral default future operators will rely on. **Extended by this correction pass**: this same subscription filter governs reclaim of an expired lease identically to a fresh claim, not a looser rule (§6b) — one behavioral default, one sign-off, not two. |
 | **OD-5** | Retention sweeper's process shape | Open | Candidates: (a) a ticker inside `cmd/worker` (fewest binaries, but couples maintenance load to the claim-serving process); (b) a standalone `cmd/taskforge-retention` binary, operator/cron-invoked (cleanest isolation, one more binary to deploy/document); (c) a ticker inside `cmd/api`. No recommendation is fixed here; (b) is favored for isolating maintenance-window scheduling (§15) from request/claim serving, but this trades off operational simplicity the ADR/implementer should weigh. |
 | **OD-6** | `503` system-capacity admission mechanism | Recommended, not yet approved | §8: an in-process bounded semaphore (`TASKFORGE_MAX_INFLIGHT_SUBMISSIONS`) in `cmd/api`. Default threshold value intentionally not fixed (mirrors `ActiveWorkerWindow`'s precedent of leaving a numeric default to implementation-time judgment). |
@@ -1149,9 +1161,13 @@ restated with different wording, to avoid the two-copies drift risk Phase
 the roadmap's own checklist does not spell out as separate line items but
 that block the checklist above from being honestly checkable:**
 
-- [ ] The invariant-ID governance PR (§18 OD-3) has landed, so this
+- [x] The invariant-ID governance PR (§18 OD-3) has landed, so this
       phase's fairness property has a confirmed, non-tentative ID before
-      its own exit criteria are declared met.
+      its own exit criteria are declared met. **Done**: confirmed as
+      `TF-INV-019` in [invariants.md](invariants.md) — see the
+      post-planning update at the top of this document. This does not by
+      itself satisfy any other exit-criteria checkbox on this list; it
+      only clears the ID-allocation precondition.
 - [ ] The TF-INV-005/retention interaction proof (§10, SF-045) passes,
       confirming retention does not silently weaken an existing, numbered
       invariant's durable detection mechanism.
