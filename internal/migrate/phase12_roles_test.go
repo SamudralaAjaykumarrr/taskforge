@@ -18,8 +18,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +32,7 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
+	"github.com/SamudralaAjaykumarrr/taskforge/migrations"
 )
 
 // applyRoleScript runs deploy/postgres-roles.sql against the test database
@@ -188,6 +193,60 @@ func TestPostgresRoleScript_IsIdempotent(t *testing.T) {
 	require.False(t, hasPrivilege(t, db, "taskforge_worker", "api_keys", "SELECT"))
 }
 
+// createTableRE extracts the table name from a migration's CREATE TABLE
+// statement, tolerating the "IF NOT EXISTS" every migrations/*.up.sql file
+// uses (see the grep in migrationDefinedTables's comment).
+var createTableRE = regexp.MustCompile(`(?i)CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
+
+// migrationDefinedTables returns every table a migrations/*.up.sql file
+// creates, read from the embedded migration source itself -- NOT from the
+// live database's pg_tables catalog.
+//
+// That distinction matters: internal/testutil.DB may point at a database
+// shared with other packages' test binaries (TASKFORGE_TEST_DATABASE_URL,
+// which CI sets to one Postgres service container for the whole job; a
+// local run without it gets a fresh embedded-postgres instance per test
+// binary and never shares a database at all). Other packages create their
+// own throwaway tables directly against that shared "public" schema --
+// txenqueue/txenqueue_test.go's setupBusinessTable creates
+// txenqueue_test_business_rows to stand in for a caller's own business
+// table, and deliberately never drops it (see its doc comment). Enumerating
+// pg_tables would make this test's pass/fail depend on which other
+// packages' tests happened to run against the same physical database
+// first -- exactly the CI-only flake this test hit: passes locally (every
+// package gets its own throwaway database), fails in CI (one shared
+// database, so a fixture table created by an unrelated package leaks into
+// the scan and "is unreachable by both roles" because no role was ever
+// meant to reach it).
+//
+// The migrations are the actual definition of "the schema TaskForge has,"
+// so this reads that definition directly instead of asking a catalog that
+// can contain tables no migration ever created.
+func migrationDefinedTables(t *testing.T) []string {
+	t.Helper()
+	entries, err := fs.ReadDir(migrations.Files, ".")
+	require.NoError(t, err)
+
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".up.sql") {
+			continue
+		}
+		content, err := migrations.Files.ReadFile(e.Name())
+		require.NoError(t, err)
+		for _, m := range createTableRE.FindAllStringSubmatch(string(content), -1) {
+			seen[strings.ToLower(m[1])] = true
+		}
+	}
+
+	tables := make([]string, 0, len(seen))
+	for name := range seen {
+		tables = append(tables, name)
+	}
+	sort.Strings(tables)
+	return tables
+}
+
 // TestPostgresRoleScript_CoversEveryTableTheSchemaHas is the rot guard: if
 // a future migration adds a table and nobody updates the provisioning
 // script, at least one role will have no privilege on it at all and this
@@ -197,20 +256,7 @@ func TestPostgresRoleScript_CoversEveryTableTheSchemaHas(t *testing.T) {
 	db := testutil.DB(t)
 	applyRoleScript(t, db)
 
-	rows, err := db.Query(`
-		SELECT tablename FROM pg_tables
-		WHERE schemaname = 'public' AND tablename <> 'schema_migrations'
-		ORDER BY tablename`)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var name string
-		require.NoError(t, rows.Scan(&name))
-		tables = append(tables, name)
-	}
-	require.NoError(t, rows.Err())
+	tables := migrationDefinedTables(t)
 	require.NotEmpty(t, tables)
 
 	for _, table := range tables {
