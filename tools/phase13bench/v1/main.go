@@ -227,12 +227,12 @@ func collectEnvironment(ctx context.Context, db *sql.DB) Environment {
 	_ = db.QueryRowContext(ctx, `SHOW fsync`).Scan(&fsync)
 	_ = db.QueryRowContext(ctx, `SHOW synchronous_commit`).Scan(&syncCommit)
 	return Environment{
-		PostgresVersion:    version,
-		MaxConnections:     maxConn,
-		SharedBuffers:      sharedBuf,
-		Fsync:              fsync,
-		SynchronousCommit:  syncCommit,
-		Note:               "single-node WSL2 VM on consumer laptop hardware (Intel Core Ultra 7 258V, 8 vCPU, 15GiB RAM), ext4 on virtualized disk; see report Section C for full caveats",
+		PostgresVersion:   version,
+		MaxConnections:    maxConn,
+		SharedBuffers:     sharedBuf,
+		Fsync:             fsync,
+		SynchronousCommit: syncCommit,
+		Note:              "single-node WSL2 VM on consumer laptop hardware (Intel Core Ultra 7 258V, 8 vCPU, 15GiB RAM), ext4 on virtualized disk; see report Section C for full caveats",
 	}
 }
 
@@ -266,15 +266,15 @@ type Environment struct {
 }
 
 type ExactnessResult struct {
-	Candidate              CandidateID `json:"candidate"`
-	Limit                  int         `json:"limit"`
-	Workers                int         `json:"workers"`
-	DurationSec            float64     `json:"duration_sec"`
-	TotalClaims            int64       `json:"total_claims"`
-	MaxObservedRunning     int         `json:"max_observed_running"`
-	LimitViolations        int         `json:"limit_violations"`
-	SerializationFailures  int64       `json:"serialization_failures"`
-	SamplesTaken           int64       `json:"samples_taken"`
+	Candidate             CandidateID `json:"candidate"`
+	Limit                 int         `json:"limit"`
+	Workers               int         `json:"workers"`
+	DurationSec           float64     `json:"duration_sec"`
+	TotalClaims           int64       `json:"total_claims"`
+	MaxObservedRunning    int         `json:"max_observed_running"`
+	LimitViolations       int         `json:"limit_violations"`
+	SerializationFailures int64       `json:"serialization_failures"`
+	SamplesTaken          int64       `json:"samples_taken"`
 }
 
 type ThroughputResult struct {
@@ -292,12 +292,12 @@ type ThroughputResult struct {
 }
 
 type LockContentionResult struct {
-	Candidate       CandidateID `json:"candidate"`
-	Workers         int         `json:"workers"`
-	Samples         int         `json:"samples"`
-	AvgWaitingLocks float64     `json:"avg_waiting_locks"`
-	MaxWaitingLocks int         `json:"max_waiting_locks"`
-	AvgActiveConns  float64     `json:"avg_active_conns"`
+	Candidate       CandidateID    `json:"candidate"`
+	Workers         int            `json:"workers"`
+	Samples         int            `json:"samples"`
+	AvgWaitingLocks float64        `json:"avg_waiting_locks"`
+	MaxWaitingLocks int            `json:"max_waiting_locks"`
+	AvgActiveConns  float64        `json:"avg_active_conns"`
 	LockTypeCounts  map[string]int `json:"lock_type_wait_counts"`
 }
 
@@ -327,14 +327,14 @@ type CorrectnessCheck struct {
 }
 
 type Results struct {
-	Timestamp       string                  `json:"timestamp"`
-	Environment     Environment             `json:"environment"`
-	Exactness       []ExactnessResult       `json:"exactness"`
-	Throughput      []ThroughputResult      `json:"throughput"`
-	LockContention  []LockContentionResult  `json:"lock_contention"`
-	Fairness        []FairnessResult        `json:"fairness"`
-	Isolation       []IsolationResult       `json:"isolation"`
-	Correctness     []CorrectnessCheck      `json:"correctness"`
+	Timestamp      string                 `json:"timestamp"`
+	Environment    Environment            `json:"environment"`
+	Exactness      []ExactnessResult      `json:"exactness"`
+	Throughput     []ThroughputResult     `json:"throughput"`
+	LockContention []LockContentionResult `json:"lock_contention"`
+	Fairness       []FairnessResult       `json:"fairness"`
+	Isolation      []IsolationResult      `json:"isolation"`
+	Correctness    []CorrectnessCheck     `json:"correctness"`
 }
 
 // ---------------------------------------------------------------------
