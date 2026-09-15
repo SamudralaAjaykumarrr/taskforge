@@ -36,6 +36,22 @@ what the roadmap already, explicitly, tentatively names.
 > not otherwise alter this plan's content, so the "tentative"/"TF-INV-017"
 > language below is left as originally written except where noted.
 
+> **Post-ADR update**: the other hard blocker, OD-1 (the concurrency/
+> fairness ADR), is also resolved: **[ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md)**
+> selects slot-table concurrency limiting + `last_claimed_at` fairness,
+> defines TF-INV-019's concrete bound as E − 1 service opportunities (not
+> a wall-clock SLA), and decides the reclaim/slot-ownership question
+> (§6a/§7 below) that this plan itself left open. The ADR was authored
+> against a three-pass concurrency/performance evidence package
+> ([phase-13-concurrency-evidence-v2.md](phase-13-concurrency-evidence-v2.md),
+> [phase-13-concurrency-evidence-v3.md](phase-13-concurrency-evidence-v3.md))
+> satisfying the roadmap's own "only after a concurrency and performance
+> analysis" precondition. As of this update the ADR file exists in the
+> working tree but has **not yet been committed**; §20's exit criterion
+> ("exists, committed before implementation") is not yet checked off for
+> that reason — see §18 OD-1 below. This update does not otherwise alter
+> this plan's content.
+
 **A note on sourcing, added by this correction pass**: this plan draws on
 three distinct kinds of requirement and does not treat them as
 interchangeable. (1) **Roadmap-defined requirements** — stated directly in
@@ -1006,6 +1022,24 @@ corpus has grown to by then:
 All new tests run against real PostgreSQL, per this project's unbroken
 existing discipline (no mocked-database shortcut).
 
+> **Post-ADR reconciliation**: [ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md)
+> continues this table's numbering from its `SF-050` ceiling — `SF-051`
+> through `SF-059` are defined there, not duplicated here, to avoid the
+> two-copies drift risk this document avoids elsewhere (§20's own stated
+> reasoning). `SF-038` above (this plan's own generic, pre-ADR
+> "concurrency-limit exactness under concurrent claim attempts"
+> placeholder) is refined, not duplicated or superseded in substance, by
+> the ADR's mechanism-specific `SF-051`; the ADR additionally requires
+> `SF-052`/`SF-053` (reclaim never writes the slot table; per-row
+> slot/job consistency) and, added during the ADR's own drafting after a
+> gap was found by direct inspection of the evidence pass's own benchmark
+> database, `SF-058`/`SF-059` (the Lazy Dead-Letter Sweep's terminal
+> transition releases its job's slot durably and idempotently, including
+> the attempt-budget-exhaustion case specifically; and a fault-injection
+> proof that terminal transition and slot release cannot leave stranded
+> capacity after a crash) — see the ADR's "Required implementation proof
+> obligations" for the authoritative text of all of these.
+
 ## 17. Files / packages expected to change
 
 - **New**: `internal/governance/` (or similarly named package) —
@@ -1034,8 +1068,13 @@ existing discipline (no mocked-database shortcut).
   stakes).
 - **`internal/store/complete.go`, `cancellation.go`, and the Lazy
   Dead-Letter Sweep in `claim.go`**: each terminalization call site gains a
-  slot-release step, **only if** §6a's ADR selects the slot-table
-  mechanism (§7's conditional note) — otherwise unaffected.
+  slot-release step — no longer conditional (§7's original "only if
+  §6a's ADR selects the slot-table mechanism" note is resolved: it did —
+  see [ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md)). The
+  Lazy Dead-Letter Sweep's own release specifically must be durable and
+  idempotent (SF-058) — the ADR's own drafting found this exact call site
+  untested by every prior evidence pass, not merely one of an
+  interchangeable list.
 - **`internal/api/handlers.go`, `workflow_handlers.go`**: accept/attach
   `queue_name` on submission; new admission/rate-limit check ahead of the
   existing insert path (§6, §9).
@@ -1070,7 +1109,7 @@ opportunistically during implementation.
 
 | ID | Topic | Status | This plan's position |
 |---|---|---|---|
-| **OD-1** *(blocker)* | Concurrency-limit enforcement mechanism + fairness algorithm | **Blocked on a mandatory ADR** ([enterprise-roadmap.md](enterprise-roadmap.md) explicit requirement) | Not decided here by design. §6a lays out three concurrency-mechanism candidates and two fairness candidates for that ADR to evaluate after a concurrency/performance analysis this plan does not itself perform. |
+| **OD-1** *(blocker, now resolved)* | Concurrency-limit enforcement mechanism + fairness algorithm | **Resolved** — [ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md), drafted against a three-pass concurrency/performance evidence package (not yet committed; see the post-ADR update above) | §6a's three concurrency-mechanism candidates and two fairness candidates were evaluated exactly as scoped here, not extended: ADR-0009 selects the slot-table semaphore (candidate 2) and `last_claimed_at` ascending ordering (candidate B), rejecting advisory lock, `SERIALIZABLE`+retry, and round-robin with specific, measured failure modes for each. TF-INV-019's bound is defined as E − 1 service opportunities (a parametric, hardware-independent form), and the reclaim/slot-ownership question this plan's own §6a/§7 left implicit is now decided explicitly (a reclaim retains its original slot; never re-acquires). |
 | **OD-2** | Per-principal (not just per-queue) concurrency/rate limits | Open | Roadmap hedges with "where supported." Schema (§7) supports both from day one (`queue_limits` keyed by `(queue_name, principal_id)`); whether principal-scoped enforcement ships in the same implementation PR or a fast-follow is the ADR's/implementer's call, not fixed here. |
 | **OD-3** *(blocker, now resolved)* | Formal `TF-INV-0NN` allocation for Phase 13's fairness property (and Phase 12's still-unallocated G1–G8) | **Resolved** — the cross-phase governance pass landed in [invariants.md](invariants.md) "Cross-Phase Governance Additions": Phase 12's G2 → `TF-INV-017`, G7 → `TF-INV-018`; G1/G3/G4/G5/G6/G8 remain symbolic guarantees proven by verification points, not invariants; Phase 13's fairness property is confirmed as `TF-INV-019` (not the roadmap's tentative `TF-INV-017`, since `017`/`018` went to Phase 12 instead). | This blocker is cleared. The property's wording is unchanged from §10 below; only its ID moved from tentative `TF-INV-017` to confirmed `TF-INV-019`. The concurrency/fairness *algorithm* itself (OD-1) remains open — this governance pass deliberately did not decide it. |
 | **OD-4** | Default worker queue-subscription semantics | Recommended, not yet approved | §14: unset `TASKFORGE_WORKER_QUEUES` means "claim everything," for compatibility. Recommended with a firm rationale; still listed as open pending explicit sign-off since it is a behavioral default future operators will rely on. **Extended by this correction pass**: this same subscription filter governs reclaim of an expired lease identically to a fresh claim, not a looser rule (§6b) — one behavioral default, one sign-off, not two. |
@@ -1142,7 +1181,12 @@ restated with different wording, to avoid the two-copies drift risk Phase
 
 - [ ] An ADR selecting the Phase 13 fairness/scheduling algorithm exists,
       committed before implementation, stating the concurrency/performance
-      analysis behind the choice. **(§18 OD-1 — hard blocker.)**
+      analysis behind the choice. **(§18 OD-1 — hard blocker.)** **Drafted**:
+      [ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md) exists in
+      the working tree and states the required analysis (three evidence
+      passes, see the post-ADR update above). Left unchecked because this
+      criterion's own text requires the ADR be **committed**, which it is
+      not yet — do not mark this done on the strength of the draft alone.
 - [ ] A named-queue or per-job-type/tenant concurrency-limit mechanism
       exists with a passing test demonstrating one queue/tenant cannot
       starve another beyond the documented bound (a bounded, not

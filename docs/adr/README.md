@@ -17,6 +17,7 @@ consequences (including negative ones) accepted as a result.
 | [0006](0006-database-backed-queue-first.md) | Database-backed queue before any message broker | Accepted |
 | [0007](0007-monotonic-attempt-history.md) | Monotonic, append-only attempt history | Accepted |
 | [0008](0008-explicit-terminal-states.md) | Explicit, minimal terminal states | Accepted |
+| [0009](0009-phase-13-concurrency-and-fairness.md) | Phase 13 concurrency limiting and fairness (OD-1) | Accepted |
 
 ## Conventions
 
