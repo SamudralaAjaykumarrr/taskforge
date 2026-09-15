@@ -1,0 +1,389 @@
+{
+  "timestamp": "2026-09-15T16:59:51Z",
+  "environment": {
+    "postgres_version": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+    "max_connections": "100",
+    "shared_buffers": "128MB",
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "note": "single-node WSL2 VM on consumer laptop hardware (Intel Core Ultra 7 258V, 8 vCPU, 15GiB RAM), ext4 on virtualized disk; see report Section C for full caveats"
+  },
+  "exactness": [
+    {
+      "candidate": "advisory_lock",
+      "limit": 5,
+      "workers": 30,
+      "duration_sec": 5,
+      "total_claims": 1018,
+      "max_observed_running": 5,
+      "limit_violations": 0,
+      "serialization_failures": 0,
+      "samples_taken": 4873
+    },
+    {
+      "candidate": "slot_table",
+      "limit": 5,
+      "workers": 30,
+      "duration_sec": 5,
+      "total_claims": 912,
+      "max_observed_running": 5,
+      "limit_violations": 0,
+      "serialization_failures": 0,
+      "samples_taken": 4672
+    },
+    {
+      "candidate": "serializable",
+      "limit": 5,
+      "workers": 30,
+      "duration_sec": 5,
+      "total_claims": 879,
+      "max_observed_running": 5,
+      "limit_violations": 0,
+      "serialization_failures": 8421,
+      "samples_taken": 4519
+    }
+  ],
+  "throughput": [
+    {
+      "candidate": "advisory_lock",
+      "workers": 1,
+      "duration_sec": 4,
+      "total_claims": 406,
+      "claims_per_sec": 101.5,
+      "p50_ms": 2.41,
+      "p95_ms": 3.784,
+      "p99_ms": 4.321,
+      "max_ms": 22.249,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "advisory_lock",
+      "workers": 5,
+      "duration_sec": 4,
+      "total_claims": 2222,
+      "claims_per_sec": 555.5,
+      "p50_ms": 2.266,
+      "p95_ms": 4.12,
+      "p99_ms": 6.461,
+      "max_ms": 30.822,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "advisory_lock",
+      "workers": 10,
+      "duration_sec": 4,
+      "total_claims": 2262,
+      "claims_per_sec": 565.5,
+      "p50_ms": 10.77,
+      "p95_ms": 14.216,
+      "p99_ms": 22.601,
+      "max_ms": 52.317,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "advisory_lock",
+      "workers": 25,
+      "duration_sec": 4,
+      "total_claims": 2218,
+      "claims_per_sec": 554.5,
+      "p50_ms": 37.32,
+      "p95_ms": 44.998,
+      "p99_ms": 77.545,
+      "max_ms": 100.309,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "advisory_lock",
+      "workers": 50,
+      "duration_sec": 4,
+      "total_claims": 1981,
+      "claims_per_sec": 495.25,
+      "p50_ms": 89.297,
+      "p95_ms": 131.012,
+      "p99_ms": 165.795,
+      "max_ms": 218.855,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "advisory_lock",
+      "workers": 80,
+      "duration_sec": 4,
+      "total_claims": 2003,
+      "claims_per_sec": 500.75,
+      "p50_ms": 142.754,
+      "p95_ms": 223.696,
+      "p99_ms": 302.268,
+      "max_ms": 392.047,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 1,
+      "duration_sec": 4,
+      "total_claims": 387,
+      "claims_per_sec": 96.75,
+      "p50_ms": 2.258,
+      "p95_ms": 3.289,
+      "p99_ms": 3.83,
+      "max_ms": 8.375,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 5,
+      "duration_sec": 4,
+      "total_claims": 2136,
+      "claims_per_sec": 534,
+      "p50_ms": 1.861,
+      "p95_ms": 2.627,
+      "p99_ms": 3.251,
+      "max_ms": 7.965,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 10,
+      "duration_sec": 4,
+      "total_claims": 4299,
+      "claims_per_sec": 1074.75,
+      "p50_ms": 1.989,
+      "p95_ms": 2.846,
+      "p99_ms": 3.576,
+      "max_ms": 10.744,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 25,
+      "duration_sec": 4,
+      "total_claims": 7080,
+      "claims_per_sec": 1770,
+      "p50_ms": 2.908,
+      "p95_ms": 5.258,
+      "p99_ms": 6.601,
+      "max_ms": 24.227,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 50,
+      "duration_sec": 4,
+      "total_claims": 4364,
+      "claims_per_sec": 1091,
+      "p50_ms": 6.056,
+      "p95_ms": 11.137,
+      "p99_ms": 17.069,
+      "max_ms": 66.185,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 80,
+      "duration_sec": 4,
+      "total_claims": 2791,
+      "claims_per_sec": 697.75,
+      "p50_ms": 8.705,
+      "p95_ms": 22.025,
+      "p99_ms": 33.997,
+      "max_ms": 106.752,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "serializable",
+      "workers": 1,
+      "duration_sec": 4,
+      "total_claims": 361,
+      "claims_per_sec": 90.25,
+      "p50_ms": 3.116,
+      "p95_ms": 4.703,
+      "p99_ms": 5.492,
+      "max_ms": 29.647,
+      "serialization_failures": 0,
+      "ser_fail_rate_pct": 0
+    },
+    {
+      "candidate": "serializable",
+      "workers": 5,
+      "duration_sec": 4,
+      "total_claims": 1710,
+      "claims_per_sec": 427.5,
+      "p50_ms": 4.354,
+      "p95_ms": 11.154,
+      "p99_ms": 16.505,
+      "max_ms": 52.546,
+      "serialization_failures": 1514,
+      "ser_fail_rate_pct": 46.960297766749385
+    },
+    {
+      "candidate": "serializable",
+      "workers": 10,
+      "duration_sec": 4,
+      "total_claims": 1447,
+      "claims_per_sec": 361.75,
+      "p50_ms": 8.855,
+      "p95_ms": 20.74,
+      "p99_ms": 26.556,
+      "max_ms": 61.272,
+      "serialization_failures": 1890,
+      "ser_fail_rate_pct": 56.63769853161522
+    },
+    {
+      "candidate": "serializable",
+      "workers": 25,
+      "duration_sec": 4,
+      "total_claims": 923,
+      "claims_per_sec": 230.75,
+      "p50_ms": 20.104,
+      "p95_ms": 49.187,
+      "p99_ms": 62.096,
+      "max_ms": 108.107,
+      "serialization_failures": 2268,
+      "ser_fail_rate_pct": 71.07489815104982
+    },
+    {
+      "candidate": "serializable",
+      "workers": 50,
+      "duration_sec": 4,
+      "total_claims": 737,
+      "claims_per_sec": 184.25,
+      "p50_ms": 33.221,
+      "p95_ms": 83.196,
+      "p99_ms": 111.224,
+      "max_ms": 147.288,
+      "serialization_failures": 2710,
+      "ser_fail_rate_pct": 78.6190890629533
+    },
+    {
+      "candidate": "serializable",
+      "workers": 80,
+      "duration_sec": 4,
+      "total_claims": 538,
+      "claims_per_sec": 134.5,
+      "p50_ms": 54.026,
+      "p95_ms": 150.266,
+      "p99_ms": 215.255,
+      "max_ms": 229.664,
+      "serialization_failures": 2472,
+      "ser_fail_rate_pct": 82.12624584717608
+    }
+  ],
+  "lock_contention": [
+    {
+      "candidate": "advisory_lock",
+      "workers": 40,
+      "samples": 80,
+      "avg_waiting_locks": 35.4125,
+      "max_waiting_locks": 38,
+      "avg_active_conns": 37.7125,
+      "lock_type_wait_counts": {
+        "advisory": 2833
+      }
+    },
+    {
+      "candidate": "slot_table",
+      "workers": 40,
+      "samples": 79,
+      "avg_waiting_locks": 0.10126582278481013,
+      "max_waiting_locks": 2,
+      "avg_active_conns": 25.126582278481013,
+      "lock_type_wait_counts": {
+        "transactionid": 8
+      }
+    },
+    {
+      "candidate": "serializable",
+      "workers": 40,
+      "samples": 80,
+      "avg_waiting_locks": 12.3625,
+      "max_waiting_locks": 35,
+      "avg_active_conns": 19.2125,
+      "lock_type_wait_counts": {
+        "transactionid": 51,
+        "tuple": 938
+      }
+    }
+  ],
+  "fairness": [
+    {
+      "fairness": "baseline_global_order",
+      "duration_sec": 6,
+      "flood_claimed": 5749,
+      "trickle_claimed": 9,
+      "trickle_total": 20,
+      "flood_share_pct": 99.84369572768323,
+      "p50_wait_ms": 1152.9396510000001,
+      "p95_wait_ms": 2456.278167,
+      "max_wait_ms": 2456.278167
+    },
+    {
+      "fairness": "round_robin_group_key",
+      "duration_sec": 6,
+      "flood_claimed": 5357,
+      "trickle_claimed": 19,
+      "trickle_total": 19,
+      "flood_share_pct": 99.64657738095238,
+      "p50_wait_ms": 9.859976,
+      "p95_wait_ms": 21.015167,
+      "max_wait_ms": 21.015167
+    },
+    {
+      "fairness": "last_claimed_at_ascending",
+      "duration_sec": 6,
+      "flood_claimed": 1132,
+      "trickle_claimed": 19,
+      "trickle_total": 20,
+      "flood_share_pct": 98.34926151172894,
+      "p50_wait_ms": 23.873504999999998,
+      "p95_wait_ms": 61.858129999999996,
+      "max_wait_ms": 61.858129999999996
+    }
+  ],
+  "isolation": [
+    {
+      "candidate": "advisory_lock",
+      "low_volume_alone_throughput": 522.6666666666666,
+      "low_volume_under_flood_throughput": 425.6666666666667,
+      "degradation_pct": 18.558673469387745
+    },
+    {
+      "candidate": "slot_table",
+      "low_volume_alone_throughput": 458.3333333333333,
+      "low_volume_under_flood_throughput": 396.6666666666667,
+      "degradation_pct": 13.454545454545446
+    }
+  ],
+  "correctness": [
+    {
+      "name": "subscription_boundary_no_cross_queue_claim",
+      "pass": true,
+      "detail": "worker subscribed to {qa} correctly found nothing claimable while only qb had eligible work"
+    },
+    {
+      "name": "unset_subscription_claims_any_queue",
+      "pass": true,
+      "detail": "worker with all-queues subscription claimed qb's job as expected"
+    },
+    {
+      "name": "reclaim_respects_subscription_boundary",
+      "pass": true,
+      "detail": "worker subscribed to {qa} correctly could not reclaim qb's expired lease"
+    },
+    {
+      "name": "reclaim_succeeds_for_subscribed_worker",
+      "pass": true,
+      "detail": "worker subscribed to {qa,qb} correctly reclaimed qb's expired lease (TF-INV-004 liveness preserved)"
+    }
+  ]
+}
