@@ -54,6 +54,12 @@ func (s *Store) CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner st
 		return nil, err
 	}
 
+	// Phase 13 (ADR-0009): this job stops being RUNNING here, so it must
+	// not still hold a capacity slot -- SF-053's per-row invariant.
+	if err := releaseSlot(ctx, tx, id); err != nil {
+		return nil, fmt.Errorf("store: complete success: release slot: %w", err)
+	}
+
 	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeSucceeded, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("store: complete success: record attempt outcome: %w", err)
@@ -116,6 +122,12 @@ func (s *Store) CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner st
 			s.metrics.StaleCompletionRejectionsTotal.Inc()
 		}
 		return nil, err
+	}
+
+	// Phase 13 (ADR-0009): this job stops being RUNNING here, so it must
+	// not still hold a capacity slot -- SF-053's per-row invariant.
+	if err := releaseSlot(ctx, tx, id); err != nil {
+		return nil, fmt.Errorf("store: complete failure: release slot: %w", err)
 	}
 
 	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeFailedPermanent, errClass, errMessage)

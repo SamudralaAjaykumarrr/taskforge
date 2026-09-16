@@ -72,6 +72,14 @@ func TestNew_RegistersExactlyTheDocumentedMetrics(t *testing.T) {
 		"taskforge_retry_count":                       true,
 		"taskforge_heartbeats_total":                  true,
 		"taskforge_idempotent_submission_hits_total":  true,
+		// Phase 13: unlabeled Counter/Histogram collectors always report a
+		// (zero-valued) series once registered, unlike a *Vec type with
+		// no observations yet (taskforge_auth_failures_total,
+		// taskforge_admission_rejections_total, and
+		// taskforge_retention_rows_deleted_total are all *CounterVec and
+		// therefore correctly absent here too, by that same rule).
+		"taskforge_retention_sweep_duration_seconds": true,
+		"taskforge_retention_sweep_errors_total":     true,
 	}
 	got := make(map[string]bool, len(families))
 	for _, fam := range families {

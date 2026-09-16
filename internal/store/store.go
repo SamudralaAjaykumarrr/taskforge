@@ -83,7 +83,7 @@ const jobColumns = `
 	jobs.scheduled_at, jobs.lease_owner, jobs.lease_generation, jobs.lease_expires_at, jobs.heartbeat_at,
 	jobs.attempt_count, jobs.max_attempts, jobs.execution_timeout_seconds, jobs.cancel_requested,
 	jobs.cancel_requested_at, jobs.idempotency_key, jobs.last_error, jobs.last_error_class,
-	jobs.result_metadata, jobs.terminal_at, jobs.version`
+	jobs.result_metadata, jobs.terminal_at, jobs.version, jobs.queue_name`
 
 // principalScopeClause is Phase 12's ownership predicate
 // (docs/phase-12-plan.md §4a), rendered for the two positional parameters
@@ -172,7 +172,7 @@ func (f *jobScanFields) dest() []any {
 		&f.scheduledAt, &f.leaseOwner, &f.j.LeaseGeneration, &f.leaseExpiresAt, &f.heartbeatAt,
 		&f.j.AttemptCount, &f.j.MaxAttempts, &f.j.ExecutionTimeoutSeconds, &f.j.CancelRequested,
 		&f.cancelReqAt, &f.idempotencyKey, &f.lastError, &f.lastErrorClass,
-		&f.resultMetadata, &f.terminalAt, &f.j.Version,
+		&f.resultMetadata, &f.terminalAt, &f.j.Version, &f.j.QueueName,
 	}
 }
 

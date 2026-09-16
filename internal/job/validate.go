@@ -38,6 +38,18 @@ const (
 	// here unchanged. See docs/idempotency.md "Implementation Notes."
 	MaxIdempotencyKeyLength = 255
 
+	// DefaultQueueName is the queue every pre-Phase-13 row carries
+	// (migration 0011's column default) and every submission that omits
+	// queue_name is assigned, per docs/phase-13-plan.md §14's
+	// compatibility requirement.
+	DefaultQueueName = "default"
+
+	// MaxQueueNameLength bounds queue_name. Not a documented schema
+	// constraint (OD-8: free-form TEXT, no registry table, mirroring the
+	// job_type precedent exactly) -- an application-layer choice matching
+	// MaxJobTypeLength.
+	MaxQueueNameLength = 255
+
 	// MaxRepresentableMaxAttempts is the largest caller-supplied
 	// max_attempts value that PostgreSQL's jobs.max_attempts column
 	// (INTEGER, i.e. a 32-bit signed integer -- migrations/0001_create_jobs_table.up.sql)
@@ -131,7 +143,42 @@ func ValidateSubmission(jobType string, payload json.RawMessage, maxAttempts, ex
 		MaxAttempts:             ma,
 		ExecutionTimeoutSeconds: et,
 		IdempotencyKey:          key,
+		// Defaulted here (not left empty) so every caller of
+		// ValidateSubmission gets a NewParams that is already safe to
+		// INSERT even if it never separately calls ValidateQueueName --
+		// callers that do supply a request-level queue_name overwrite
+		// this afterward, exactly as they already do for ScheduledAt.
+		QueueName: DefaultQueueName,
 	}, nil
+}
+
+// ValidateQueueName normalizes and bounds-checks an optional,
+// already-extracted queue_name value (docs/phase-13-plan.md §8: "POST
+// /jobs, POST /workflows: new optional request field queue_name ...
+// omitted/empty -> 'default'"). nil, or a value that is empty or
+// all-whitespace after trimming, defaults to DefaultQueueName -- unlike
+// ValidateIdempotencyKey, "not supplied" here is never represented as a Go
+// nil/empty value flowing further, because jobs.queue_name is NOT NULL and
+// every INSERT this package drives supplies an explicit value rather than
+// relying on the schema's own column default.
+//
+// Called separately from ValidateSubmission (like ScheduledAt in
+// internal/api/handlers.go), not folded into it, so every existing caller
+// of ValidateSubmission continues to compile and behave identically; a
+// caller that cares about queue_name calls this too and assigns the result
+// to NewParams.QueueName, exactly as it already does for ScheduledAt.
+func ValidateQueueName(raw *string) (string, error) {
+	if raw == nil {
+		return DefaultQueueName, nil
+	}
+	name := strings.TrimSpace(*raw)
+	if name == "" {
+		return DefaultQueueName, nil
+	}
+	if len(name) > MaxQueueNameLength {
+		return "", fmt.Errorf("queue_name must be at most %d characters", MaxQueueNameLength)
+	}
+	return name, nil
 }
 
 // ValidateIdempotencyKey normalizes and bounds-checks an optional,

@@ -36,6 +36,12 @@ type createJobRequest struct {
 	// dec.Decode's JSON parse in CreateJob below, before
 	// validateCreateJobRequest ever runs, with a 400 response.
 	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
+	// QueueName is Phase 13's optional named-queue field
+	// (docs/phase-13-plan.md §8). Omitted or empty defaults to "default"
+	// (internal/job.ValidateQueueName), exactly matching every
+	// pre-Phase-13 row's own value -- an old client and a new client's
+	// un-set-queue_name requests are indistinguishable in outcome.
+	QueueName *string `json:"queue_name,omitempty"`
 }
 
 type jobResponse struct {
@@ -56,6 +62,7 @@ type jobResponse struct {
 	LastErrorClass          *string         `json:"last_error_class,omitempty"`
 	ResultMetadata          json.RawMessage `json:"result_metadata,omitempty"`
 	TerminalAt              *time.Time      `json:"terminal_at,omitempty"`
+	QueueName               string          `json:"queue_name"`
 }
 
 func toJobResponse(j *job.Job) jobResponse {
@@ -77,6 +84,7 @@ func toJobResponse(j *job.Job) jobResponse {
 		LastErrorClass:          j.LastErrorClass,
 		ResultMetadata:          j.ResultMetadata,
 		TerminalAt:              j.TerminalAt,
+		QueueName:               j.QueueName,
 	}
 }
 
@@ -142,11 +150,24 @@ func (h *Handlers) CreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params.IdempotencyKey = idemKey
+
+	queueName, qerr := job.ValidateQueueName(req.QueueName)
+	if qerr != nil {
+		writeError(w, http.StatusBadRequest, qerr.Error())
+		return
+	}
+	params.QueueName = queueName
 	// The ONLY assignment of PrincipalID on this path, and it comes from
 	// the verified credential -- never from req, never from a header,
 	// never defaulted to principal.SystemPrincipalID
 	// (docs/phase-12-plan.md §6a/§6b).
 	params.PrincipalID = authz.PrincipalID
+
+	release, ok := h.admitSubmission(w, r, authz.PrincipalID.String(), queueName)
+	if !ok {
+		return
+	}
+	defer release()
 
 	j, created, err := h.store.InsertIdempotent(r.Context(), params)
 	if err != nil {

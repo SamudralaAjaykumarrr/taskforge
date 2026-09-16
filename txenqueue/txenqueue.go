@@ -173,6 +173,14 @@ type EnqueueRequest struct {
 	// ScheduledAt, if non-nil, is the caller's requested execution time
 	// (docs/scheduling.md); nil means "eligible as soon as claimed."
 	ScheduledAt *time.Time
+
+	// QueueName is Phase 13's optional named-queue field
+	// (docs/phase-13-plan.md §8), mirroring POST /jobs's queue_name field
+	// exactly. Nil, or empty/whitespace-only after trimming, defaults to
+	// internal/job.DefaultQueueName ("default") -- every pre-Phase-13
+	// caller of this package (there is a nil value here, since queue_name
+	// did not exist before) gets identical behavior to before.
+	QueueName *string
 }
 
 // Store is TaskForge's transactional-enqueue integration surface. It holds
@@ -284,6 +292,12 @@ func (s *Store) EnqueueTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest) (*
 	}
 	params.PrincipalID = req.PrincipalID
 	params.ScheduledAt = req.ScheduledAt
+
+	queueName, qerr := job.ValidateQueueName(req.QueueName)
+	if qerr != nil {
+		return nil, false, fmt.Errorf("%w: %s", ErrInvalidRequest, qerr.Error())
+	}
+	params.QueueName = queueName
 
 	// A caller passing a nil pgx.Tx (the ordinary nil-interface case --
 	// tx == nil is a well-defined, correct check for it) must never reach

@@ -50,6 +50,48 @@ independent top-level transaction. See `internal/store.InsertTx`'s doc
 comment for the SAVEPOINT-based mechanism it uses internally to recover
 from an idempotency-key conflict without ending the caller's transaction.
 
+## Required database privilege (Phase 13 — a breaking change for external integrators using their own DB role)
+
+**As of Phase 13** (docs/phase-13-plan.md §7), the single `INSERT` statement
+`EnqueueTx` issues (`internal/store.insertJobQuery`, a data-modifying CTE
+shared with `POST /jobs`) also upserts a `queue_state` row for the job's
+queue name, in the same statement and the same transaction as the job row
+itself — so that a queue name is discoverable by the fairness/claim
+mechanism (`internal/store/claim.go`'s `pickClaimCandidateQuery`) from the
+moment its first job is submitted, not later.
+
+**If your integration connects as TaskForge's own `taskforge_api` role**
+(`deploy/postgres-roles.sql`), nothing changes for you — that role's grant
+already includes this.
+
+**If your integration connects using its own, separately-provisioned
+PostgreSQL role** (i.e. you did not adopt `deploy/postgres-roles.sql`
+verbatim), you must add exactly this grant, in addition to whatever grant
+already lets `EnqueueTx` insert into `jobs`:
+
+```sql
+GRANT SELECT, INSERT ON queue_state TO <your_role>;
+```
+
+Both privileges are required, not just `INSERT`: PostgreSQL's own
+`INSERT ... ON CONFLICT (queue_name) DO NOTHING` (the upsert form this
+statement uses) checks the conflict target against existing rows even
+though this clause has no `SET`/`WHERE`, which requires `SELECT` on the
+table — confirmed directly against a real PostgreSQL instance, not assumed
+from the clause's own shape (`txenqueue/queue_state_privilege_test.go`).
+No broader privilege (`UPDATE`, `DELETE`) is needed or should be granted —
+`queue_state.last_claimed_at` is written only by the worker's claim path,
+never by submission.
+
+Without this grant, `EnqueueTx` fails with a PostgreSQL `insufficient_privilege`
+(`42501`) error, surfaced through this package's ordinary error contract as
+`ErrEnqueueFailed` (see "Error contract" below) — never a raw SQL/table-name
+leak, and your `tx` remains usable to roll back. This requirement, and both
+directions of it (necessary and sufficient), are proven against real
+PostgreSQL in `txenqueue/queue_state_privilege_test.go`, under a role
+holding only what a pre-Phase-13 integrator would plausibly have granted
+themselves (not `taskforge_api`).
+
 A job enqueued this way, once committed, is an ordinary row in the one
 `jobs` table (docs/data-model.md) — claimed by the same worker claim query,
 subject to the same leases, fencing, retries, dead-lettering, scheduling,
@@ -196,10 +238,14 @@ TaskForge does **not** claim, via this phase or any other:
 - `type Store struct{}` / `func New() *Store` — no database connection or
   other state of its own.
 - `func (*Store) EnqueueTx(ctx, tx pgx.Tx, req EnqueueRequest) (*Job, bool, error)`
-- `type EnqueueRequest struct{ PrincipalID, JobType, Payload, MaxAttempts, ExecutionTimeoutSeconds, IdempotencyKey, ScheduledAt }`
+- `type EnqueueRequest struct{ PrincipalID, JobType, Payload, MaxAttempts, ExecutionTimeoutSeconds, IdempotencyKey, ScheduledAt, QueueName }`
   — field-for-field the same contract as `POST /jobs` (docs/worker-protocol.md),
   validated by the exact same shared rules (`internal/job.ValidateSubmission`).
-  `PrincipalID` is required as of Phase 12 — see the section below.
+  `PrincipalID` is required as of Phase 12 — see the section below. `QueueName`
+  is Phase 13's optional named-queue field (`*string`); nil or empty
+  defaults to `"default"`, identically to every pre-Phase-13 caller's
+  behavior — see "Required database privilege" above for the one operational
+  consequence of this field existing at all.
 - `type Job struct{ ID uuid.UUID }` — a small, package-owned projection of
   the durable row's identity, **not** a type alias onto
   `internal/job.Job` (Phase 11 audit correction: an earlier draft of this

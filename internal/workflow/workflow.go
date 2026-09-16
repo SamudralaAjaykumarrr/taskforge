@@ -80,6 +80,15 @@ type GraphSpec struct {
 	// from the request body.
 	PrincipalID uuid.UUID
 
+	// QueueName is Phase 13's optional named-queue field
+	// (docs/phase-13-plan.md §8), applied uniformly: recorded on the
+	// workflow_instances row and on every node's underlying jobs row, the
+	// same way PrincipalID is -- a workflow's nodes always share one
+	// queue, never a per-node override. Defaults to "default"
+	// (internal/job.DefaultQueueName) when unset -- see
+	// internal/api.CreateWorkflow.
+	QueueName string
+
 	Nodes []NodeSpec
 }
 
@@ -254,7 +263,10 @@ type Instance struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	TerminalAt        *time.Time
-	Nodes             []Node
+	// QueueName is Phase 13's named-queue column, shared by this workflow
+	// and every one of its nodes' underlying jobs.
+	QueueName string
+	Nodes     []Node
 }
 
 // Node is one workflow_nodes row joined with its underlying job's current

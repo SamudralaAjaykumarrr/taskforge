@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,33 +34,261 @@ const (
 	attemptOutcomeTimedOut = "TIMED_OUT"
 )
 
-// claimQuery is docs/worker-protocol.md's "Claim Query" verbatim, with two
-// additions to the RETURNING clause (candidate.old_state,
-// candidate.old_attempt_count) so Claim can tell, without a second round
-// trip, whether the row it just claimed was a fresh QUEUED/RETRY_WAIT
-// claim or a reclaim of a previously RUNNING job — which determines
-// whether a superseded job_attempts row needs to be finalized (see
-// Claim below).
-const claimQuery = `
+// pickClaimCandidateQuery is Phase 13's non-locking "pick" step (ADR-0009,
+// following the two-step "non-locking pick, then targeted locking claim"
+// pattern its own evidence package proved out --
+// tools/phase13bench/claim_fairness.go's claimFairnessV2). It never takes
+// a row lock: it is a plain SELECT that finds the single best (job,
+// queue) candidate across every roster queue, so a concurrent claim
+// attempt that picks the same winner only contends at the SECOND step
+// (claimWithSlotQuery/claimPlainFreshQuery/claimPlainReclaimQuery below),
+// not here -- and that second step is itself a queue-scoped scan, not a
+// targeted single-row lookup, so concurrent contenders for the same
+// winning queue still diverge onto different rows within one statement.
+//
+// For each queue_state row (optionally restricted to $1's subscription
+// list -- NULL means "every queue," the worker-queue-blind compatibility
+// default, docs/phase-13-plan.md §14), the LATERAL finds that queue's own
+// single best candidate. The fresh-claim branch (QUEUED/RETRY_WAIT) and
+// the reclaim branch (expired-lease RUNNING) are fetched as two SEPARATE,
+// each-LIMIT-1 subqueries combined with UNION ALL, rather than one
+// `WHERE (...) OR (...)` spanning both of idx_jobs_claimable_by_queue and
+// idx_jobs_reclaimable_by_queue (migration 0012) -- an OR spanning two
+// differently-shaped partial indexes plus a shared ORDER BY defeats index
+// usage entirely at realistic backlog size, exactly the defect this
+// phase's own concurrency evidence found and fixed
+// (docs/phase-13-concurrency-evidence-v2.md; see migration 0012's own
+// comment for the measured numbers). The outer per-queue ORDER BY/LIMIT 1
+// then picks the single best of the (at most two) unioned rows.
+//
+// "Capacity-eligible" (ADR-0009's roster-membership definition) is
+// evaluated PER CANDIDATE, inside each branch, before the two branches
+// are collapsed to a single per-queue winner: a reclaim (old_state =
+// 'RUNNING') is always capacity-eligible (it already holds its slot --
+// see "Reclaim/slot-ownership semantics" in the ADR), unconditionally; a
+// fresh candidate is capacity-eligible only if the queue has no
+// queue_slots rows at all (unconfigured/unlimited -- the pre-Phase-13
+// compatibility default) or has at least one free (held_by_job_id IS
+// NULL) slot right now.
+//
+// This ordering matters and was previously wrong (independent review
+// finding H1, docs/adr/0009-phase-13-concurrency-and-fairness.md's
+// definitions still govern the property, this is an implementation
+// correction, not a semantics change): an earlier version of this query
+// evaluated capacity-eligibility only AFTER the two branches were already
+// collapsed to one per-queue winner by (priority DESC, eligible_at ASC).
+// If that collapsed winner happened to be fresh-shaped and the queue was
+// at capacity, the ENTIRE queue was filtered out of the roster for that
+// pick -- even when a different, lower-ranked candidate in the SAME queue
+// was a reclaim, which is unconditionally capacity-eligible and should
+// have won instead. Since priority is not settable via any public API
+// (internal/job.NewParams has no Priority field), every job's priority is
+// the schema default (0), so this was reachable by nothing more exotic
+// than a later-submitted fresh job whose eligible_at happened to sort
+// ahead of an already-reclaim-eligible job sharing its queue -- silently
+// and indefinitely starving the reclaim, a TF-INV-004 violation. Filtering
+// each branch by its own capacity-eligibility rule BEFORE the collapse
+// means an ineligible fresh candidate simply never enters the union in
+// the first place, so it can never hide an eligible reclaim candidate
+// behind it; the queue's per-queue winner is now always drawn from
+// whichever candidates are actually admittable. A queue leaves the roster
+// (produces no row here) if and only if genuinely NEITHER branch has any
+// eligible candidate left, matching the ADR's "Roster membership -- exit"
+// definition exactly. See internal/store/phase13_claim_selection_fix_test.go
+// for the regression test (reproduced against the pre-fix query, fails
+// there, passes here).
+//
+// is_limited is returned alongside the winner so the caller's targeted
+// step 2 knows, without a second lookup, whether it must go through the
+// slot-acquiring variant.
+//
+// Final selection orders by qs.last_claimed_at ascending (ADR-0009's
+// fairness ordering -- ties, most commonly every queue's shared
+// '-infinity' default on a cold start, break by each candidate's own
+// priority DESC, eligible_at ASC, exactly the tie-break the pre-Phase-13
+// claim query already used).
+const pickClaimCandidateQuery = `
+	SELECT c.id, qs.queue_name, c.old_state,
+	       EXISTS (SELECT 1 FROM queue_slots qsl WHERE qsl.queue_name = qs.queue_name) AS is_limited
+	FROM queue_state qs
+	JOIN LATERAL (
+		SELECT id, old_state, priority, eligible_at
+		FROM (
+			(SELECT id, state AS old_state, priority, eligible_at
+			 FROM jobs
+			 WHERE queue_name = qs.queue_name AND state IN ('QUEUED', 'RETRY_WAIT') AND eligible_at <= now()
+			   AND (
+			         NOT EXISTS (SELECT 1 FROM queue_slots qsl WHERE qsl.queue_name = qs.queue_name)
+			      OR EXISTS (SELECT 1 FROM queue_slots qsl WHERE qsl.queue_name = qs.queue_name AND qsl.held_by_job_id IS NULL)
+			       )
+			 ORDER BY priority DESC, eligible_at ASC LIMIT 1)
+			UNION ALL
+			(SELECT id, state AS old_state, priority, eligible_at
+			 FROM jobs
+			 WHERE queue_name = qs.queue_name AND state = 'RUNNING' AND lease_expires_at < now() AND attempt_count < max_attempts
+			 ORDER BY priority DESC, eligible_at ASC LIMIT 1)
+		) branch
+		ORDER BY priority DESC, eligible_at ASC
+		LIMIT 1
+	) c ON true
+	WHERE ($1::text[] IS NULL OR qs.queue_name = ANY($1::text[]))
+	ORDER BY qs.last_claimed_at ASC, c.priority DESC, c.eligible_at ASC
+	LIMIT 1`
+
+// claimCandidate is pickClaimCandidateQuery's winning row.
+type claimCandidate struct {
+	id        uuid.UUID
+	queueName string
+	oldState  jobstate.State
+	limited   bool // true iff this queue has any provisioned queue_slots rows
+}
+
+// queueNameArrayLiteral renders queues as a PostgreSQL text[] array
+// literal for a `$n::text[]` parameter, escaping backslashes and double
+// quotes per PostgreSQL's array-literal syntax (queue names are
+// operator-supplied free-form text, OD-8 -- unlike
+// internal/store/workflow.go's uuidArrayLiteral, which can join UUIDs
+// with bare commas because a UUID's own syntax can never contain one,
+// this cannot assume the same about an arbitrary queue name). A nil slice
+// (the worker-queue-blind default) renders as a real SQL NULL, not an
+// empty array -- `$1::text[] IS NULL` in pickClaimCandidateQuery is what
+// distinguishes "no subscription filter at all" from "subscribed to
+// nothing," and passing Go nil through database/sql already produces a
+// NULL bind value, so no explicit sentinel is needed for that case.
+func queueNameArrayLiteral(queues []string) any {
+	if queues == nil {
+		return nil
+	}
+	parts := make([]string, len(queues))
+	for i, q := range queues {
+		escaped := strings.ReplaceAll(q, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		parts[i] = `"` + escaped + `"`
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// pickClaimCandidate runs the non-locking pick step above. found is false
+// (with a nil error) when no roster queue currently has a pending,
+// capacity-eligible candidate -- a normal outcome, not an error.
+func pickClaimCandidate(ctx context.Context, tx *sql.Tx, subscribedQueues []string) (claimCandidate, bool, error) {
+	var c claimCandidate
+	var oldState string
+	err := tx.QueryRowContext(ctx, pickClaimCandidateQuery, queueNameArrayLiteral(subscribedQueues)).
+		Scan(&c.id, &c.queueName, &oldState, &c.limited)
+	if errors.Is(err, sql.ErrNoRows) {
+		return claimCandidate{}, false, nil
+	}
+	if err != nil {
+		return claimCandidate{}, false, err
+	}
+	c.oldState = jobstate.State(oldState)
+	return c, true, nil
+}
+
+// claimWithSlotQuery is step 2's fresh-claim, capacity-limited variant.
+//
+// It is deliberately a QUEUE-SCOPED SCAN (WHERE queue_name = $1 ...
+// ORDER BY ... FOR UPDATE SKIP LOCKED LIMIT 1), not a lookup targeted at
+// the one specific job id pickClaimCandidate happened to find, and the
+// slot half is the same kind of scan over queue_slots. This is a
+// deliberate, evidence-driven correction to an earlier draft of this
+// mechanism (caught by TestMetrics_ConcurrentRecording_RaceSafe: 50
+// workers racing 50 same-queue jobs claimed as few as 6 of them when step
+// 2 targeted one fixed id, because many concurrent callers' non-locking
+// pick step deterministically agree on the SAME globally-best candidate,
+// and only one can win a targeted lock on it -- exactly the "many
+// concurrent workers ... converged on the identical single winning row"
+// failure mode tools/phase13bench/claim_concurrency.go's own comment
+// documents for a single-queue, no-fairness-alternative shape). Scoping
+// each SKIP LOCKED clause to the whole winning queue (not one row)
+// restores this codebase's foundational per-statement divergence
+// property -- PostgreSQL itself makes every concurrent scanner skip a
+// row (or slot) another has already locked and move on to the
+// next-best one, WITHIN this one statement, for both the job and the
+// slot independently. It still uses idx_jobs_claimable_by_queue (a
+// single, unqualified index scan -- no OR across branches, since the
+// caller already knows, from pickClaimCandidate's own old_state, that
+// this candidate is fresh-shaped, not a reclaim).
+const claimWithSlotQuery = `
 	WITH candidate AS (
 		SELECT id, state AS old_state, attempt_count AS old_attempt_count
 		FROM jobs
-		WHERE (
-				state IN ('QUEUED', 'RETRY_WAIT')
-				AND eligible_at <= now()
-			  )
-		   OR (
-				state = 'RUNNING'
-				AND lease_expires_at < now()
-				AND attempt_count < max_attempts
-			  )
+		WHERE queue_name = $1 AND state IN ('QUEUED', 'RETRY_WAIT') AND eligible_at <= now()
+		ORDER BY priority DESC, eligible_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	), slot AS (
+		SELECT slot_index
+		FROM queue_slots
+		WHERE queue_name = $1 AND held_by_job_id IS NULL
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	)
+	UPDATE jobs
+	SET state = 'RUNNING',
+		lease_owner = $2,
+		lease_generation = jobs.lease_generation + 1,
+		lease_expires_at = now() + make_interval(secs => jobs.execution_timeout_seconds),
+		heartbeat_at = now(),
+		attempt_count = jobs.attempt_count + 1,
+		updated_at = now(),
+		cancel_requested = false,
+		cancel_requested_at = NULL,
+		version = jobs.version + 1
+	FROM candidate, slot
+	WHERE jobs.id = candidate.id
+	RETURNING ` + jobColumns + `, candidate.old_state, candidate.old_attempt_count, slot.slot_index`
+
+// claimPlainFreshQuery is step 2's variant for a fresh claim on a queue
+// with no provisioned queue_slots rows at all (unconfigured, unlimited
+// concurrency -- the pre-Phase-13 compatibility default). Queue-scoped
+// SKIP LOCKED scan, same divergence reasoning as claimWithSlotQuery
+// above, using idx_jobs_claimable_by_queue alone (no OR, no reclaim
+// branch -- pickClaimCandidate already determined this candidate is
+// fresh-shaped).
+const claimPlainFreshQuery = `
+	WITH candidate AS (
+		SELECT id, state AS old_state, attempt_count AS old_attempt_count
+		FROM jobs
+		WHERE queue_name = $1 AND state IN ('QUEUED', 'RETRY_WAIT') AND eligible_at <= now()
 		ORDER BY priority DESC, eligible_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	)
 	UPDATE jobs
 	SET state = 'RUNNING',
-		lease_owner = $1,
+		lease_owner = $2,
+		lease_generation = jobs.lease_generation + 1,
+		lease_expires_at = now() + make_interval(secs => jobs.execution_timeout_seconds),
+		heartbeat_at = now(),
+		attempt_count = jobs.attempt_count + 1,
+		updated_at = now(),
+		cancel_requested = false,
+		cancel_requested_at = NULL,
+		version = jobs.version + 1
+	FROM candidate
+	WHERE jobs.id = candidate.id
+	RETURNING ` + jobColumns + `, candidate.old_state, candidate.old_attempt_count`
+
+// claimPlainReclaimQuery is step 2's variant for a reclaim (old_state =
+// 'RUNNING' -- never touches queue_slots, per SF-052/the ADR's
+// "Reclaim/slot-ownership semantics": a reclaimed job retains and reuses
+// its original capacity-slot binding, so reclaiming it must never
+// allocate, free, or otherwise write a slot row). Queue-scoped SKIP
+// LOCKED scan using idx_jobs_reclaimable_by_queue alone.
+const claimPlainReclaimQuery = `
+	WITH candidate AS (
+		SELECT id, state AS old_state, attempt_count AS old_attempt_count
+		FROM jobs
+		WHERE queue_name = $1 AND state = 'RUNNING' AND lease_expires_at < now() AND attempt_count < max_attempts
+		ORDER BY priority DESC, eligible_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	)
+	UPDATE jobs
+	SET state = 'RUNNING',
+		lease_owner = $2,
 		lease_generation = jobs.lease_generation + 1,
 		lease_expires_at = now() + make_interval(secs => jobs.execution_timeout_seconds),
 		heartbeat_at = now(),
@@ -83,26 +312,132 @@ func scanClaimJob(row rowScanner) (*job.Job, jobstate.State, int, error) {
 	return f.materialize(), jobstate.State(oldState), oldAttemptCount, nil
 }
 
-// Claim atomically finds and takes ownership of at most one eligible job
-// for workerID: either a freshly QUEUED/RETRY_WAIT job, or a RUNNING job
-// whose lease has expired and still has attempt budget remaining
-// (reclaim), per docs/worker-protocol.md's claim query. Both paths
-// transition the job to RUNNING under a strictly incremented
-// lease_generation (TF-INV-002); the same query, the same transaction,
-// and the same generation-increment arithmetic handle both cases, exactly
-// as docs/architecture.md describes ("there is no separate reaper
-// process required for correctness").
+// scanClaimJobWithSlot is scanClaimJob's counterpart for claimWithSlotQuery,
+// whose RETURNING clause carries one extra column (the acquired slot's
+// slot_index) so the caller can mark that exact slot held in a following
+// statement without a second lookup.
+func scanClaimJobWithSlot(row rowScanner) (*job.Job, jobstate.State, int, int, error) {
+	var f jobScanFields
+	var oldState string
+	var oldAttemptCount int
+	var slotIndex int
+	dest := append(f.dest(), &oldState, &oldAttemptCount, &slotIndex)
+	if err := row.Scan(dest...); err != nil {
+		return nil, "", 0, 0, err
+	}
+	return f.materialize(), jobstate.State(oldState), oldAttemptCount, slotIndex, nil
+}
+
+// releaseSlot durably releases the queue_slots row (if any) held by
+// jobID, in the caller's transaction. It is idempotent and safe to call
+// unconditionally: a job that never held a slot (an unlimited queue, or a
+// job that was already released) simply matches zero rows -- matching by
+// held_by_job_id (not by queue_name/slot_index) means this can never
+// disturb a DIFFERENT job's later, legitimate hold on the same slot index
+// (SF-058's idempotency requirement). Called from every path that stops a
+// job being RUNNING: CompleteSuccess, CompleteFailure, CompleteCancelled,
+// completeRetryableOutcome (both its RETRY_WAIT and DEAD_LETTERED
+// destinations -- a job that stops being RUNNING must not still hold a
+// slot regardless of which non-RUNNING state it lands in, or SF-053's
+// per-row invariant (every RUNNING job holds exactly one slot, every held
+// slot belongs to exactly one RUNNING job) would be violated the moment a
+// RETRY_WAIT job kept its slot across a claim cycle it does not occupy),
+// and the Lazy Dead-Letter Sweep (via releaseSlotsForJobs below, batched).
+func releaseSlot(ctx context.Context, tx *sql.Tx, jobID uuid.UUID) error {
+	_, err := tx.ExecContext(ctx, `UPDATE queue_slots SET held_by_job_id = NULL WHERE held_by_job_id = $1`, jobID)
+	return err
+}
+
+// releaseSlotsForJobs is releaseSlot batched for the Lazy Dead-Letter
+// Sweep, which can dead-letter many jobs in one statement. A no-op for an
+// empty slice.
+func releaseSlotsForJobs(ctx context.Context, tx *sql.Tx, jobIDs []uuid.UUID) error {
+	if len(jobIDs) == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE queue_slots SET held_by_job_id = NULL WHERE held_by_job_id = ANY($1::uuid[])`,
+		uuidArrayLiteral(jobIDs))
+	return err
+}
+
+// upsertLastClaimedAt advances queueName's fairness clock to now(),
+// unconditionally -- ADR-0009: "a successful claim (fresh or reclaim)
+// updates it to the current time," with no distinction between the two
+// (SF-057). The INSERT ... ON CONFLICT form (rather than a plain UPDATE)
+// is defense in depth against a queue_name that somehow reached this point
+// without an existing queue_state row (every job-insert path upserts one
+// eagerly -- internal/store/idempotency.go, tx.go, workflow.go -- but a
+// plain UPDATE would silently do nothing, not fail, against a missing
+// row, which would make a real fairness bug invisible).
+func upsertLastClaimedAt(ctx context.Context, tx *sql.Tx, queueName string) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO queue_state (queue_name, last_claimed_at) VALUES ($1, now())
+		ON CONFLICT (queue_name) DO UPDATE SET last_claimed_at = now()`, queueName)
+	return err
+}
+
+// Claim is the compatibility entry point: it claims from every queue,
+// exactly as every pre-Phase-13 caller's behavior must remain
+// (docs/phase-13-plan.md §14 -- a worker with no queue-subscription
+// configuration retains today's exact queue-blind behavior, including
+// reclaiming every queue's expired leases). It is claim(ctx, workerID,
+// nil) -- see that method for the full claim/reclaim/slot/fairness
+// mechanism.
+func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, error) {
+	return s.claim(ctx, workerID, nil)
+}
+
+// ClaimFromQueues is Phase 13's queue-subscription-aware entry point
+// (docs/phase-13-plan.md §6b/§8): identical to Claim, except eligibility
+// is additionally restricted to queueNames -- applied identically to both
+// the fresh-claim branch and the expired-lease reclaim branch (§6b's
+// settled rule: a worker's subscription is one authorization boundary,
+// not two). A nil or empty queueNames means "subscribed to nothing" here
+// (this is the EXPLICIT-subscription entry point; a worker that wants the
+// queue-blind default calls Claim instead, never this method with a nil
+// slice) -- internal/worker.Worker chooses between the two based on its
+// own configured subscription, so this method's own zero-value behavior
+// is never relied upon by production code.
+func (s *Store) ClaimFromQueues(ctx context.Context, workerID string, queueNames []string) (*job.Job, bool, error) {
+	if len(queueNames) == 0 {
+		return nil, false, nil
+	}
+	return s.claim(ctx, workerID, queueNames)
+}
+
+// claim is the shared implementation behind Claim and ClaimFromQueues: it
+// atomically finds and takes ownership of at most one eligible job for
+// workerID, restricted to subscribedQueues (nil means every queue --
+// Claim's compatibility behavior). Both a freshly QUEUED/RETRY_WAIT job
+// and a RUNNING job whose lease has expired with attempt budget remaining
+// (reclaim) transition to RUNNING under a strictly incremented
+// lease_generation (TF-INV-002) -- the same transaction and the same
+// generation-increment arithmetic handle both cases, exactly as
+// docs/architecture.md describes ("there is no separate reaper process
+// required for correctness").
+//
+// Phase 13 (ADR-0009) adds two mechanisms on top of that unchanged core:
+//
+//   - Queue-subscription filtering (§6b): subscribedQueues restricts which
+//     queue_state rows the non-locking pick step (pickClaimCandidate)
+//     considers, identically for both branches.
+//   - Slot-table concurrency limiting + last_claimed_at fairness: the pick
+//     step orders roster candidates by fairness and filters by capacity
+//     eligibility; the second, queue-scoped-scan step (claimWithSlotQuery
+//     for a fresh claim on a capacity-limited queue, claimPlainReclaimQuery
+//     for every reclaim, claimPlainFreshQuery for every unlimited-queue
+//     fresh claim) performs the actual locking claim, atomically acquiring
+//     a slot only in the first case
+//     (SF-051/SF-052/SF-053). Every successful claim -- fresh or reclaim
+//     alike -- advances the claimed queue's last_claimed_at (SF-057).
 //
 // Before claiming, this runs the Lazy Dead-Letter Sweep
 // (docs/worker-protocol.md) in the same transaction, so an
 // attempt-budget-exhausted expired lease is dead-lettered rather than
-// reclaimed (TF-INV-006) — Phase 2 has no retry backoff yet, so the only
-// way a job's attempt_count reaches max_attempts is repeated reclaim of a
-// job whose worker keeps disappearing before completing; without this
-// sweep the claim query's own "AND attempt_count < max_attempts" guard
-// would otherwise just leave such a job permanently RUNNING-but-unclaimable
-// once exhausted, which is exactly the "stranded job" TF-INV-004 exists to
-// prevent.
+// reclaimed (TF-INV-006); Phase 13 extends that sweep to also release the
+// swept job's capacity slot, durably and idempotently, in the same
+// transaction (SF-058) — see sweepExpiredExhaustedLeases.
 //
 // When this claim is a reclaim (the previous state was RUNNING), the
 // superseded attempt's job_attempts row is finalized (outcome
@@ -110,9 +445,13 @@ func scanClaimJob(row rowScanner) (*job.Job, jobstate.State, int, error) {
 // ledger and the job row can never disagree about whether the previous
 // attempt is still open (TF-INV-013).
 //
-// The second return value is false (with a nil error) when there is
-// nothing eligible to claim right now — a normal, expected outcome, not
-// an error.
+// The second return value is false (with a nil error) both when nothing
+// is eligible to claim right now, and when the non-locking pick step's
+// winning candidate was claimed by a concurrent transaction (or its slot
+// exhausted) before this method's own targeted, locking attempt ran --
+// both are normal, expected outcomes under contention, not errors; the
+// caller's next poll tries again, exactly as it already does for the
+// ordinary "nothing eligible" case.
 //
 // Phase 8: after a successful commit, this records
 // taskforge_claim_latency_seconds/taskforge_queue_age_seconds (computed
@@ -128,7 +467,7 @@ func scanClaimJob(row rowScanner) (*job.Job, jobstate.State, int, error) {
 // recordSweptJobs, using data collected by sweepExpiredExhaustedLeases
 // but only emitted after this transaction has actually committed (a
 // sweep whose enclosing transaction rolls back must never be recorded).
-func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, error) {
+func (s *Store) claim(ctx context.Context, workerID string, subscribedQueues []string) (*job.Job, bool, error) {
 	for _, from := range []jobstate.State{jobstate.Queued, jobstate.RetryWait, jobstate.Running} {
 		if !jobstate.IsValidTransition(from, jobstate.Running) {
 			return nil, false, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, from, jobstate.Running)
@@ -146,17 +485,100 @@ func (s *Store) Claim(ctx context.Context, workerID string) (*job.Job, bool, err
 		return nil, false, fmt.Errorf("store: claim: %w", err)
 	}
 
-	row := tx.QueryRowContext(ctx, claimQuery, workerID)
-	j, oldState, _, err := scanClaimJob(row)
-	if errors.Is(err, sql.ErrNoRows) {
+	// maxPickAndLockAttempts bounds the pick-then-lock retry loop below.
+	// Unlike the pre-Phase-13 claimQuery (one atomic FOR UPDATE SKIP
+	// LOCKED statement scanning the whole eligible set, so many concurrent
+	// claimers naturally diverge onto different rows within that single
+	// statement), the two-step "non-locking pick, then targeted locking
+	// claim" pattern this ADR selects (tools/phase13bench/claim_fairness.go's
+	// claimFairnessV2) has a real race window between the two steps: many
+	// concurrent callers' non-locking pick can compute the IDENTICAL
+	// globally-best (queue, job) candidate -- deterministically, from the
+	// same committed state -- especially with few roster queues, where
+	// there is little for them to naturally diverge onto. Only one wins
+	// the second, targeted lock; every other single pick+lock attempt
+	// would otherwise report "nothing claimed" even though other, merely
+	// slightly-less-fair candidates remain genuinely claimable. Retrying
+	// the pick (which reflects each retry's own fresh, post-loss committed
+	// state -- READ COMMITTED gives each statement in this still-open
+	// transaction its own snapshot) resolves this: the row or slot that
+	// was just lost is no longer a candidate on the next iteration, so
+	// concurrent claimers converge, lose, retry, and redistribute onto
+	// the remaining work within the SAME Claim call, rather than each
+	// separately waiting a full pollInterval to try again. This bound
+	// only caps a single call's own retries; it never changes what gets
+	// claimed or which queue's fairness turn is honored -- every retry
+	// re-runs the identical, unmodified pick/lock logic.
+	const maxPickAndLockAttempts = 32
+
+	var j *job.Job
+	var oldState jobstate.State
+	var cand claimCandidate
+	var acquiringSlot bool
+	var slotIndex int
+
+	for attempt := 0; attempt < maxPickAndLockAttempts; attempt++ {
+		var found bool
+		cand, found, err = pickClaimCandidate(ctx, tx, subscribedQueues)
+		if err != nil {
+			return nil, false, fmt.Errorf("store: claim: pick candidate: %w", err)
+		}
+		if !found {
+			if cerr := tx.Commit(); cerr != nil {
+				return nil, false, fmt.Errorf("store: claim: commit (nothing eligible): %w", cerr)
+			}
+			s.recordSweptJobs(swept)
+			return nil, false, nil
+		}
+
+		switch {
+		case cand.oldState == jobstate.Running:
+			acquiringSlot = false
+			row := tx.QueryRowContext(ctx, claimPlainReclaimQuery, cand.queueName, workerID)
+			j, oldState, _, err = scanClaimJob(row)
+		case cand.limited:
+			acquiringSlot = true
+			row := tx.QueryRowContext(ctx, claimWithSlotQuery, cand.queueName, workerID)
+			j, oldState, _, slotIndex, err = scanClaimJobWithSlot(row)
+		default:
+			acquiringSlot = false
+			row := tx.QueryRowContext(ctx, claimPlainFreshQuery, cand.queueName, workerID)
+			j, oldState, _, err = scanClaimJob(row)
+		}
+		if err == nil {
+			break // won this candidate
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, fmt.Errorf("store: claim: %w", err)
+		}
+		// Lost the race between the non-locking pick and this targeted
+		// attempt (a concurrent claimer took the row, or the free slot we
+		// were counting on, first) -- retry with a fresh pick; see the
+		// loop's own doc comment above.
+		j = nil
+	}
+	if j == nil {
+		// Every retry lost the race -- a normal outcome under sustained
+		// contention, not an error; the caller's next poll tries again,
+		// exactly as the ordinary "nothing eligible" case already does.
 		if cerr := tx.Commit(); cerr != nil {
-			return nil, false, fmt.Errorf("store: claim: commit (nothing eligible): %w", cerr)
+			return nil, false, fmt.Errorf("store: claim: commit (lost race): %w", cerr)
 		}
 		s.recordSweptJobs(swept)
 		return nil, false, nil
 	}
-	if err != nil {
-		return nil, false, fmt.Errorf("store: claim: %w", err)
+
+	if acquiringSlot {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE queue_slots SET held_by_job_id = $1 WHERE queue_name = $2 AND slot_index = $3`,
+			j.ID, cand.queueName, slotIndex,
+		); err != nil {
+			return nil, false, fmt.Errorf("store: claim: acquire slot: %w", err)
+		}
+	}
+
+	if err := upsertLastClaimedAt(ctx, tx, cand.queueName); err != nil {
+		return nil, false, fmt.Errorf("store: claim: update fairness state: %w", err)
 	}
 
 	var supersededStartedAt time.Time
@@ -313,6 +735,28 @@ func (s *Store) sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) ([]
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sweep expired-exhausted leases: %w", err)
+	}
+
+	// Phase 13 (ADR-0009, SF-058): release every swept job's capacity slot
+	// in the SAME transaction as its DEAD_LETTERED transition -- durable
+	// (a crash immediately after this transaction's commit cannot leave
+	// the slot ambiguous, since the release and the state transition
+	// either both commit or neither does) and idempotent (releaseSlotsForJobs
+	// matches by held_by_job_id, so a second sweep pass against an
+	// already-DEAD_LETTERED job -- whose slot this already released -- is
+	// a no-op: it cannot re-release, or otherwise disturb, a slot a
+	// different job may since have legitimately claimed). This is the
+	// specific call site the ADR's own drafting found completely
+	// untested by every prior evidence pass -- see "Reclaim/slot-ownership
+	// semantics" in docs/adr/0009-phase-13-concurrency-and-fairness.md.
+	if len(swept) > 0 {
+		ids := make([]uuid.UUID, len(swept))
+		for i := range swept {
+			ids[i] = swept[i].id
+		}
+		if err := releaseSlotsForJobs(ctx, tx, ids); err != nil {
+			return nil, fmt.Errorf("sweep expired-exhausted leases: release slots: %w", err)
+		}
 	}
 
 	for i := range swept {

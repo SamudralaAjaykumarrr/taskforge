@@ -131,8 +131,17 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	// transaction -- a workflow and its nodes can never end up owned by
 	// different principals, so workflow-level ownership scoping is
 	// sufficient to protect the nodes too.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, principal_id, state) VALUES ($1, $2, 'RUNNING')`, workflowID, g.PrincipalID); err != nil {
+	queueName := queueNameOrDefault(g.QueueName)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_instances (id, principal_id, state, queue_name) VALUES ($1, $2, 'RUNNING', $3)`, workflowID, g.PrincipalID, queueName); err != nil {
 		return nil, fmt.Errorf("store: create workflow: insert instance: %w", err)
+	}
+	// Phase 13: register queueName in the fairness roster (see
+	// internal/store/claim.go's pickClaimCandidateQuery) once per workflow,
+	// in the same transaction, rather than once per node -- every node
+	// shares this one queue, so registering it once already covers all of
+	// them.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO queue_state (queue_name) VALUES ($1) ON CONFLICT (queue_name) DO NOTHING`, queueName); err != nil {
+		return nil, fmt.Errorf("store: create workflow: register queue_state: %w", err)
 	}
 
 	nodeIDs := make(map[string]uuid.UUID, len(g.Nodes))
@@ -144,7 +153,7 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 	for _, n := range g.Nodes {
 		jobID := uuid.New()
 		blocked := len(n.DependsOn) > 0
-		if err := insertWorkflowNodeJob(ctx, tx, jobID, g.PrincipalID, n, blocked); err != nil {
+		if err := insertWorkflowNodeJob(ctx, tx, jobID, g.PrincipalID, queueName, n, blocked); err != nil {
 			return nil, fmt.Errorf("store: create workflow: insert node %q job: %w", n.NodeKey, err)
 		}
 		jobTypes = append(jobTypes, n.JobType)
@@ -195,15 +204,15 @@ func (s *Store) CreateWorkflow(ctx context.Context, g workflow.GraphSpec) (*work
 // consistent with docs/failure-model.md's Clock Model — blockedEligibleAt
 // itself is a fixed constant, not a clock reading, so passing it as a
 // literal parameter does not reintroduce a clock-skew dependency.
-func insertWorkflowNodeJob(ctx context.Context, tx *sql.Tx, jobID, principalID uuid.UUID, n workflow.NodeSpec, blocked bool) error {
+func insertWorkflowNodeJob(ctx context.Context, tx *sql.Tx, jobID, principalID uuid.UUID, queueName string, n workflow.NodeSpec, blocked bool) error {
 	var scheduledAt sql.NullTime
 	if n.ScheduledAt != nil {
 		scheduledAt = sql.NullTime{Time: *n.ScheduledAt, Valid: true}
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, scheduled_at, eligible_at)
-		VALUES ($1, $9, $2, $3, 'QUEUED', $4, $5, $6, CASE WHEN $7 THEN $8 ELSE COALESCE($6, now()) END)`,
-		jobID, n.JobType, []byte(n.Payload), n.MaxAttempts, n.ExecutionTimeoutSeconds, scheduledAt, blocked, blockedEligibleAt, principalID,
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, scheduled_at, eligible_at, queue_name)
+		VALUES ($1, $9, $2, $3, 'QUEUED', $4, $5, $6, CASE WHEN $7 THEN $8 ELSE COALESCE($6, now()) END, $10)`,
+		jobID, n.JobType, []byte(n.Payload), n.MaxAttempts, n.ExecutionTimeoutSeconds, scheduledAt, blocked, blockedEligibleAt, principalID, queueName,
 	)
 	return err
 }
@@ -225,10 +234,10 @@ func (s *Store) GetWorkflow(ctx context.Context, id uuid.UUID, authz principal.A
 	var cancelReqAt, terminalAt sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, principal_id, state, cancel_requested, cancel_requested_at, created_at, updated_at, terminal_at
+		SELECT id, principal_id, state, cancel_requested, cancel_requested_at, created_at, updated_at, terminal_at, queue_name
 		FROM workflow_instances WHERE id = $1 AND `+workflowPrincipalScopeClause(2, 3),
 		append([]any{id}, scopeArgs(authz)...)...,
-	).Scan(&inst.ID, &inst.PrincipalID, &state, &inst.CancelRequested, &cancelReqAt, &inst.CreatedAt, &inst.UpdatedAt, &terminalAt)
+	).Scan(&inst.ID, &inst.PrincipalID, &state, &inst.CancelRequested, &cancelReqAt, &inst.CreatedAt, &inst.UpdatedAt, &terminalAt, &inst.QueueName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

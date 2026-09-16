@@ -112,6 +112,13 @@ type Handlers struct {
 	logger  *slog.Logger
 	auth    Authenticator
 	metrics *metrics.Metrics
+
+	// governance and inflight are Phase 13's admission-check dependencies
+	// (admission.go) -- both nil-safe (see WithGovernance,
+	// WithMaxInflightSubmissions): a Handlers that never configures
+	// either behaves exactly as a pre-Phase-13 one did.
+	governance GovernanceStore
+	inflight   chan struct{}
 }
 
 // NewHandlers constructs the HTTP handlers.

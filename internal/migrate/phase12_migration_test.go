@@ -214,14 +214,20 @@ func TestMigrations0005To0008_AreDataSafeReversible(t *testing.T) {
 	require.Equal(t, principal.SystemPrincipalID, owner)
 
 	// Down, newest first (0010's down is safe here, since no cross-principal
-	// key reuse exists yet).
+	// key reuse exists yet). Phase 13's queue_limits/queue_slots (0013)
+	// reference principals/jobs, so they must come down before 0005 can
+	// drop principals -- see dropPhase12Schema's identical ordering fix.
+	require.NoError(t, applyDown(t, db, "0014_drop_old_claimable_index.down.sql"))
+	require.NoError(t, applyDown(t, db, "0013_create_governance_tables.down.sql"))
+	require.NoError(t, applyDown(t, db, "0012_create_claimable_by_queue_index.down.sql"))
+	require.NoError(t, applyDown(t, db, "0011_add_queue_name.down.sql"))
 	require.NoError(t, applyDown(t, db, "0010_drop_global_idempotency_index.down.sql"))
 	require.NoError(t, applyDown(t, db, "0009_validate_principal_id_and_scope_idempotency.down.sql"))
 	require.NoError(t, applyDown(t, db, "0008_require_principal_id.down.sql"))
 	require.NoError(t, applyDown(t, db, "0007_backfill_principal_id.down.sql"))
 	require.NoError(t, applyDown(t, db, "0006_add_principal_id_columns.down.sql"))
 	require.NoError(t, applyDown(t, db, "0005_create_principals_and_api_keys.down.sql"))
-	_, err = db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9)`)
+	_, err = db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 11, 12, 13, 14)`)
 	require.NoError(t, err)
 
 	// The job row itself survived the rollback untouched.
@@ -672,7 +678,17 @@ func TestPhase12Migrations_0009TakesNoAccessExclusive_ReadsAndCompletionContinue
 	require.False(t, validatedBefore, "test setup: the constraint must start NOT VALID")
 
 	// Make this Up run apply exactly 0009 -- the scan and the index builds.
+	// Phase 13 added 0011-0014 after 0010; without also faking them as
+	// already-applied, this same migrate.Up call would run straight into
+	// them once 0009 finishes (0012 needs its own SHARE lock on jobs),
+	// which would then contend with the still-held claim-shaped row lock
+	// below and make this test about 0012's lock behaviour instead of
+	// 0009's.
 	markVersionApplied(t, db, 10, "0010_drop_global_idempotency_index.up.sql")
+	markVersionApplied(t, db, 11, "0011_add_queue_name.up.sql")
+	markVersionApplied(t, db, 12, "0012_create_claimable_by_queue_index.up.sql")
+	markVersionApplied(t, db, 13, "0013_create_governance_tables.up.sql")
+	markVersionApplied(t, db, 14, "0014_drop_old_claimable_index.up.sql")
 
 	_, release := holdClaimShapedRowLock(t, db)
 
@@ -713,10 +729,18 @@ func TestPhase12Migrations_0009TakesNoAccessExclusive_ReadsAndCompletionContinue
 	// 0010's DROP INDEX is catalog-only but needs ACCESS EXCLUSIVE, so it
 	// must wait for any conflicting lock like all DDL. That is documented
 	// deployment behaviour, not a defect -- and it is why it is a separate
-	// file.
+	// file. Unmark 0011-0014 too (faked above so this test observed 0009 in
+	// isolation) so this final Up call genuinely applies every one of them,
+	// leaving the database fully migrated for whatever test runs next --
+	// not merely recorded as applied without ever having run.
 	unmarkVersion(t, db, 10)
+	unmarkVersion(t, db, 11)
+	unmarkVersion(t, db, 12)
+	unmarkVersion(t, db, 13)
+	unmarkVersion(t, db, 14)
 	require.NoError(t, migrate.Up(ctx, db))
 	require.False(t, indexExists(t, db, "idx_jobs_idempotency_key"))
+	require.True(t, indexExists(t, db, "idx_jobs_claimable_by_queue"))
 }
 
 // TestPhase12Migrations_0009BlocksWritesAndTheClaimQuery is the corrected

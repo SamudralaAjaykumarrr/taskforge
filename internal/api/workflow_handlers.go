@@ -39,6 +39,11 @@ type createWorkflowNodeRequest struct {
 
 type createWorkflowRequest struct {
 	Nodes []createWorkflowNodeRequest `json:"nodes"`
+	// QueueName is Phase 13's optional named-queue field
+	// (docs/phase-13-plan.md §8), applied to the whole workflow -- every
+	// node's underlying job shares it, the same way every node shares the
+	// workflow's PrincipalID. Omitted or empty defaults to "default".
+	QueueName *string `json:"queue_name,omitempty"`
 }
 
 type workflowNodeResponse struct {
@@ -59,6 +64,7 @@ type workflowResponse struct {
 	CreatedAt         time.Time              `json:"created_at"`
 	UpdatedAt         time.Time              `json:"updated_at"`
 	TerminalAt        *time.Time             `json:"terminal_at,omitempty"`
+	QueueName         string                 `json:"queue_name"`
 	Nodes             []workflowNodeResponse `json:"nodes"`
 }
 
@@ -83,6 +89,7 @@ func toWorkflowResponse(wf *workflow.Instance) workflowResponse {
 		CreatedAt:         wf.CreatedAt,
 		UpdatedAt:         wf.UpdatedAt,
 		TerminalAt:        wf.TerminalAt,
+		QueueName:         wf.QueueName,
 		Nodes:             nodes,
 	}
 }
@@ -163,7 +170,13 @@ func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	// internal/store.CreateWorkflow writes it to the workflow_instances
 	// row and to every node's underlying jobs row in one transaction, so
 	// a workflow and its nodes are always owned by the same principal.
-	spec := workflow.GraphSpec{PrincipalID: authz.PrincipalID, Nodes: make([]workflow.NodeSpec, 0, len(req.Nodes))}
+	queueName, qerr := job.ValidateQueueName(req.QueueName)
+	if qerr != nil {
+		writeError(w, http.StatusBadRequest, qerr.Error())
+		return
+	}
+
+	spec := workflow.GraphSpec{PrincipalID: authz.PrincipalID, QueueName: queueName, Nodes: make([]workflow.NodeSpec, 0, len(req.Nodes))}
 	for _, n := range req.Nodes {
 		ns, verr := validateWorkflowNodeRequest(n)
 		if verr != "" {
@@ -172,6 +185,12 @@ func (h *Handlers) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 		spec.Nodes = append(spec.Nodes, ns)
 	}
+
+	release, ok := h.admitSubmission(w, r, authz.PrincipalID.String(), queueName)
+	if !ok {
+		return
+	}
+	defer release()
 
 	wf, err := h.store.CreateWorkflow(r.Context(), spec)
 	if err != nil {

@@ -136,6 +136,16 @@ table (docs/data-model.md) already supports a plain `INSERT` from any
 transaction, including one a caller opened, so no migration was added for
 this phase.
 
+**Phase 13 update**: `EnqueueTx`'s underlying insert now also upserts a
+`queue_state` row (migration `0013`) in the same statement and transaction,
+which changes the *minimum PostgreSQL privilege* an external integrator's
+own custom database role needs — a compatibility-relevant operational
+change, though not a Go API break (the new `QueueName` request field is
+optional and defaults identically to pre-Phase-13 behavior). See
+docs/transactional-enqueue.md "Required database privilege" for the exact
+grant required and why, and `txenqueue/queue_state_privilege_test.go` for
+the proof against real PostgreSQL.
+
 This guarantee is explicitly **not** extended, and cannot be, across two
 different databases or any non-PostgreSQL system. TaskForge does not
 implement distributed transactions or two-phase commit. The documented

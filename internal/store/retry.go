@@ -165,6 +165,20 @@ func (s *Store) completeRetryableOutcome(ctx context.Context, id uuid.UUID, leas
 		return nil, fmt.Errorf("store: complete retryable outcome: %w", err)
 	}
 
+	// Phase 13 (ADR-0009): this job stops being RUNNING here regardless of
+	// which destination it lands on -- RETRY_WAIT is not itself terminal,
+	// but it is not RUNNING either, and re-claiming it later goes through
+	// the fresh-claim branch (which acquires a NEW slot on a
+	// capacity-limited queue, per pickClaimCandidateQuery/claimWithSlotQuery),
+	// never a reclaim. A job left holding its old slot across a
+	// RUNNING -> RETRY_WAIT transition would violate SF-053's per-row
+	// invariant (every RUNNING job holds exactly one slot, every held
+	// slot belongs to exactly one RUNNING job) the moment it is next
+	// re-claimed and (correctly) acquires a second one.
+	if err := releaseSlot(ctx, tx, id); err != nil {
+		return nil, fmt.Errorf("store: complete retryable outcome: release slot: %w", err)
+	}
+
 	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcome, errorClass, errMessage)
 	if err != nil {
 		return nil, fmt.Errorf("store: complete retryable outcome: record attempt outcome: %w", err)

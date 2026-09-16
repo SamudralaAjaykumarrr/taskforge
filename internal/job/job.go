@@ -45,6 +45,11 @@ type Job struct {
 	ResultMetadata          json.RawMessage
 	TerminalAt              *time.Time
 	Version                 int64
+	// QueueName is Phase 13's named-queue column (docs/phase-13-plan.md
+	// §7). Every job carries one, defaulting to "default" for every
+	// pre-Phase-13 row and for any submission that does not name one
+	// explicitly -- see internal/job.ValidateSubmission.
+	QueueName string
 }
 
 // IsTerminal reports whether the job has reached a state with no legal
@@ -90,6 +95,16 @@ type NewParams struct {
 	ExecutionTimeoutSeconds int
 	IdempotencyKey          *string
 	ScheduledAt             *time.Time
+	// QueueName is Phase 13's optional named-queue field
+	// (docs/phase-13-plan.md §8). Populated by ValidateSubmission, which
+	// defaults an empty/unsupplied value to "default" -- every call site
+	// that constructs NewParams directly (internal/store/workflow.go) must
+	// apply the same default, never leave this empty, since the INSERT
+	// always supplies an explicit value rather than relying on the
+	// schema's own DEFAULT 'default' (jobs.queue_name is NOT NULL with no
+	// volatile default-dependent behavior once a value is explicitly
+	// bound).
+	QueueName string
 }
 
 // Failure classes recorded in last_error_class, per docs/data-model.md.

@@ -45,6 +45,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/api"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/buildinfo"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/governance"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/metrics"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/migrate"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
@@ -108,6 +109,13 @@ func run(logger *slog.Logger) error {
 	st := store.New(db, store.WithMetrics(m), store.WithLogger(logger))
 	m.Registry.MustRegister(metrics.NewStateCollector(st, cfg.ActiveWorkerWindow, logger))
 
+	// Phase 13: the queue-scoped gauges (taskforge_queue_depth,
+	// taskforge_queue_running, taskforge_queue_concurrency_limit) --
+	// registered as their own collector since they read both the Store
+	// (jobs table) and the governance Store (queue_limits).
+	gov := governance.New(db)
+	m.Registry.MustRegister(metrics.NewQueueStateCollector(st, gov, logger))
+
 	principals, err := principal.NewStore(db, cfg.APIKeyPepper)
 	if err != nil {
 		return err
@@ -123,6 +131,8 @@ func run(logger *slog.Logger) error {
 	handlers := api.NewHandlers(st, logger,
 		api.WithAuthenticator(principals),
 		api.WithMetrics(m),
+		api.WithGovernance(gov),
+		api.WithMaxInflightSubmissions(cfg.MaxInflightSubmissions),
 	)
 	router := api.NewRouter(handlers,
 		api.WithMetricsEndpoint(promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})),
