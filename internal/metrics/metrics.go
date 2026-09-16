@@ -186,6 +186,33 @@ type Metrics struct {
 	// this phase provides instead, not a claim that the problem is
 	// solved.
 	AuthFailuresTotal *prometheus.CounterVec
+
+	// AdmissionRejectionsTotal is Phase 13's
+	// taskforge_admission_rejections_total (counter, labeled by code
+	// "429"/"503" and reason): mirrors AuthFailuresTotal{reason}'s Phase
+	// 12 precedent exactly -- server-side diagnostic detail (which of the
+	// two backpressure codes fired and why), while the caller-facing
+	// response body stays uniform and discloses nothing tenant-specific
+	// (docs/phase-13-plan.md §9, §12). reason is a small, fixed,
+	// developer-owned enum (e.g. "rate_limited", "capacity"), never a
+	// queue_name, principal id, or any other caller-supplied value.
+	AdmissionRejectionsTotal *prometheus.CounterVec
+
+	// RetentionRowsDeletedTotal is Phase 13's
+	// taskforge_retention_rows_deleted_total (counter, labeled by table):
+	// what the retention sweeper actually deleted, per
+	// docs/phase-13-plan.md §12's "an operator must be able to see
+	// retention actually running, not infer it silently happened."
+	RetentionRowsDeletedTotal *prometheus.CounterVec
+
+	// RetentionSweepDurationSeconds is Phase 13's
+	// taskforge_retention_sweep_duration_seconds (histogram, unlabeled).
+	RetentionSweepDurationSeconds prometheus.Histogram
+
+	// RetentionSweepErrorsTotal is Phase 13's
+	// taskforge_retention_sweep_errors_total (counter, unlabeled): sweep
+	// failures must not be silent.
+	RetentionSweepErrorsTotal prometheus.Counter
 }
 
 // New constructs a fresh Metrics instance backed by its own private
@@ -265,6 +292,27 @@ func New() *Metrics {
 			Name: "taskforge_auth_failures_total",
 			Help: "HTTP requests rejected by authentication, labeled by reason.",
 		}, []string{"reason"}),
+
+		AdmissionRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "taskforge_admission_rejections_total",
+			Help: "Submissions rejected by admission/rate-limit policy or system capacity, labeled by code and reason.",
+		}, []string{"code", "reason"}),
+
+		RetentionRowsDeletedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "taskforge_retention_rows_deleted_total",
+			Help: "Rows deleted by the retention sweeper, labeled by table.",
+		}, []string{"table"}),
+
+		RetentionSweepDurationSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "taskforge_retention_sweep_duration_seconds",
+			Help:    "Duration of each retention sweep/batch cycle.",
+			Buckets: prometheus.DefBuckets,
+		}),
+
+		RetentionSweepErrorsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "taskforge_retention_sweep_errors_total",
+			Help: "Count of retention sweep failures.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -280,6 +328,10 @@ func New() *Metrics {
 		m.HeartbeatsTotal,
 		m.IdempotentSubmissionHitsTotal,
 		m.AuthFailuresTotal,
+		m.AdmissionRejectionsTotal,
+		m.RetentionRowsDeletedTotal,
+		m.RetentionSweepDurationSeconds,
+		m.RetentionSweepErrorsTotal,
 	)
 
 	return m
@@ -387,4 +439,117 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.activeWorkers, prometheus.GaugeValue, float64(active))
+}
+
+// QueueDepthQuerier is the read-only contract behind
+// taskforge_queue_depth/taskforge_queue_running; *store.Store satisfies
+// it structurally.
+type QueueDepthQuerier interface {
+	QueueDepthAndRunningCounts(ctx context.Context) (map[string]map[string]int64, error)
+}
+
+// QueueLimitQuerier is the read-only contract behind
+// taskforge_queue_concurrency_limit; *governance.Store satisfies it
+// structurally. Kept as its own small interface (rather than folding into
+// QueueDepthQuerier) so this collector depends on neither internal/store
+// nor internal/governance directly, avoiding an import cycle either way.
+type QueueLimitQuerier interface {
+	ConcurrencyLimits(ctx context.Context) (map[string]int, error)
+}
+
+// queueStateCollector implements prometheus.Collector for Phase 13's
+// three queue-scoped gauges (docs/phase-13-plan.md §12):
+// taskforge_queue_depth (labeled queue_name, state), taskforge_queue_running
+// (labeled queue_name -- the state="RUNNING" slice of the same
+// underlying query, exposed under its own name per that section's
+// metrics table, mirroring ClaimLatencySeconds/QueueAgeSeconds's Phase 8
+// precedent of one measurement surfaced under two documented names), and
+// taskforge_queue_concurrency_limit (labeled queue_name, one series per
+// queue with a configured limit -- an unconfigured/unlimited queue has no
+// series at all, never a fabricated "unlimited" value).
+//
+// queue_name is cardinality-safe as a metric label: it is
+// operator-configured and bounded, exactly like job_type
+// (docs/observability.md's Cardinality Policy) -- never derived from
+// unbounded caller input.
+type queueStateCollector struct {
+	depth  QueueDepthQuerier
+	limits QueueLimitQuerier
+	logger *slog.Logger
+
+	queueDepth            *prometheus.Desc
+	queueRunning          *prometheus.Desc
+	queueConcurrencyLimit *prometheus.Desc
+}
+
+// NewQueueStateCollector returns a prometheus.Collector for the three
+// queue-scoped gauges above. Register it on m.Registry separately from
+// New() and NewStateCollector (which have no database/governance access)
+// -- see cmd/api's main.go for the wiring. Phase 8's cmd/worker does not
+// register this collector: cmd/worker has no dependency on
+// internal/governance today, and these three gauges are operator-facing
+// governance signals, not worker-execution signals.
+func NewQueueStateCollector(depth QueueDepthQuerier, limits QueueLimitQuerier, logger *slog.Logger) prometheus.Collector {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &queueStateCollector{
+		depth:  depth,
+		limits: limits,
+		logger: logger,
+		queueDepth: prometheus.NewDesc(
+			"taskforge_queue_depth",
+			"Live per-queue backlog, labeled by queue_name and state.",
+			[]string{"queue_name", "state"}, nil,
+		),
+		queueRunning: prometheus.NewDesc(
+			"taskforge_queue_running",
+			"Current concurrently-RUNNING count per queue, labeled by queue_name.",
+			[]string{"queue_name"}, nil,
+		),
+		queueConcurrencyLimit: prometheus.NewDesc(
+			"taskforge_queue_concurrency_limit",
+			"Configured concurrency cap per queue (from queue_limits), labeled by queue_name. No series for an unconfigured (unlimited) queue.",
+			[]string{"queue_name"}, nil,
+		),
+	}
+}
+
+func (c *queueStateCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.queueDepth
+	ch <- c.queueRunning
+	ch <- c.queueConcurrencyLimit
+}
+
+// Collect runs both durable-state queries fresh, every scrape -- same
+// discipline as stateCollector.Collect above: no in-memory bookkeeping to
+// drift, a query failure is logged and simply omits the affected metric.
+func (c *queueStateCollector) Collect(ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), scrapeTimeout)
+	defer cancel()
+
+	depth, err := c.depth.QueueDepthAndRunningCounts(ctx)
+	if err != nil {
+		c.logger.Warn("metrics: failed to scrape queue_depth/queue_running", "error", err)
+	} else {
+		for queueName, byState := range depth {
+			var running int64
+			for state, count := range byState {
+				ch <- prometheus.MustNewConstMetric(c.queueDepth, prometheus.GaugeValue, float64(count), queueName, state)
+				if state == "RUNNING" {
+					running = count
+				}
+			}
+			ch <- prometheus.MustNewConstMetric(c.queueRunning, prometheus.GaugeValue, float64(running), queueName)
+		}
+	}
+
+	limits, err := c.limits.ConcurrencyLimits(ctx)
+	if err != nil {
+		c.logger.Warn("metrics: failed to scrape queue_concurrency_limit", "error", err)
+		return
+	}
+	for queueName, limit := range limits {
+		ch <- prometheus.MustNewConstMetric(c.queueConcurrencyLimit, prometheus.GaugeValue, float64(limit), queueName)
+	}
 }

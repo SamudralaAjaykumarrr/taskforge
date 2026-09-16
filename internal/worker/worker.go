@@ -59,6 +59,10 @@ import (
 // against a real PostgreSQL-backed *store.Store.
 type Store interface {
 	Claim(ctx context.Context, workerID string) (*job.Job, bool, error)
+	// ClaimFromQueues is Phase 13's queue-subscription-aware claim
+	// (docs/phase-13-plan.md §6b/§8) -- used only when this Worker is
+	// configured with a non-empty queue subscription; see RunOnce.
+	ClaimFromQueues(ctx context.Context, workerID string, queueNames []string) (*job.Job, bool, error)
 	Heartbeat(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, extension time.Duration) (*job.Job, error)
 	CompleteSuccess(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, resultMetadata []byte) (*job.Job, error)
 	CompleteFailure(ctx context.Context, id uuid.UUID, leaseOwner string, leaseGeneration int64, errMessage, errClass string) (*job.Job, error)
@@ -91,6 +95,12 @@ type Worker struct {
 	logger       *slog.Logger
 	retryConfig  retry.Config
 	rand         retry.RandSource
+	// queues is Phase 13's queue-subscription filter
+	// (docs/phase-13-plan.md §8/§14). nil (the default from New) means
+	// "claim from every queue" -- the mandatory compatibility behavior; a
+	// non-empty value, set via SetQueues, restricts both a fresh claim and
+	// a reclaim of an expired lease identically (§6b).
+	queues []string
 }
 
 // New constructs a Worker. id is the lease_owner value recorded on every
@@ -127,13 +137,41 @@ func (w *Worker) SetRetryConfig(cfg retry.Config) { w.retryConfig = cfg }
 // a deterministic retry.RandSource to assert exact backoff boundaries.
 func (w *Worker) SetRandSource(src retry.RandSource) { w.rand = src }
 
+// SetQueues configures this Worker's queue subscription
+// (docs/phase-13-plan.md §8, TASKFORGE_WORKER_QUEUES). Passing nil or an
+// empty slice restores the default (claim from every queue) --
+// SetQueues(nil) is a valid, meaningful call, not a no-op; it is how a
+// caller explicitly requests the queue-blind default rather than merely
+// never calling this method, and both produce the identical behavior a
+// pre-Phase-13 Worker already had.
+func (w *Worker) SetQueues(queues []string) {
+	if len(queues) == 0 {
+		w.queues = nil
+		return
+	}
+	w.queues = queues
+}
+
 // RunOnce attempts to claim and fully execute a single job (which may be a
 // fresh QUEUED/RETRY_WAIT job, or a reclaim of a previously RUNNING job
 // whose lease expired — internal/store.Claim treats both identically). It
 // returns claimed=false (with a nil error) when there was nothing eligible
 // to claim, which is the normal steady-state outcome, not a failure.
+//
+// Phase 13: a Worker with no configured queue subscription (w.queues ==
+// nil, the default from New) calls Claim -- claim from every queue,
+// exactly as every pre-Phase-13 Worker already did. A Worker configured
+// via SetQueues calls ClaimFromQueues instead, restricting both a fresh
+// claim and a reclaim of an expired lease identically
+// (docs/phase-13-plan.md §6b) to that subscription.
 func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
-	j, ok, err := w.store.Claim(ctx, w.ID)
+	var j *job.Job
+	var ok bool
+	if w.queues == nil {
+		j, ok, err = w.store.Claim(ctx, w.ID)
+	} else {
+		j, ok, err = w.store.ClaimFromQueues(ctx, w.ID, w.queues)
+	}
 	if err != nil {
 		return false, err
 	}

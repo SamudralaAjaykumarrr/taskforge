@@ -46,6 +46,7 @@ import (
 
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/buildinfo"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/config"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/governance"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/principal"
 )
 
@@ -66,8 +67,26 @@ func usage() string {
 		"  revoke-key        -key-id=<key_id>",
 		"  revoke-principal  -principal=<uuid>",
 		"  list-principals",
+		"  set-queue-limit   -queue=<name> [-concurrency=<N>|-unlimited]",
+		"  set-rate-limit    -queue=<name> -rate=<per-sec> -burst=<N>",
+		"  clear-rate-limit  -queue=<name>",
+		"  show-queue-state",
 		"  version",
 	}, "\n")
+}
+
+// governanceCommands are handled entirely by internal/governance and need
+// neither TASKFORGE_API_KEY_PEPPER nor internal/principal.Store -- an
+// operator managing queue/rate-limit configuration should not be forced
+// to have the credential pepper on hand at all (docs/phase-13-plan.md §8:
+// this configuration is operator-tool-managed, not an HTTP surface, but
+// it is also a DISTINCT concern from key lifecycle, and the two must not
+// be coupled through a shared, unrelated startup requirement).
+var governanceCommands = map[string]bool{
+	"set-queue-limit":  true,
+	"set-rate-limit":   true,
+	"clear-rate-limit": true,
+	"show-queue-state": true,
 }
 
 func run(args []string) error {
@@ -78,6 +97,36 @@ func run(args []string) error {
 	if cmd == "version" {
 		fmt.Println("taskforge-admin " + buildinfo.String())
 		return nil
+	}
+
+	if governanceCommands[cmd] {
+		dbCfg, err := config.FromEnv()
+		if err != nil {
+			return err
+		}
+		db, err := sql.Open("pgx", dbCfg.DatabaseURL)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			return err
+		}
+
+		g := governance.New(db)
+		switch cmd {
+		case "set-queue-limit":
+			return setQueueLimit(ctx, g, rest)
+		case "set-rate-limit":
+			return setRateLimit(ctx, g, rest)
+		case "clear-rate-limit":
+			return clearRateLimit(ctx, g, rest)
+		case "show-queue-state":
+			return showQueueState(ctx, g, rest)
+		}
 	}
 
 	// The pepper is mandatory for every command that touches api_keys,
@@ -257,4 +306,123 @@ func splitScopes(raw string) []string {
 		}
 	}
 	return out
+}
+
+// setQueueLimit implements `set-queue-limit -queue=<name>
+// [-concurrency=<N>|-unlimited]` (docs/phase-13-plan.md §8). Exactly one
+// of -concurrency or -unlimited must be given: this tool distinguishes
+// "set a limit" from "explicitly remove any limit" rather than trying to
+// infer the operator's intent from a single ambiguous flag, and
+// -concurrency=0 is rejected by internal/governance itself (SF-041 --
+// distinct from -unlimited, never silently equivalent to it).
+func setQueueLimit(ctx context.Context, g *governance.Store, args []string) error {
+	fs := flag.NewFlagSet("set-queue-limit", flag.ContinueOnError)
+	queue := fs.String("queue", "", "queue_name to configure (required)")
+	concurrency := fs.Int("concurrency", -1, "concurrency limit (positive integer)")
+	unlimited := fs.Bool("unlimited", false, "explicitly remove any concurrency limit")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *queue == "" {
+		return fmt.Errorf("-queue is required")
+	}
+	if *unlimited == (*concurrency >= 0) {
+		return fmt.Errorf("specify exactly one of -concurrency=<N> or -unlimited")
+	}
+
+	var limit *int
+	if !*unlimited {
+		limit = concurrency
+	}
+	if err := g.SetConcurrencyLimit(ctx, *queue, limit); err != nil {
+		return err
+	}
+	if limit == nil {
+		fmt.Printf("queue %q: concurrency limit removed (unlimited)\n", *queue)
+	} else {
+		fmt.Printf("queue %q: concurrency limit set to %d\n", *queue, *limit)
+	}
+	return nil
+}
+
+// setRateLimit implements `set-rate-limit -queue=<name> -rate=<per-sec>
+// -burst=<N>`.
+func setRateLimit(ctx context.Context, g *governance.Store, args []string) error {
+	fs := flag.NewFlagSet("set-rate-limit", flag.ContinueOnError)
+	queue := fs.String("queue", "", "queue_name to configure (required)")
+	rate := fs.Float64("rate", 0, "sustained submissions per second (required, positive)")
+	burst := fs.Int("burst", 0, "token-bucket burst size (required, positive)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *queue == "" {
+		return fmt.Errorf("-queue is required")
+	}
+	if err := g.SetRateLimit(ctx, *queue, *rate, *burst); err != nil {
+		return err
+	}
+	fmt.Printf("queue %q: rate limit set to %.4g/s, burst %d\n", *queue, *rate, *burst)
+	return nil
+}
+
+// clearRateLimit implements `clear-rate-limit -queue=<name>`.
+func clearRateLimit(ctx context.Context, g *governance.Store, args []string) error {
+	fs := flag.NewFlagSet("clear-rate-limit", flag.ContinueOnError)
+	queue := fs.String("queue", "", "queue_name to clear (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *queue == "" {
+		return fmt.Errorf("-queue is required")
+	}
+	if err := g.ClearRateLimit(ctx, *queue); err != nil {
+		return err
+	}
+	fmt.Printf("queue %q: rate limit cleared\n", *queue)
+	return nil
+}
+
+// showQueueState implements `show-queue-state`: current limits plus live
+// concurrency/rate-bucket state, read-only operator visibility --
+// docs/phase-13-plan.md §8's CLI-side complement to §12's metrics, for an
+// operator who wants a point-in-time snapshot without a Prometheus query.
+func showQueueState(ctx context.Context, g *governance.Store, args []string) error {
+	fs := flag.NewFlagSet("show-queue-state", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	states, err := g.ListQueueState(ctx)
+	if err != nil {
+		return err
+	}
+	if len(states) == 0 {
+		fmt.Println("no queues known (none configured, none ever submitted to)")
+		return nil
+	}
+
+	fmt.Printf("%-20s %-10s %-8s %-14s %-16s %-10s %s\n",
+		"QUEUE", "CONCURRENCY", "SLOTS", "RATE/BURST", "TOKENS", "LAST_CLAIMED", "")
+	for _, st := range states {
+		concurrency := "unlimited"
+		if st.ConcurrencyLimit != nil {
+			concurrency = fmt.Sprintf("%d", *st.ConcurrencyLimit)
+		}
+		slots := fmt.Sprintf("%d/%d", st.SlotsHeld, st.SlotsTotal)
+		rate := "none"
+		if st.RateLimitPerSec != nil && st.RateLimitBurst != nil {
+			rate = fmt.Sprintf("%.4g/s,%d", *st.RateLimitPerSec, *st.RateLimitBurst)
+		}
+		tokens := "-"
+		if st.RateTokens != nil {
+			tokens = fmt.Sprintf("%.2f", *st.RateTokens)
+		}
+		lastClaimed := "never"
+		if st.LastClaimedAt != nil {
+			lastClaimed = st.LastClaimedAt.UTC().Format(time.RFC3339)
+		}
+		fmt.Printf("%-20s %-10s %-8s %-14s %-16s %-10s\n",
+			st.QueueName, concurrency, slots, rate, tokens, lastClaimed)
+	}
+	return nil
 }

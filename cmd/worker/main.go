@@ -116,6 +116,10 @@ func run(logger *slog.Logger) error {
 
 	workerID := fmt.Sprintf("worker-%d-%s", os.Getpid(), hostname())
 	w := worker.New(workerID, st, registry, cfg.WorkerPollInterval, logger)
+	w.SetQueues(cfg.WorkerQueues)
+	if len(cfg.WorkerQueues) > 0 {
+		logger.Info("worker queue subscription configured", "queues", cfg.WorkerQueues)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

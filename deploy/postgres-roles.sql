@@ -59,6 +59,15 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'taskforge_worker') THEN
         CREATE ROLE taskforge_worker LOGIN PASSWORD 'CHANGE_ME_worker';
     END IF;
+    -- Phase 13 (docs/phase-13-plan.md §9, §15; docs/security-model.md §2's
+    -- own forward-reference): a third, even-more-restricted role for the
+    -- retention sweeper. "workers do not need DELETE on jobs if Phase 13's
+    -- retention cleanup runs under its own, narrower-scoped role" -- this
+    -- is that role. Neither taskforge_api nor taskforge_worker gains
+    -- DELETE anywhere in this script; only this role ever does.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'taskforge_retention') THEN
+        CREATE ROLE taskforge_retention LOGIN PASSWORD 'CHANGE_ME_retention';
+    END IF;
 END
 $$;
 
@@ -68,15 +77,15 @@ $$;
 -- into, not a hardcoded "taskforge".
 DO $$
 BEGIN
-    EXECUTE format('GRANT CONNECT ON DATABASE %I TO taskforge_api, taskforge_worker', current_database());
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO taskforge_api, taskforge_worker, taskforge_retention', current_database());
 END
 $$;
 
-GRANT USAGE ON SCHEMA public TO taskforge_api, taskforge_worker;
+GRANT USAGE ON SCHEMA public TO taskforge_api, taskforge_worker, taskforge_retention;
 
--- Neither role may create objects in the schema. Migrations run as the
--- owner, not as either of these.
-REVOKE CREATE ON SCHEMA public FROM taskforge_api, taskforge_worker;
+-- No role may create objects in the schema. Migrations run as the owner,
+-- not as any of these.
+REVOKE CREATE ON SCHEMA public FROM taskforge_api, taskforge_worker, taskforge_retention;
 
 -- ------------------------------------------------------------
 -- taskforge_api: the HTTP surface
@@ -100,6 +109,25 @@ GRANT SELECT                  ON api_keys           TO taskforge_api;
 -- rewrite a secret_hash.
 GRANT UPDATE (last_used_at) ON api_keys TO taskforge_api;
 
+-- Phase 13 (docs/phase-13-plan.md §7, §9): the API server inserts a job or
+-- workflow-node row that may name a queue_name never seen before, and the
+-- INSERT that creates it also upserts a queue_state row for that queue in
+-- the SAME statement (internal/store's insertJobQuery/insertWorkflowNodeJob
+-- -- a data-modifying CTE, not a second round trip), so this grant is
+-- exercised by the ordinary submission path, not a separate governance
+-- feature. taskforge_api never needs UPDATE or DELETE on queue_state --
+-- last_claimed_at is written only by the claim path (taskforge_worker).
+GRANT SELECT, INSERT ON queue_state TO taskforge_api;
+
+-- Static concurrency/rate-limit configuration (read-only from the API's
+-- perspective -- cmd/taskforge-admin, run under the owner role, is the
+-- only writer) and durable rate-limit token-bucket state (read-write: the
+-- API server's own admission check refills and debits it on every
+-- submission attempt, docs/phase-13-plan.md §7/§13's "must survive a
+-- restart" requirement).
+GRANT SELECT                  ON queue_limits       TO taskforge_api;
+GRANT SELECT, INSERT, UPDATE  ON rate_limit_buckets  TO taskforge_api;
+
 -- ------------------------------------------------------------
 -- taskforge_worker: the execution fleet
 -- ------------------------------------------------------------
@@ -116,14 +144,47 @@ GRANT SELECT                  ON workflow_nodes     TO taskforge_worker;
 -- can see the decision: a worker cannot read or write credentials.
 REVOKE ALL ON principals, api_keys FROM taskforge_worker;
 
+-- Phase 13 (ADR-0009): the claim query's slot-table concurrency mechanism
+-- and last_claimed_at fairness ordering both live entirely in the worker's
+-- own claim transaction. The worker never reads queue_limits at all --
+-- "does queue Q have configured capacity" is answered entirely by whether
+-- queue_slots has any rows for Q (provisioned by cmd/taskforge-admin under
+-- the owner role), so taskforge_worker needs no grant on queue_limits.
+GRANT SELECT, UPDATE          ON queue_slots  TO taskforge_worker;
+GRANT SELECT, INSERT, UPDATE  ON queue_state  TO taskforge_worker;
+
 -- ------------------------------------------------------------
--- Neither role may DELETE anything
+-- taskforge_retention: the retention sweeper (Phase 13, docs/phase-13-plan.md
+-- §9, §15)
 -- ------------------------------------------------------------
--- No TaskForge code path issues a DELETE against any of these tables
--- (TF-INV-005: terminal states are never reopened, and rows are never
--- removed). Retention/cleanup is a Phase 13 concern and will get its own,
--- narrower role when it exists -- it is not granted here in advance.
+-- The narrowest role in this script, deliberately: SELECT (to find
+-- expired rows) and DELETE (to prune them) on exactly the four
+-- retention-eligible tables, and nothing else -- no INSERT, no UPDATE, no
+-- access to jobs' governance/credential neighbors. This is the role
+-- docs/security-model.md §2 forward-referenced: "workers do not need
+-- DELETE on jobs if Phase 13's retention cleanup runs under its own,
+-- narrower-scoped role."
+GRANT SELECT, DELETE ON jobs                TO taskforge_retention;
+GRANT SELECT, DELETE ON job_attempts        TO taskforge_retention;
+GRANT SELECT, DELETE ON workflow_instances  TO taskforge_retention;
+GRANT SELECT, DELETE ON workflow_nodes      TO taskforge_retention;
+REVOKE ALL ON principals, api_keys, queue_state, queue_limits, queue_slots, rate_limit_buckets
+    FROM taskforge_retention;
+
+-- ------------------------------------------------------------
+-- No role may DELETE anything outside its own narrow retention grant
+-- ------------------------------------------------------------
+-- No TaskForge code path other than the retention sweeper issues a DELETE
+-- against any of these tables (TF-INV-005: terminal states are never
+-- reopened, and non-retention rows are never removed). taskforge_api and
+-- taskforge_worker are explicitly denied DELETE everywhere, including the
+-- new Phase 13 tables -- neither the submission path nor the claim path
+-- ever deletes a queue_state/queue_slots/rate_limit_buckets row; a queue's
+-- slot count is reconciled (rows added or removed) only by
+-- cmd/taskforge-admin under the owner role.
 REVOKE DELETE ON jobs, job_attempts, workflow_instances, workflow_nodes, principals, api_keys
+    FROM taskforge_api, taskforge_worker;
+REVOKE DELETE ON queue_state, queue_limits, queue_slots, rate_limit_buckets
     FROM taskforge_api, taskforge_worker;
 
 -- ------------------------------------------------------------
@@ -162,4 +223,4 @@ REVOKE DELETE ON jobs, job_attempts, workflow_instances, workflow_nodes, princip
 -- and TestMigrateUp_UnderLeastPrivilegeRole_CannotApplyAPendingMigration,
 -- which connect as these roles for real rather than only asking the catalog
 -- what they are allowed to do.
-GRANT SELECT ON schema_migrations TO taskforge_api, taskforge_worker;
+GRANT SELECT ON schema_migrations TO taskforge_api, taskforge_worker, taskforge_retention;

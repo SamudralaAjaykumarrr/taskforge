@@ -46,7 +46,7 @@ func applyRoleScript(t *testing.T, db *sql.DB) {
 	require.NoError(t, err, "deploy/postgres-roles.sql must exist")
 
 	t.Cleanup(func() {
-		for _, role := range []string{"taskforge_api", "taskforge_worker"} {
+		for _, role := range []string{"taskforge_api", "taskforge_worker", "taskforge_retention"} {
 			// DROP OWNED first: a role holding privileges cannot be
 			// dropped while any grant still references it.
 			if _, err := db.ExecContext(context.Background(), `DROP OWNED BY `+role); err != nil {
@@ -289,7 +289,7 @@ const rolePassword = "phase12-role-audit-password"
 
 func setRolePasswords(t *testing.T, db *sql.DB) {
 	t.Helper()
-	for _, role := range []string{"taskforge_api", "taskforge_worker"} {
+	for _, role := range []string{"taskforge_api", "taskforge_worker", "taskforge_retention"} {
 		_, err := db.ExecContext(context.Background(),
 			`ALTER ROLE `+role+` PASSWORD '`+rolePassword+`'`)
 		require.NoError(t, err, "set a usable password on %s", role)

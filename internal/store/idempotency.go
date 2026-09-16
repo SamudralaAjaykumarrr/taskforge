@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -138,10 +139,30 @@ func (s *Store) InsertIdempotent(ctx context.Context, p job.NewParams) (*job.Job
 // above and the pgx.Tx-based InsertTx (tx.go, Phase 11) -- both paths must
 // create a durable jobs row with identical shape, so there is exactly one
 // copy of this statement.
+//
+// Phase 13: the INSERT is wrapped in a data-modifying CTE so the same
+// statement also upserts a queue_state row for $9's queue_name, in the
+// SAME round trip and the SAME transaction as the job row itself --
+// docs/phase-13-plan.md's fairness roster (internal/store/claim.go's
+// pickClaimCandidateQuery) enumerates queue_state, so a queue_name that
+// has never been submitted before must become discoverable at the moment
+// its first job is, not later. ON CONFLICT DO NOTHING means a queue_name
+// every prior submission already registered costs nothing extra here.
+// jobColumns' "jobs."-qualified column list is valid inside the CTE's own
+// RETURNING clause (the target relation is in scope there, exactly as it
+// already was in the RETURNING of the unwrapped INSERT this replaces);
+// the outer SELECT then reads those same columns, by position, off "ins".
 const insertJobQuery = `
-	INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key, scheduled_at, eligible_at)
-	VALUES ($1, $8, $2, $3, 'QUEUED', $4, $5, $6, $7, COALESCE($7, now()))
-	RETURNING ` + jobColumns
+	WITH ins AS (
+		INSERT INTO jobs (id, principal_id, job_type, payload, state, max_attempts, execution_timeout_seconds, idempotency_key, scheduled_at, eligible_at, queue_name)
+		VALUES ($1, $8, $2, $3, 'QUEUED', $4, $5, $6, $7, COALESCE($7, now()), $9)
+		RETURNING ` + jobColumns + `
+	), qs AS (
+		INSERT INTO queue_state (queue_name)
+		SELECT queue_name FROM ins
+		ON CONFLICT (queue_name) DO NOTHING
+	)
+	SELECT * FROM ins`
 
 // insertJobArgs generates a fresh job id and builds insertJobQuery's
 // positional arguments from p, shared by InsertIdempotent and InsertTx.
@@ -171,7 +192,22 @@ func insertJobArgs(p job.NewParams) (uuid.UUID, []any) {
 	// insert fails on the foreign key. Failing loudly on an unattributed
 	// submission is the point: there is no silent fallback identity
 	// anywhere on this path (docs/phase-12-plan.md §6b, OD-1/OD-4).
-	return id, []any{id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey, scheduledAt, p.PrincipalID}
+	return id, []any{id, p.JobType, p.Payload, p.MaxAttempts, p.ExecutionTimeoutSeconds, idemKey, scheduledAt, p.PrincipalID, queueNameOrDefault(p.QueueName)}
+}
+
+// queueNameOrDefault guards against an empty QueueName reaching the
+// INSERT: every ValidateSubmission/ValidateQueueName caller already
+// defaults to job.DefaultQueueName, but a caller that constructs
+// job.NewParams directly (bypassing validation) must not be able to
+// insert an empty string into a NOT NULL column that has its own,
+// different schema default -- an explicit value, even empty, always wins
+// over a column DEFAULT in PostgreSQL, so this is the actual backstop,
+// not merely documentation.
+func queueNameOrDefault(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return job.DefaultQueueName
+	}
+	return name
 }
 
 // GetByIdempotencyKey returns the job durably mapped to (principalID,

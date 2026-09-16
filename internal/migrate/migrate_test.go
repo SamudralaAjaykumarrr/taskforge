@@ -4,6 +4,7 @@ package migrate_test
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -227,7 +228,7 @@ func TestUp_UpgradesPhase1SchemaToPhase2(t *testing.T) {
 		migratedVersions = append(migratedVersions, v)
 	}
 	require.NoError(t, rows.Err())
-	require.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, migratedVersions)
+	require.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}, migratedVersions)
 
 	// Phase 12's own half of this upgrade: the pre-existing row, inserted
 	// with no principal at all, must come out of migrate.Up attributed to
@@ -441,7 +442,12 @@ func TestFiles_ExactlySevenMigrationsEmbedded(t *testing.T) {
 	// because internal/migrate holds every lock a file takes until that
 	// file commits -- see docs/phase-12-plan.md §5 "Why six files, not
 	// three".
-	require.Equal(t, 10, upFiles)
+	//
+	// Phase 13 adds four more (docs/phase-13-plan.md §17, §11): 0011
+	// (queue_name), 0012 (the queue-aware claimable/reclaimable indexes),
+	// 0013 (the governance tables), and 0014 (the contract-step drop of
+	// the old, non-queue-aware claimable index) -- 10 + 4 = 14.
+	require.Equal(t, 14, upFiles)
 }
 
 // dropPhase12Schema rewinds a migrated database to its pre-Phase-12 shape:
@@ -465,6 +471,16 @@ func dropPhase12Schema(t *testing.T, db *sql.DB) {
 	// half-migrated database.
 	restorePhase12Schema(t, db)
 	for _, name := range []string{
+		// Phase 13's queue_limits.principal_id and queue_slots.held_by_job_id
+		// foreign keys (migration 0013) reference principals and jobs
+		// respectively -- 0005's down migration cannot drop principals
+		// while queue_limits still references it. Rewinding all the way to
+		// pre-Phase-12 must therefore rewind past Phase 13 first, exactly
+		// as a real deployment would have to.
+		"0014_drop_old_claimable_index.down.sql",
+		"0013_create_governance_tables.down.sql",
+		"0012_create_claimable_by_queue_index.down.sql",
+		"0011_add_queue_name.down.sql",
 		"0010_drop_global_idempotency_index.down.sql",
 		"0009_validate_principal_id_and_scope_idempotency.down.sql",
 		"0008_require_principal_id.down.sql",
@@ -477,7 +493,7 @@ func dropPhase12Schema(t *testing.T, db *sql.DB) {
 		_, err = db.ExecContext(ctx, string(sqlText))
 		require.NoError(t, err, "applying %s", name)
 	}
-	_, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10)`)
+	_, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14)`)
 	require.NoError(t, err)
 }
 
@@ -494,16 +510,34 @@ func restorePhase12Schema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx := context.Background()
+
+		// Phase 13's queue_slots.held_by_job_id references jobs -- TRUNCATE
+		// refuses to empty jobs while any OTHER table's live foreign key
+		// references it, unless that table is included in the SAME
+		// statement (regardless of whether it currently has rows). Whether
+		// queue_slots exists at this point depends on whether the test body
+		// re-ran migrate.Up (some of these tests do, to reach a fully
+		// migrated state partway through; others only ever run
+		// dropPhase12Schema and never migrate forward again before this
+		// cleanup fires) -- so its presence is checked rather than assumed.
+		truncateTargets := []string{"job_attempts", "workflow_nodes", "workflow_instances", "jobs", "api_keys"}
+		var hasQueueSlots bool
+		if err := db.QueryRowContext(ctx, `SELECT to_regclass('queue_slots') IS NOT NULL`).Scan(&hasQueueSlots); err != nil {
+			t.Logf("restorePhase12Schema: check queue_slots existence: %v", err)
+		} else if hasQueueSlots {
+			truncateTargets = append([]string{"queue_slots"}, truncateTargets...)
+		}
+
 		stmts := []string{
 			// Divergent rows left behind by a rollback test would make
 			// 0009's unique index un-creatable.
-			`TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs, api_keys`,
+			`TRUNCATE TABLE ` + strings.Join(truncateTargets, ", "),
 			`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_principal_id_not_null`,
 			`ALTER TABLE workflow_instances DROP CONSTRAINT IF EXISTS workflow_instances_principal_id_not_null`,
 			`DROP INDEX IF EXISTS idx_jobs_idempotency_scoped`,
 			`DROP INDEX IF EXISTS idx_jobs_principal_id`,
 			`DROP INDEX IF EXISTS idx_workflow_instances_principal_id`,
-			`DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10)`,
+			`DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14)`,
 		}
 		for _, stmt := range stmts {
 			if _, err := db.ExecContext(ctx, stmt); err != nil {

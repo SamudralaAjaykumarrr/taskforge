@@ -7,6 +7,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -57,6 +59,26 @@ type Config struct {
 	// documented risk for this phase (docs/phase-12-plan.md §14); no
 	// secrets-manager integration is in scope.
 	APIKeyPepper []byte
+
+	// MaxInflightSubmissions bounds concurrent in-flight POST
+	// /jobs/POST /workflows handler executions in cmd/api
+	// (docs/phase-13-plan.md §8 OD-6); exceeding it is the 503
+	// system-capacity signal. 0 (the default) disables the bound
+	// entirely -- the pre-Phase-13 behavior. This numeric default is an
+	// implementation decision this plan explicitly leaves open, like
+	// ActiveWorkerWindow's.
+	MaxInflightSubmissions int
+
+	// WorkerQueues is Phase 13's queue-subscription filter
+	// (docs/phase-13-plan.md §6b/§8/§14): the queue_name values a worker
+	// process claims from (both branches of the claim query identically —
+	// a fresh claim and a reclaim of an expired lease alike). nil means
+	// "claim from every queue" -- the mandatory compatibility default: an
+	// old (pre-Phase-13) worker binary has no queue_name predicate at all
+	// and behaves identically, and a new worker binary with
+	// TASKFORGE_WORKER_QUEUES unset must reproduce that exact behavior,
+	// not silently narrow to "default" only. See FromEnv's doc comment.
+	WorkerQueues []string
 }
 
 // MinAPIKeyPepperLength is the shortest pepper cmd/api will start with.
@@ -78,6 +100,18 @@ const MinAPIKeyPepperLength = 32
 //	  time.ParseDuration)
 //	TASKFORGE_API_KEY_PEPPER (required by cmd/api; at least
 //	  MinAPIKeyPepperLength bytes -- see FromEnvRequiringPepper)
+//	TASKFORGE_WORKER_QUEUES (Phase 13, docs/phase-13-plan.md §8; default
+//	  unset, comma-separated queue_name values). Unset (or a value that is
+//	  empty/all-whitespace after splitting and trimming) means "claim from
+//	  every queue" -- NOT "claim only from 'default'". This is stated as a
+//	  hard requirement, not a preference: an operator who upgrades worker
+//	  binaries without also updating configuration must not silently
+//	  strand any job submitted to a non-default queue. Only a worker an
+//	  operator has deliberately configured with a non-empty value is
+//	  restricted at all.
+//	TASKFORGE_MAX_INFLIGHT_SUBMISSIONS (Phase 13, docs/phase-13-plan.md
+//	  §8 OD-6; default "0", parsed as an integer). 0 or unset disables the
+//	  system-capacity 503 bound entirely.
 //
 // FromEnv itself does NOT require the pepper, because cmd/worker and the
 // chaos harness legitimately have no HTTP surface and no credentials to
@@ -117,14 +151,44 @@ func FromEnv() (Config, error) {
 		activeWorkerWindow = d
 	}
 
+	maxInflight := 0
+	if raw := os.Getenv("TASKFORGE_MAX_INFLIGHT_SUBMISSIONS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid TASKFORGE_MAX_INFLIGHT_SUBMISSIONS %q: %w", raw, err)
+		}
+		if n < 0 {
+			return Config{}, fmt.Errorf("config: TASKFORGE_MAX_INFLIGHT_SUBMISSIONS must not be negative")
+		}
+		maxInflight = n
+	}
+
 	return Config{
-		DatabaseURL:        dbURL,
-		HTTPAddr:           addr,
-		WorkerPollInterval: pollInterval,
-		MetricsAddr:        metricsAddr,
-		ActiveWorkerWindow: activeWorkerWindow,
-		APIKeyPepper:       []byte(os.Getenv(envAPIKeyPepper)),
+		DatabaseURL:            dbURL,
+		HTTPAddr:               addr,
+		WorkerPollInterval:     pollInterval,
+		MetricsAddr:            metricsAddr,
+		ActiveWorkerWindow:     activeWorkerWindow,
+		APIKeyPepper:           []byte(os.Getenv(envAPIKeyPepper)),
+		WorkerQueues:           parseWorkerQueues(os.Getenv("TASKFORGE_WORKER_QUEUES")),
+		MaxInflightSubmissions: maxInflight,
 	}, nil
+}
+
+// parseWorkerQueues splits raw on commas and trims each element, dropping
+// empty entries. An empty/all-whitespace raw (including "" -- the unset
+// case) returns nil, never an empty-but-non-nil slice: internal/store's
+// Claim/ClaimFromQueues split treats nil specifically as "no subscription
+// filter" (see internal/store/claim.go's queueNameArrayLiteral), so this
+// must never collapse "unset" into "subscribed to nothing."
+func parseWorkerQueues(raw string) []string {
+	var queues []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			queues = append(queues, trimmed)
+		}
+	}
+	return queues
 }
 
 // envAPIKeyPepper is the environment variable holding the API-key pepper.

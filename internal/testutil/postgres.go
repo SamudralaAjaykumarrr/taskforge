@@ -193,8 +193,17 @@ func DB(t *testing.T) *sql.DB {
 	// it, but credentials must not leak between tests) and principals
 	// afterwards, in dependency order: jobs and workflow_instances both
 	// reference principals, so they have to be emptied first.
-	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE job_attempts, workflow_nodes, workflow_instances, jobs, api_keys`); err != nil {
+	//
+	// Phase 13 adds queue_slots (references jobs via held_by_job_id, so it
+	// must be in the same TRUNCATE statement as jobs per the comment
+	// above) and, separately, queue_state/queue_limits/rate_limit_buckets
+	// (nothing references them, but they are governance/runtime state a
+	// previous test may have written and must not leak either).
+	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE queue_slots, job_attempts, workflow_nodes, workflow_instances, jobs, api_keys`); err != nil {
 		t.Fatalf("testutil: truncate tables: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE queue_state, queue_limits, rate_limit_buckets`); err != nil {
+		t.Fatalf("testutil: truncate governance tables: %v", err)
 	}
 	// The system principal (migration 0005's seed row) is deliberately
 	// preserved: it is schema, not test data, and migration 0007's
@@ -203,6 +212,13 @@ func DB(t *testing.T) *sql.DB {
 	if _, err := db.ExecContext(ctx,
 		`DELETE FROM principals WHERE id <> $1`, principal.SystemPrincipalID); err != nil {
 		t.Fatalf("testutil: reset principals: %v", err)
+	}
+	// Mirrors migration 0013's own seed: the fairness roster must never be
+	// empty for the 'default' queue, even immediately after a truncate --
+	// see queue_state's table comment in that migration.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO queue_state (queue_name) VALUES ('default') ON CONFLICT (queue_name) DO NOTHING`); err != nil {
+		t.Fatalf("testutil: reseed default queue_state: %v", err)
 	}
 
 	return db

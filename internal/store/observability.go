@@ -39,6 +39,39 @@ func (s *Store) JobStateCounts(ctx context.Context) (map[string]int64, error) {
 	return counts, nil
 }
 
+// QueueDepthAndRunningCounts returns the current count of jobs in each
+// (queue_name, state) pair (SELECT queue_name, state, count(*) FROM jobs
+// GROUP BY queue_name, state), per docs/phase-13-plan.md §12's
+// taskforge_queue_depth gauge. taskforge_queue_running is the same data's
+// state="RUNNING" slice -- both metrics are populated from this one
+// query (see internal/metrics.NewQueueStateCollector), matching this
+// package's existing single-query-for-two-metric-names precedent
+// (ClaimLatencySeconds/QueueAgeSeconds, Phase 8).
+func (s *Store) QueueDepthAndRunningCounts(ctx context.Context) (map[string]map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT queue_name, state, count(*) FROM jobs GROUP BY queue_name, state`)
+	if err != nil {
+		return nil, fmt.Errorf("store: queue depth and running counts: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[string]map[string]int64)
+	for rows.Next() {
+		var queueName, state string
+		var count int64
+		if err := rows.Scan(&queueName, &state, &count); err != nil {
+			return nil, fmt.Errorf("store: queue depth and running counts: scan: %w", err)
+		}
+		if counts[queueName] == nil {
+			counts[queueName] = make(map[string]int64)
+		}
+		counts[queueName][state] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: queue depth and running counts: %w", err)
+	}
+	return counts, nil
+}
+
 // ActiveWorkerCount returns the number of distinct lease_owner values
 // with a heartbeat_at within the last window, per
 // docs/observability.md's taskforge_active_workers gauge ("distinct

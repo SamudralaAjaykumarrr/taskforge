@@ -1,0 +1,31 @@
+-- Phase 13 (docs/phase-13-plan.md §11), contract step: retire the
+-- pre-Phase-13 idx_jobs_claimable index now that idx_jobs_claimable_by_queue
+-- (0012) is live and internal/store/claim.go's claim query has been cut
+-- over to filter by queue_name (this phase's implementation ships the
+-- schema and the code change together, so there is no window in which a
+-- running binary still depends on the old index's exact shape).
+--
+-- LOCK PROFILE: ACCESS EXCLUSIVE, catalog-only, O(1) once acquired
+-- ---------------------------------------------------------------------
+-- DROP INDEX needs ACCESS EXCLUSIVE on jobs and performs no scan --
+-- identical in kind to migration 0010's retirement of the old global
+-- idempotency index, and isolated in its own file for the identical
+-- reason: appended to 0012's file it would make that file's whole
+-- transaction -- including the index-build work already performed --
+-- queue behind this stronger lock, and PostgreSQL queues every new lock
+-- request behind a waiting stronger one, so ordinary readers would queue
+-- behind it too. Isolating it means 0012's build commits and becomes
+-- durable first, and only this one-statement transaction waits.
+--
+-- Deployment note: like all DDL this must WAIT for any conflicting lock
+-- currently held on jobs, and queues new requests behind it while
+-- waiting. Set lock_timeout and retry if the deployment window is busy;
+-- re-running is safe (IF EXISTS).
+--
+-- Unlike migration 0010's drop (which could not safely resurrect the old
+-- unique index without re-validating uniqueness against potentially
+-- divergent data), this drop's down migration can recreate the old index
+-- unconditionally: it is an ordinary non-unique index with no
+-- data-uniqueness constraint that could fail on rebuild.
+
+DROP INDEX IF EXISTS idx_jobs_claimable;

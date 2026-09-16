@@ -243,6 +243,12 @@ func (s *Store) CompleteCancelled(ctx context.Context, id uuid.UUID, leaseOwner 
 		return nil, err
 	}
 
+	// Phase 13 (ADR-0009): this job stops being RUNNING here, so it must
+	// not still hold a capacity slot -- SF-053's per-row invariant.
+	if err := releaseSlot(ctx, tx, id); err != nil {
+		return nil, fmt.Errorf("store: complete cancelled: release slot: %w", err)
+	}
+
 	startedAt, err := finalizeOpenAttemptForGeneration(ctx, tx, id, leaseGeneration, attemptOutcomeCancelled, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("store: complete cancelled: record attempt outcome: %w", err)
