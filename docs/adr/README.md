@@ -18,6 +18,7 @@ consequences (including negative ones) accepted as a result.
 | [0007](0007-monotonic-attempt-history.md) | Monotonic, append-only attempt history | Accepted |
 | [0008](0008-explicit-terminal-states.md) | Explicit, minimal terminal states | Accepted |
 | [0009](0009-phase-13-concurrency-and-fairness.md) | Phase 13 concurrency limiting and fairness (OD-1) | Accepted |
+| [0010](0010-expand-migrate-contract.md) | Expand/migrate/contract as the primary schema-compatibility model (Phase 14 OD-1) | Accepted |
 
 ## Conventions
 
