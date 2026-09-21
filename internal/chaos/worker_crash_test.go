@@ -191,6 +191,26 @@ func TestChaos_HeartbeatRacesReclaim_Seeded(t *testing.T) {
 			const numJobs = 15
 			registry := handler.NewRegistry()
 
+			// heartbeatRaceExecutionTimeoutSeconds (and the interval it
+			// implies via worker.heartbeatIntervalFraction's leaseDuration/3
+			// relationship, mirrored here since that const is unexported)
+			// give the claim -> force-expire -> reclaim sequence below, and
+			// the heartbeat-winning side's first real heartbeat, headroom
+			// against actual PostgreSQL round-trip latency. A 1s timeout
+			// (~333ms interval) was tight enough that under a real (not
+			// embedded-postgres) database, that first heartbeat could be
+			// delayed past its own lease's natural expiry -- making a
+			// heartbeat-winning job ALSO eligible for the untargeted,
+			// queue-wide Claim() below to reclaim instead of its intended
+			// target, and/or pushing total elapsed time past this attempt's
+			// own execCtx deadline (dispositionTimedOut) before the test
+			// ever closes that job's proceed channel. Neither is the
+			// property this test exists to check; both are timing
+			// artifacts of too tight a budget, not generation-fencing bugs
+			// (production fencing is correct: see TF-INV-002/015 above).
+			const heartbeatRaceExecutionTimeoutSeconds = 6
+			const heartbeatRaceInterval = heartbeatRaceExecutionTimeoutSeconds * time.Second / 3
+
 			type inFlight struct {
 				jobID        string
 				jobType      string
@@ -208,7 +228,7 @@ func TestChaos_HeartbeatRacesReclaim_Seeded(t *testing.T) {
 					JobType:                 jobType,
 					Payload:                 []byte(`{}`),
 					MaxAttempts:             5,
-					ExecutionTimeoutSeconds: 1, // ~333ms heartbeat interval
+					ExecutionTimeoutSeconds: heartbeatRaceExecutionTimeoutSeconds,
 				})
 				require.NoError(t, err)
 
@@ -265,8 +285,11 @@ func TestChaos_HeartbeatRacesReclaim_Seeded(t *testing.T) {
 			// heartbeat tick, then release every handler so w1.RunOnce can
 			// finish (successfully for the ones it still legitimately
 			// owns; its completion call will be rejected as stale for the
-			// ones that were reclaimed instead).
-			time.Sleep(500 * time.Millisecond)
+			// ones that were reclaimed instead). Two full intervals, not
+			// one, so a single slow heartbeat round-trip under realistic
+			// PostgreSQL latency still leaves a second chance to land
+			// before proceed is closed -- see heartbeatRaceInterval above.
+			time.Sleep(2 * heartbeatRaceInterval)
 			for _, f := range flights {
 				close(f.proceed)
 			}
