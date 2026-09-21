@@ -753,6 +753,24 @@ and `018` allocated to Phase 12's already-merged G2/G7 and `019` confirmed
 Phase 13's concurrency/fairness *algorithm* (OD-1) remains open and is
 explicitly not decided by this pass.
 
+### Phase 14 reviewed: no new invariant added
+
+Phase 14 (Upgrade & Compatibility Proof, [phase-14-plan.md](phase-14-plan.md)
+§11) was reviewed against this same method and adds **no new numbered
+invariant**. Its proof obligation is the existing set, `TF-INV-001`
+through `TF-INV-019`, holding throughout a mixed-binary-version window
+(`test/compat`'s two-binary-version harness, SF-066/067) and a graceful
+SIGTERM/SIGKILL drain sequence (`test/procs`, SF-063 through SF-070) — a
+breadth requirement across a new adversarial *condition*, not a new
+state-machine property. Candidates considered and their disposition:
+
+| Candidate | Disposition | Why |
+|---|---|---|
+| Expand/migrate/contract, data-safe-reversible vs. forward-fix-only migration classification | **Not an invariant.** Schema-tooling/CI-enforcement policy. | [ADR-0010](adr/0010-expand-migrate-contract.md) governs this; it is a statement about how migrations are authored and verified, not a durable row-level state property. |
+| Graceful-drain grace period (`Worker.SetDrainTimeout`, `dispositionDraining`) | **Not a new invariant.** Proof obligation against the existing TF-INV-004. | A drain-timeout expiry is deliberately made indistinguishable, from the job's and the store's perspective, from an ordinary worker crash — TF-INV-004's already-proven lease-expiry/reclaim mechanism is what makes it safe, not a new property. |
+| `cmd/api` `BaseContext`/`srv.Close` shutdown-deadline behavior | **Not an invariant.** Process-lifecycle/operational contract. | Governs when a process stops serving a request, not a durable state-machine transition. |
+| Old-worker/new-server (and vice versa) schema compatibility | **Not a new invariant.** Proof obligation across every existing `TF-INV-*`. | This is exactly the breadth requirement this section already describes — the two-binary harness is a stronger *test* of existing invariants under a new condition, not a new invariant in its own right. |
+
 ---
 
 ## Summary Table

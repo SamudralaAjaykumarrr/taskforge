@@ -36,9 +36,23 @@ jobs:
       TASKFORGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/taskforge_test?sslmode=disable
 
     steps:
+      # fetch-depth: 0 (full history) is required here, not just a
+      # preference: Phase 14's mixed-binary-version compatibility harness
+      # (test/compat/two_binary_test.go) checks out two pinned, immutable
+      # historical commits into detached git worktrees
+      # (794abbb57a7e2a965d556700468930a1ebed23e4 and
+      # c17f89c592c803a8f7d2fbd61cde566467ebe062) and builds cmd/worker
+      # from each. actions/checkout's default shallow clone (fetch-depth:
+      # 1) contains only the tip commit's tree, so `git worktree add
+      # --detach <dir> <sha>` for either pinned commit fails outright
+      # ("fatal: invalid reference") under the default. The harness
+      # intentionally depends on real repository history rather than
+      # working around a shallow clone itself, so CI must provide that
+      # history explicitly.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

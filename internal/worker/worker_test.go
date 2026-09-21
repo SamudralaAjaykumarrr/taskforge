@@ -20,6 +20,7 @@ import (
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/store"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/testutil"
 	"github.com/SamudralaAjaykumarrr/taskforge/internal/worker"
+	"github.com/SamudralaAjaykumarrr/taskforge/internal/workflow"
 )
 
 func TestMain(m *testing.M) { testutil.RunMain(m) }
@@ -125,6 +126,56 @@ func TestRunOnce_NoHandlerRegistered(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, jobstate.DeadLettered, final.State)
 	require.NotNil(t, final.LastError)
+}
+
+// TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler is SF-062
+// (docs/phase-14-plan.md §6.3/§16): extends
+// TestRunOnce_NoHandlerRegistered's plain-job proof to a workflow node's
+// underlying job. A workflow node is, underneath, a row in the same jobs
+// table claimed and completed through the exact same RunOnce/ErrNoHandler/
+// CompleteFailure path -- this test confirms that is genuinely true end to
+// end, including TF-INV-012's completion-propagation cascade, not merely
+// assumed because both paths happen to call the same store method.
+//
+// docs/compatibility-policy.md's "PROPOSED: Workflows Surviving
+// Deployments" section documents the underlying risk this proves a defined
+// (not undefined-behavior) outcome for: a workflow node's job_type handler
+// removed or never registered between workflow submission and that node's
+// eventual execution dead-letters the node and fails the workflow, exactly
+// as an unregistered job_type does for a plain job -- it does not panic,
+// hang, or leave the workflow silently stuck RUNNING forever.
+func TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+
+	inst, err := s.CreateWorkflow(ctx, workflow.GraphSpec{
+		PrincipalID: testPrincipalID,
+		Nodes: []workflow.NodeSpec{
+			{NodeKey: "only", JobType: "test.wf.unregistered", Payload: json.RawMessage(`{}`), MaxAttempts: 5, ExecutionTimeoutSeconds: 30},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, inst.Nodes, 1)
+	nodeJobID := inst.Nodes[0].JobID
+
+	registry := handler.NewRegistry() // nothing registered, exactly like the plain-job test above
+	w := worker.New("worker-1", s, registry, 0, discardLogger())
+
+	claimed, err := w.RunOnce(ctx)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	finalJob, err := s.GetByID(ctx, nodeJobID, testAccess)
+	require.NoError(t, err)
+	require.Equal(t, jobstate.DeadLettered, finalJob.State,
+		"a workflow node's job with no registered handler must dead-letter through the same ErrNoHandler path as a plain job")
+	require.NotNil(t, finalJob.LastError)
+
+	finalWorkflow, err := s.GetWorkflow(ctx, inst.ID, testAccess)
+	require.NoError(t, err)
+	require.Equal(t, workflow.Failed, finalWorkflow.State,
+		"TF-INV-012's cascade must propagate the dead-lettered node's outcome to the workflow's own terminal state")
 }
 
 // TestRunOnce_NothingToClaim proves the steady-state "no eligible job"

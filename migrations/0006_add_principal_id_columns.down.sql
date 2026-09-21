@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Data-safe reversible: the columns are wholly additive and re-running
 -- 0006's up recreates them exactly (0007 then re-derives the same backfill
 -- for every row). Dropping a column drops its indexes with it.

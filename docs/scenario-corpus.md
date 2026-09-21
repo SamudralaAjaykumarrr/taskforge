@@ -895,6 +895,410 @@ honest account.
   `TestEnqueueTx_Serializable_IdempotencyConflictOutsideSnapshot_MapsToMustRetry`
   (`txenqueue/errors_test.go`).
 
+## Phase 13 — Workload Governance and Retention (SF-051 through SF-059)
+
+Folded back from [ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md)
+("Required implementation proof obligations"), where these were first
+defined and implemented, per [phase-14-plan.md](phase-14-plan.md) §16's
+own recommendation that Phase 14 — the phase auditing cross-document
+consistency anyway — close this reconciliation gap rather than leave
+`scenario-corpus.md` ending at SF-036 while SF-051–059 existed only in the
+ADR and in-code comments.
+
+### SF-051 — Slot-table concurrency-limit exactness under concurrent claim attempts, mixed fresh/reclaim load
+
+- **Initial state**: A capacity-limited queue with `N` free slots.
+- **Actions**: Many concurrent claim attempts, including a mix of fresh
+  claims and lease-expiry reclaims, racing for the same limited capacity.
+- **Fault**: True concurrency across separate connections.
+- **Expected durable state**: Never more than `N` jobs concurrently
+  `RUNNING` for that queue, under fresh-only load and under mixed
+  fresh/reclaim load alike.
+- **Invariants proved**: TF-INV-019 (exact concurrency-limit enforcement).
+- **Test**: `TestSlotTable_SF051_ExactConcurrencyLimitUnderConcurrentClaims`,
+  `TestSlotTable_SF051_MixedFreshAndReclaimLoad_NeverExceedsLimit`
+  (`internal/store/phase13_slot_concurrency_test.go`).
+
+### SF-052 — Reclaim never writes `queue_slots`
+
+- **Initial state**: A `RUNNING` job whose lease has expired, already
+  holding a `queue_slots` row from its original claim.
+- **Actions**: A worker reclaims the expired-lease job.
+- **Fault**: None — a direct assertion on the reclaim code path, not
+  merely an absence of violations under load.
+- **Expected durable state**: The reclaim does not acquire a second slot
+  or otherwise write `queue_slots` — the existing held slot carries over
+  to the new lease generation unchanged.
+- **Invariants proved**: TF-INV-019 (slot/lease-generation independence).
+- **Test**: `TestSlotTable_SF052_ReclaimNeverWritesQueueSlots`,
+  `TestSlotTable_ReclaimDoesNotAcquireASecondSlot`
+  (`internal/store/phase13_slot_concurrency_test.go`).
+
+### SF-053 — Per-row slot/job consistency (strengthened)
+
+- **Initial state**: A capacity-limited queue under sustained, mixed
+  claim/complete/reclaim load.
+- **Actions**: Concurrent claims, completions, and reclaims over a
+  sustained run.
+- **Fault**: True concurrency; the aggregate check
+  `count(RUNNING) == count(held slots)` alone cannot distinguish a
+  correct state from two offsetting errors (one job wrongly holding two
+  slots, another wrongly holding none).
+- **Expected durable state**: Checked **per row**: every `RUNNING` job's
+  id appears in exactly one held `queue_slots` row, and every held
+  `queue_slots` row's `held_by_job_id` names exactly one currently-`RUNNING`
+  job for that queue; a terminal completion releases exactly its own slot.
+- **Invariants proved**: TF-INV-019, strengthened past the original
+  aggregate-only phrasing.
+- **Test**: `TestSlotTable_SF053_TerminalCompletionReleasesExactlyItsSlot`,
+  `TestSlotTable_SF053_PerRowConsistencyUnderSustainedMixedLoad`
+  (`internal/store/phase13_slot_concurrency_test.go`).
+
+### SF-054 — Sparse queue not starved by a hot queue
+
+- **Initial state**: A flooded ("hot") queue and a sparse,
+  continuously-pending, capacity-eligible queue, both competing for
+  service.
+- **Actions**: Sustained claim traffic across both queues.
+- **Fault**: The hot queue's volume could starve the sparse queue absent
+  a fairness bound.
+- **Expected durable state**: The sparse queue is never starved beyond
+  `E − 1` other queues' service opportunities (TF-INV-019's exact bound),
+  traced directly from served-queue order, not inferred from wall-clock
+  wait alone.
+- **Invariants proved**: TF-INV-019.
+- **Test**: `TestFairness_SF054_SparseQueueNotStarvedByHotQueue`
+  (`internal/store/phase13_fairness_test.go`).
+
+### SF-055 — Temporary capacity ineligibility preserves fairness position
+
+- **Initial state**: A queue at its capacity limit (temporarily
+  ineligible), with a `last_claimed_at` fairness position already
+  established.
+- **Actions**: The queue regains capacity eligibility after a window
+  during which a competing queue was served.
+- **Fault**: A naive fairness implementation might disturb the
+  temporarily-ineligible queue's position, or double-count the competing
+  queue's service against it.
+- **Expected durable state**: The queue's `last_claimed_at` position is
+  not disturbed by the ineligibility window, and the competing queue's
+  service during that window counts at most once against any other
+  queue's bound.
+- **Invariants proved**: TF-INV-019's exact accounting rule.
+- **Test**: `TestFairness_SF055_TemporaryCapacityIneligibility_PositionPreserved`
+  (`internal/store/phase13_fairness_test.go`).
+
+### SF-056 — Newly-eligible queue served first despite existing backlog
+
+- **Initial state**: An existing backlog of queues with established
+  `last_claimed_at` positions; a newly-configured or never-before-served
+  queue becomes eligible.
+- **Actions**: The new queue's first eligible job is claimed.
+- **Fault**: A `last_claimed_at`-ordered fairness scheme could otherwise
+  make a brand-new queue wait behind every existing queue's backlog.
+- **Expected durable state**: The new queue is served on its first
+  opportunity, not gated behind existing backlog (the `-infinity` default
+  for a never-before-served queue).
+- **Invariants proved**: TF-INV-019.
+- **Test**: `TestFairness_SF056_NewlyEligibleQueue_ServedFirstDespiteExistingBacklog`
+  (`internal/store/phase13_fairness_test.go`).
+
+### SF-057 — Reclaim participates in fairness accounting identically to a fresh claim
+
+- **Initial state**: A queue with an expired-lease job eligible for
+  reclaim.
+- **Actions**: A worker reclaims the expired-lease job.
+- **Fault**: A fairness implementation that only updates
+  `last_claimed_at` on the fresh-claim code path (not reclaim) would let
+  a queue's reclaim traffic escape the fairness bound entirely.
+- **Expected durable state**: The reclaim advances `last_claimed_at`
+  identically to a fresh claim — one uniform "service opportunity"
+  definition, both branches of the claim query.
+- **Invariants proved**: TF-INV-019.
+- **Test**: `TestFairness_SF057_ReclaimAdvancesLastClaimedAtIdenticallyToFreshClaim`
+  (`internal/store/phase13_fairness_test.go`).
+
+### SF-058 — Sweep releases capacity durably and idempotently on attempt-budget exhaustion
+
+- **Initial state**: A job whose lease has expired and whose
+  `attempt_count` has reached `max_attempts` while still `RUNNING`,
+  holding a `queue_slots` row.
+- **Actions**: The Lazy Dead-Letter Sweep transitions it to
+  `DEAD_LETTERED`; a second, later sweep pass runs against the
+  already-`DEAD_LETTERED` job.
+- **Fault**: Neither SF-052 (reclaim never writes slots) nor SF-053
+  (per-row consistency) alone exercises this path — an independent review
+  found a real benchmark database holding 22 jobs permanently stuck in
+  exactly this unaddressed state before this scenario was added.
+- **Expected durable state**: The slot is released in the same
+  transaction as the terminal transition (durable — a crash immediately
+  after commit must not leave the slot ambiguous); the second sweep pass
+  is a no-op that does not re-release or otherwise disturb a slot that
+  may since have been legitimately reclaimed by a different job
+  (idempotent); a subsequent claim attempt for that queue can
+  successfully use the freed slot.
+- **Invariants proved**: TF-INV-005 (no attempt after terminal), TF-INV-019
+  (slot release).
+- **Test**: `TestSweep_SF058_ReleasesSlotDurablyOnAttemptBudgetExhaustion`,
+  `TestSweep_SF058_SecondSweepPassIsIdempotent_DoesNotDisturbANewHolder`
+  (`internal/store/phase13_sweep_test.go`).
+
+### SF-059 — Fault injection: terminal transition and slot release are atomic
+
+- **Initial state**: A `RUNNING` job holding a `queue_slots` row, about to
+  reach a terminal state (success, failure, cancellation, or dead-letter).
+- **Actions**: A crash/rollback is forced between the job's terminal
+  state transition and its slot-release write.
+- **Fault**: Injected transaction abort at that exact boundary.
+- **Expected durable state**: PostgreSQL's own transaction atomicity means
+  the row is left exactly as it was before the transition began — never
+  terminal with its slot still held, and never slot-released with the job
+  row still non-terminal.
+- **Invariants proved**: TF-INV-013 (no half-transitioned state), extended
+  to the slot-table mechanism — mirrors SF-014's own precedent ("Rollback
+  never leaves a half-transitioned job").
+- **Test**: `TestSweep_SF059_FaultInjection_TerminalTransitionAndSlotReleaseAreAtomic`
+  (`internal/store/phase13_sweep_test.go`).
+
+## Phase 14 — Upgrade & Compatibility Proof (SF-060 through SF-070)
+
+Continuing the numbering from SF-059 (Phase 13's concurrency/fairness
+scenarios, folded back into this file immediately above, per
+[phase-14-plan.md](phase-14-plan.md) §16's own recommendation that Phase
+14 — the phase auditing cross-document consistency anyway — close that
+reconciliation gap rather than leave it for a future pass).
+
+### SF-060 — Data-safe-reversible migration round trip
+
+- **Initial state**: A database freshly migrated to exactly one migration
+  version earlier than the migration under test.
+- **Actions**: `internal/migrate.UpTo` to the version under test, then
+  `internal/migrate.Down` for that version, then `UpTo` again for the
+  same version.
+- **Fault**: None — this proves the down path works, not merely that it
+  fails safely.
+- **Expected durable state**: The resulting schema (columns, indexes,
+  constraints) is byte-identical to what a straight-through `Up` to that
+  version produces, for every migration labeled `data-safe-reversible`.
+  `forward-fix-only` migrations (`0001`, `0002`, `0003`, `0005`) are
+  deliberately never exercised this way.
+- **Invariants proved**: [ADR-0010](adr/0010-expand-migrate-contract.md)'s
+  data-safe-reversible promise; no `TF-INV-*` directly (a schema-tooling
+  property, not a state-machine one).
+- **Test**: `TestMigrations_SF060_DataSafeReversibleSubsetRoundTripsCleanly`
+  (`internal/migrate/reversibility_test.go`).
+
+### SF-061 — Every migration file is explicitly labeled
+
+- **Initial state**: The full, current `migrations/` directory.
+- **Actions**: `internal/migrate.Migrations()`.
+- **Fault**: A migration file with no `taskforge:down-migration-status`
+  marker, or an unrecognized value, would be the fault condition under
+  test; today's real files all pass.
+- **Expected durable state**: N/A (a static/schema-file check, not a
+  runtime state proof) — `Migrations()` returns an error for any
+  unlabeled or mislabeled file rather than silently defaulting.
+- **Invariants proved**: The roadmap's own exit criterion, "every
+  forward-fix-only migration is explicitly labeled."
+- **Test**: `TestMigrations_SF061_EveryFileCarriesAValidDownMigrationStatusMarker`
+  (`internal/migrate/reversibility_test.go`).
+
+### SF-062 — Workflow node with no registered handler
+
+- **Initial state**: A single-node workflow submitted with a `job_type`
+  no handler is registered for.
+- **Actions**: A worker claims and attempts the node's underlying job.
+- **Fault**: `handler.Registry.Lookup` finds nothing.
+- **Expected durable state**: The node's job dead-letters via the same
+  `ErrNoHandler`/`CompleteFailure` path a plain job uses; the workflow
+  itself reaches `FAILED` (TF-INV-012's cascade).
+- **Invariants proved**: TF-INV-012 (cascade correctness) extended to the
+  unregistered-handler failure mode; documents the previously-untested
+  half of docs/compatibility-policy.md's "PROPOSED: Workflows Surviving
+  Deployments."
+- **Test**: `TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler`
+  (`internal/worker/worker_test.go`).
+
+### SF-063 — `cmd/api` ordinary graceful shutdown (real OS process)
+
+- **Initial state**: A real, separately-compiled `cmd/api` binary running
+  and accepting connections.
+- **Actions**: A real SIGTERM is sent while an ordinary request is
+  in flight; a new connection is attempted shortly afterward.
+- **Fault**: None — proves the ordinary, within-budget path.
+- **Expected durable state/behavior**: The in-flight request completes
+  successfully (it finishes well within `TASKFORGE_API_SHUTDOWN_TIMEOUT`);
+  a new connection attempted after SIGTERM is refused; the process exits
+  cleanly (code 0).
+- **Invariants proved**: The graceful-drain contract's ordinary case,
+  docs/compatibility-policy.md's "PROPOSED: Rolling Server Upgrades."
+- **Test**: `TestProc_SF063_APIGracefulShutdown_OrdinaryRequestCompletes_NewConnectionsRefused`
+  (`test/procs/api_shutdown_test.go`).
+
+### SF-064 — `cmd/worker` opt-in drain: in-flight job finishes before the deadline (real OS process)
+
+- **Initial state**: A real, separately-compiled `cmd/worker` binary
+  (configured with `TASKFORGE_WORKER_DRAIN_TIMEOUT`) executing a job
+  whose handler will finish well within that window.
+- **Actions**: A real SIGTERM is sent mid-execution.
+- **Fault**: None — the ordinary, within-drain-budget case.
+- **Expected durable state**: The job reaches `SUCCEEDED` under its
+  original `lease_generation`; the process attempts no new claim after
+  SIGTERM and exits cleanly.
+- **Invariants proved**: §6.4's opt-in drain redesign's core positive
+  claim.
+- **Test**: `TestProc_SF064_WorkerDrain_InFlightJobFinishesBeforeDeadline`
+  (`test/procs/worker_drain_test.go`).
+
+### SF-064a — Default (un-opted-in) `Worker` cancels immediately (in-process)
+
+- **Initial state**: A `*Worker` constructed via `worker.New`,
+  `SetDrainTimeout` never called, executing a job.
+- **Actions**: The context passed to `Run`/`RunOnce` is cancelled.
+- **Fault**: None — proves the zero-value default is unchanged.
+- **Expected durable state/behavior**: The handler's context is observed
+  cancelled within a sub-second window (no grace period at all); the job
+  remains `RUNNING`, untouched.
+- **Invariants proved**: The default `Worker.Run` contract is
+  byte-for-byte identical to pre-Phase-14 behavior for every caller that
+  does not explicitly opt in.
+- **Test**: `TestRunOnce_SF064a_DefaultWorkerCancelsExecutionImmediately`
+  (`internal/worker/drain_test.go`).
+
+### SF-064b — Phase 5 graceful-shutdown stress test, re-run unmodified
+
+- **Initial state/Actions/Fault**: Identical to Phase 5's own
+  `TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`
+  — not a new scenario, a mandatory regression re-run against the changed
+  worker code.
+- **Expected durable state**: Unchanged from Phase 5: no goroutine leak,
+  no orphaned authority, same 5-second hard timeout, same assertions, the
+  test file itself not edited.
+- **Invariants proved**: The specific regression an earlier design
+  iteration of the drain redesign would have broken; confirms the
+  opt-in-only correction actually holds.
+- **Test**: `TestStress_WorkerPoolGracefulShutdown_NoGoroutineLeak_NoOrphanedAuthority`
+  (`internal/worker/concurrency_stress_test.go`, unmodified).
+
+### SF-065 — Worker SIGKILL mid-execution (real OS process)
+
+- **Initial state**: A real `cmd/worker` binary executing a job.
+- **Actions**: A real SIGKILL (not SIGTERM) is sent mid-execution.
+- **Fault**: The process is terminated instantly, bypassing Go signal
+  handling and the drain contract entirely.
+- **Expected durable state**: The job remains `RUNNING` under its
+  original lease; once `lease_expires_at` passes, an ordinary fresh
+  worker reclaims and completes it via the existing, unmodified
+  TF-INV-004 path.
+- **Invariants proved**: TF-INV-004 (lease-expiry reclaim), and that the
+  drain redesign makes no claim about, and did not accidentally change,
+  SIGKILL behavior.
+- **Test**: `TestProc_SF065_WorkerSIGKILL_LeaseExpiryReclaimUnaffected`
+  (`test/procs/worker_drain_test.go`).
+
+### SF-066 — Two-binary-version compatibility across the full expand/migrate/contract window (real OS processes)
+
+- **Initial state**: A database rewound to exactly the pre-Phase-13
+  schema (migrations `0001`-`0010`).
+- **Actions**: A real `cmd/worker` binary pinned to
+  `794abbb57a7e2a965d556700468930a1ebed23e4` (built via a detached `git
+  worktree`; no knowledge of `queue_name` at the Go type level at all) and
+  one pinned to `c17f89c592c803a8f7d2fbd61cde566467ebe062` (the full Phase
+  13 delta) run concurrently while migrations `0011`→`0014` are applied
+  one at a time via `internal/migrate.UpTo`; a job is submitted and driven
+  to completion at every intermediate stage.
+- **Fault**: The schema changing underneath two binaries compiled against
+  different versions of it, concurrently.
+- **Expected durable state**: Every submitted job reaches `SUCCEEDED`;
+  `internal/invariant.Checker.CheckAll` finds zero violations at every
+  stage, including the intermediate ones, not just before `0011` and
+  after `0014`.
+- **Invariants proved**: Every `TF-INV-*` holding throughout a
+  mixed-binary-version window (Phase 14's stated breadth requirement, not
+  a new invariant).
+- **Test**: `TestCompat_SF066_SF067_TwoBinaryVersionAcrossExpandMigrateContractWindow`
+  (`test/compat/two_binary_test.go`).
+
+### SF-067 — Old worker binary continues functioning against a post-Phase-13 schema
+
+- **Initial state/Actions**: The same run as SF-066.
+- **Fault**: The OLD binary's claim query was compiled before `queue_name`
+  existed at all.
+- **Expected durable state**: Jobs claimed and completed throughout the
+  window carry a schema-defaulted `queue_name = 'default'`, regardless of
+  which of the two binaries actually claimed them — the old binary's
+  completely queue_name-unaware query neither errors nor stalls against
+  the evolved schema.
+- **Invariants proved**: The roadmap's explicit "old worker binary
+  continues to function correctly against a post-Phase-13 schema"
+  requirement — a real-binary strengthening of the existing SF-046
+  in-process proof.
+- **Test**: `TestCompat_SF066_SF067_TwoBinaryVersionAcrossExpandMigrateContractWindow`
+  (`test/compat/two_binary_test.go`, same run as SF-066).
+
+### SF-068 — Repurposed `job_type` across an incompatible payload shape
+
+- **Initial state**: A job queued under a `job_type` with an old payload
+  shape.
+- **Actions**: A handler now registered under that same `job_type`
+  expects a field the old shape never had.
+- **Fault**: The handler's own validation/unmarshal logic fails against
+  the old-shaped payload.
+- **Expected durable state**: The job dead-letters via the ordinary
+  classified-failure path (permanent, by `internal/handler.Classify`'s
+  documented default) — not a panic, not a silent no-op, not an infinite
+  retry loop.
+- **Invariants proved**: Documents, rather than prevents, the named gap
+  in docs/compatibility-policy.md's "PROPOSED: Job Payload/Schema
+  Evolution" — the roadmap's own explicitly flagged requirement that this
+  failure mode be known even though it is not guarded against.
+- **Test**: `TestCompat_SF068_RepurposedJobTypeAcrossIncompatiblePayloadShape`
+  (`test/compat/two_binary_test.go`).
+
+### SF-069 — `cmd/worker` drain timeout elapses: no completion written, lease reclaimable (real OS process)
+
+- **Initial state**: A real `cmd/worker` binary (drain timeout
+  configured) executing a job whose handler will run longer than the
+  configured drain window.
+- **Actions**: A real SIGTERM is sent; the configured drain timeout then
+  elapses before the handler returns.
+- **Fault**: The in-flight job does not finish within the drain budget.
+- **Expected durable state**: `dispositionDraining` fires; no `Complete*`
+  call is made; the job's row is left exactly as it was (`RUNNING`, under
+  the draining worker's own lease) — directly verified by querying the
+  row immediately after the process exits; once `lease_expires_at`
+  passes, a second, freshly started worker reclaims and completes it
+  through the ordinary, unmodified TF-INV-004 path.
+- **Invariants proved**: §19 OD-3's core safety claim — a drain-timeout
+  expiry is indistinguishable, from the job's and the store's perspective,
+  from an ordinary worker crash at that instant; no `job_attempts` row
+  records a false failure/timeout.
+- **Test**: `TestProc_SF069_WorkerDrainTimeout_NoCompletionWritten_LeaseReclaimable`
+  (`test/procs/worker_drain_test.go`); see also the in-process analogue
+  `TestRunOnce_SF069InProcess_DrainTimeoutExpiryReportsNoCompletion_LeaseReclaimable`
+  (`internal/worker/drain_test.go`).
+
+### SF-070 — `cmd/api` shutdown deadline: a still-running handler is forcibly ended, not abandoned (real OS process)
+
+- **Initial state**: A real `cmd/api` binary handling a deliberately slow
+  request (a real client streaming its body far slower than
+  `TASKFORGE_API_SHUTDOWN_TIMEOUT`).
+- **Actions**: A real SIGTERM is sent; the shutdown deadline passes while
+  the request is still in flight.
+- **Fault**: `srv.Shutdown`'s own deadline elapsing does not, by itself,
+  interrupt a handler blocked on real socket I/O.
+- **Expected durable state/behavior**: The still-open connection is
+  forcibly closed (`srv.Close`, after `BaseContext` cancellation) once the
+  deadline passes — the client observes its request fail, rather than
+  hanging forever or succeeding long after the deadline; the process
+  itself still exits promptly afterward, with a structured
+  `api_shutdown_completed` log recording `outcome=deadline_exceeded`.
+- **Invariants proved**: §19 OD-4's redesign — `cmd/api`'s
+  shutdown-deadline behavior is now deterministic and testable, not an
+  unexamined stdlib default that silently abandons a goroutine.
+- **Test**: `TestProc_SF070_APIShutdown_SlowHandlerObservesCancellationAtDeadline`
+  (`test/procs/api_shutdown_test.go`).
+
 ## Scenario-to-Invariant Cross-Check
 
 See [testing-strategy.md](testing-strategy.md) for the invariant-to-test

@@ -383,3 +383,76 @@ operator's, and TaskForge cannot verify them from inside the process):
 and `TestPhase12Migrations_0009BlocksWritesAndTheClaimQuery` measure both
 behaviours through the real `migrate.Up`; the latter asserts the write block
 rather than denying it.
+
+## Phase 13 migration lock profile
+
+Phase 13 adds `queue_name` to two live tables, builds a new queue-aware
+claimable index, adds four new governance tables, and drops the old
+non-queue-aware index — an ordinary additive expand/migrate/contract
+sequence ([ADR-0010](adr/0010-expand-migrate-contract.md)), measured here
+with the same discipline the "Phase 12 migration lock profile" section
+above establishes: every claim is proved against real PostgreSQL, not
+asserted from prose. [phase-13-plan.md](phase-13-plan.md) §11 promised
+this write-up; the measurements themselves were already captured by
+`internal/migrate/phase13_migration_test.go` before Phase 14 — this
+section closes the documentation-lag gap Phase 14's own planning pass
+(§6.5, OD-8) found, using tests that already existed and already passed.
+
+| Migration | Statements | Locks on `jobs` (held to commit) | Scans/writes the table? | Blocks reads? | Blocks writes, incl. the worker claim query? |
+|---|---|---|---|---|---|
+| `0011_add_queue_name` | `ADD COLUMN ... NOT NULL DEFAULT 'default'` ×2 | `ACCESS EXCLUSIVE` | **no** (catalog-only — PostgreSQL 11+ does not rewrite the table for a non-volatile-default `NOT NULL` column add) | yes, while held | yes, while held |
+| `0012_create_claimable_by_queue_index` | `CREATE INDEX` ×2 (claimable and reclaimable, by queue) | `SHARE` | **yes** (index build scans the table) | **no** | **YES** — `SHARE` conflicts with the `ROW EXCLUSIVE` every write (including the claim query's `UPDATE`) needs, for the file's full duration |
+| `0013_create_governance_tables` | new tables (`queue_state`, `queue_limits`, `queue_slots`, `rate_limit_buckets`) + `queue_slots.held_by_job_id REFERENCES jobs(id)` | `SHARE ROW EXCLUSIVE` (from the new foreign key) | **no** (catalog-only; the foreign key add validates against zero existing `queue_slots` rows, since the table is new) | **no** | **YES** — `SHARE ROW EXCLUSIVE` also conflicts with `ROW EXCLUSIVE` |
+| `0014_drop_old_claimable_index` | `DROP INDEX` (the pre-Phase-13, non-queue-aware `idx_jobs_claimable`) | `ACCESS EXCLUSIVE` | **no** (catalog-only) | yes, while held | yes, while held |
+
+**What is measured, stated narrowly, mirroring the Phase 12 section's own
+discipline**:
+
+- **`0011` is genuinely catalog-only and O(1)**: adding a `NOT NULL`
+  column with a fixed (non-volatile) default performs no table rewrite
+  and no full scan on PostgreSQL 11+ — measured directly: the identical
+  statement shape against a 5,000-row table completes in well under the
+  bound `TestPhase13Migration0011_AddColumnIsFastRegardlessOfTableSize`
+  asserts, not in time proportional to row count.
+- **`0012` blocks every write to `jobs`, including the worker claim
+  query, for its full duration** — the same shape of finding
+  [ADR-0010](adr/0010-expand-migrate-contract.md)'s Phase 12 precedent
+  already established for migration `0009`: `CREATE INDEX` (not
+  `CONCURRENTLY`, since every migration here runs inside one transaction,
+  TF-INV-013) takes `SHARE`, which conflicts with the `ROW EXCLUSIVE`
+  every write needs. Reads are unaffected (`ACCESS SHARE` is compatible
+  with `SHARE`). Measured directly:
+  `TestPhase13Migration0012_BlocksWritesAndReadsAreUnaffected`.
+- **`0013` blocks writes too, but for a different, easy-to-miss reason**:
+  it introduces no `ACCESS EXCLUSIVE` or `SHARE` statement against `jobs`
+  itself — the block comes from `queue_slots.held_by_job_id REFERENCES
+  jobs(id)`, whose foreign-key validation takes `SHARE ROW EXCLUSIVE` on
+  the *referenced* table (`jobs`), which likewise conflicts with `ROW
+  EXCLUSIVE`. An earlier draft of this migration's own comment claimed no
+  lock on `jobs` at all; `TestPhase13Migration0013_BlocksWritesViaForeignKeyLock_ReadsUnaffected`
+  caught that as false and the up migration's comment was corrected — the
+  same "measure before documenting" discipline the retracted Phase 12
+  claims (above) exist to enforce project-wide.
+- **`0014` is `ACCESS EXCLUSIVE` but catalog-only**, exactly like `0006`/
+  `0008`/`0010`'s Phase 12 precedent: it blocks even reads while held, but
+  a `DROP INDEX`/`CREATE INDEX` pair against a 5,000-row table completes
+  in well under the bound
+  `TestPhase13Migration0014_BlocksOnAccessExclusive_ButIsCatalogOnly`
+  asserts — the lock is total but brief, not total and long.
+- **The whole `0011`-`0014` sequence is data-safe-reversible**: a full
+  down-then-up-again round trip (`TestPhase13Migrations0011To0014_AreDataSafeReversible`,
+  and Phase 14's own `TestMigrations_SF060_DataSafeReversibleSubsetRoundTripsCleanly`)
+  reproduces an identical schema, and a non-default `queue_name` value is
+  understood, not silently corrupted, to revert to `'default'` on
+  rollback — the same accepted, documented cost every other additive
+  Phase 13/Phase 12 rollback carries.
+
+**What is NOT claimed**, for the same reason the Phase 12 section states
+its own boundaries explicitly: this sequence is not online or
+zero-downtime; `0012`'s and `0013`'s write-blocking durations scale with
+how long `CREATE INDEX`/foreign-key validation actually takes against a
+deployment's real table size, which no synthetic test here can predict
+for production data; and an operator should still benchmark against a
+realistic copy of their own `jobs` table, set `lock_timeout`, and schedule
+`0012`/`0013` in a quiet window, exactly as the Phase 12 section
+recommends for `0009`.

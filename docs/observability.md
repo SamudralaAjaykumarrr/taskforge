@@ -32,6 +32,8 @@ designed" from "silently degraded" for a specific failure mode in
 | `taskforge_heartbeats_total` | counter | Raw heartbeat volume — used to detect heartbeat-interval misconfiguration relative to lease TTL. |
 | `taskforge_idempotent_submission_hits_total` | counter | Count of `POST /jobs` calls that resolved to an existing row via idempotency key rather than creating a new one — validates that `Idempotency-Key` usage is actually happening when expected. |
 | `taskforge_auth_failures_total` (Phase 12) | counter, labeled by `reason` (`malformed`/`unknown_key`/`revoked`/`expired`/`bad_secret`/`principal_revoked`/`internal_error`) | HTTP requests rejected by authentication, broken down by why. This is the **server-side** half of a deliberate split: the caller always receives one uniform `401` body regardless of reason, so no client can enumerate which `key_id`s exist or which have been retired, while an operator still gets the breakdown needed to tell "someone is stuffing credentials" apart from "one deployment is still using a rotated-out key." `internal_error` is a deliberately separate bucket so a database outage is never reported as, or mistaken for, a credential problem. |
+| `taskforge_worker_drain_duration_seconds` (Phase 14) | histogram, unlabeled | How long `cmd/worker` actually waited between SIGTERM and process exit — validates the graceful-drain redesign is doing something observable, not merely present in code. Observed once per process, in `cmd/worker/main.go`. |
+| `taskforge_worker_drain_timed_out_total` (Phase 14) | counter, unlabeled | Count of drains that hit `TASKFORGE_WORKER_DRAIN_TIMEOUT` before the in-flight job finished on its own — an operator-visible signal that the configured timeout may be too short relative to real job durations. |
 
 **`taskforge_auth_failures_total` is not a rate limiter, and is not an input
 to one.** Automated brute-force lockout, IP throttling, and exponential
@@ -66,6 +68,15 @@ applicable), `lease_generation` (if applicable). Key events to log:
   Authorization header, the `key_id`, the secret, or the pepper.
 - **Scope denied (Phase 12)**: `event: "authz_scope_denied"`, with the
   authenticated `actor` and the `required_scope` that was missing.
+- **Graceful drain (Phase 14)**: `cmd/worker` logs `event:
+  "worker_drain_started"` the instant SIGTERM is observed (before the
+  poll-gating context is cancelled), and `event: "worker_drain_completed"`
+  with an `outcome` of `"in_flight_job_finished"`, `"drain_timeout_exceeded"`,
+  or `"no_job_in_flight"` once the process is about to exit — mirroring
+  Phase 13's existing `retention_sweep_started`/`retention_sweep_completed`
+  pairing convention. `cmd/api` logs the same `_started`/`_completed` pair
+  under `event: "api_shutdown_started"`/`"api_shutdown_completed"`, with
+  `outcome` of `"graceful"` or `"deadline_exceeded"`.
 
 ### `actor` (Phase 12)
 

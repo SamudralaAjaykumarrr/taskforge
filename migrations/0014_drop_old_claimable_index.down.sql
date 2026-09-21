@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Recreates the retired index unconditionally -- see the up migration's
 -- comment for why this, unlike migration 0010's down, needs no
 -- honest-failure caveat.

@@ -213,6 +213,23 @@ type Metrics struct {
 	// taskforge_retention_sweep_errors_total (counter, unlabeled): sweep
 	// failures must not be silent.
 	RetentionSweepErrorsTotal prometheus.Counter
+
+	// WorkerDrainDurationSeconds is Phase 14's
+	// taskforge_worker_drain_duration_seconds (histogram, unlabeled):
+	// how long cmd/worker actually waited between SIGTERM and process
+	// exit (docs/phase-14-plan.md §13) -- observed once, in
+	// cmd/worker/main.go, from the moment its context is cancelled to
+	// the moment Run returns. Validates the drain redesign is doing
+	// something observable, not merely present in code.
+	WorkerDrainDurationSeconds prometheus.Histogram
+
+	// WorkerDrainTimedOutTotal is Phase 14's
+	// taskforge_worker_drain_timed_out_total (counter, unlabeled): count
+	// of drains that hit TASKFORGE_WORKER_DRAIN_TIMEOUT before the
+	// in-flight job finished on its own -- an operator-visible signal
+	// that the configured timeout may be too short relative to real job
+	// durations.
+	WorkerDrainTimedOutTotal prometheus.Counter
 }
 
 // New constructs a fresh Metrics instance backed by its own private
@@ -313,6 +330,17 @@ func New() *Metrics {
 			Name: "taskforge_retention_sweep_errors_total",
 			Help: "Count of retention sweep failures.",
 		}),
+
+		WorkerDrainDurationSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "taskforge_worker_drain_duration_seconds",
+			Help:    "How long cmd/worker waited between SIGTERM and process exit.",
+			Buckets: prometheus.DefBuckets,
+		}),
+
+		WorkerDrainTimedOutTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "taskforge_worker_drain_timed_out_total",
+			Help: "Count of drains that hit TASKFORGE_WORKER_DRAIN_TIMEOUT before the in-flight job finished on its own.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -332,6 +360,8 @@ func New() *Metrics {
 		m.RetentionRowsDeletedTotal,
 		m.RetentionSweepDurationSeconds,
 		m.RetentionSweepErrorsTotal,
+		m.WorkerDrainDurationSeconds,
+		m.WorkerDrainTimedOutTotal,
 	)
 
 	return m

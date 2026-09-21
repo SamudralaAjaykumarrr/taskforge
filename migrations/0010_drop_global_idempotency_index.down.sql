@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Honest, not blanket-safe (docs/phase-12-plan.md §5, verification point
 -- 13). This is the one Phase 12 down migration that can legitimately fail,
 -- which is why it lives alone: every other down in this phase is

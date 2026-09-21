@@ -1,18 +1,28 @@
 # Compatibility / Evolution Policy
 
-Status: **review document, mostly PROPOSED, partially implemented.**
-This document originally marked every rule `PROPOSED` because none of it
-was implemented, tested, or proven. As of Phase 11
-(docs/enterprise-roadmap.md), the "API Evolution" and "Transactional
-Enqueue" sections below are now implemented and proven — each such rule is
-labeled "Status: implemented" at its section header, with the executable
-test(s) that prove it. Every rule not so labeled remains `PROPOSED`: a
-specification of what TaskForge *should* adopt, not a claim that it already
-holds. Treating a still-PROPOSED guarantee as an existing one would be
-exactly the kind of unsupported claim [vision.md](vision.md) and
-[invariants.md](invariants.md) exist to prevent — cite only the
-sections explicitly marked implemented as evidence of a shipped
-compatibility guarantee.
+Status: **mostly implemented and proven, as of Phase 14.** This document
+originally marked every rule `PROPOSED` because none of it was
+implemented, tested, or proven. As of Phase 11 (docs/enterprise-roadmap.md),
+the "API Evolution" and "Transactional Enqueue" sections were the first to
+become implemented and proven. Phase 14 (docs/enterprise-roadmap.md,
+[phase-14-plan.md](phase-14-plan.md), [ADR-0010](adr/0010-expand-migrate-contract.md))
+converts nearly everything else that remained `PROPOSED` into proven
+policy: Database Migrations (expand/migrate/contract, machine-checked),
+Rolling Server Upgrades, Old/New Worker-Server Compatibility, the
+unregistered-`job_type` sub-claims of the two deployment-durability
+sections, the Backward Compatibility Policy statement, and the
+Deprecation Policy. Each such rule is labeled "Status: implemented" at its
+section header, with the executable test(s) that prove it. Only "PROPOSED:
+Job Payload/Schema Evolution" remains genuinely `PROPOSED` (the
+`schema_version` convention is documentation guidance, not an enforced
+mechanism — Phase 14 adds a demonstrated failure mode if it is violated,
+but does not change the guidance itself into a requirement), and only the
+legacy unprefixed API routes' actual removal/Sunset *date* remains
+undecided (the deprecation *policy* itself is now adopted). Treating a
+still-PROPOSED guarantee as an existing one would be exactly the kind of
+unsupported claim [vision.md](vision.md) and [invariants.md](invariants.md)
+exist to prevent — cite only the sections explicitly marked implemented as
+evidence of a shipped compatibility guarantee.
 
 ## Why This Document Exists Now
 
@@ -166,100 +176,174 @@ four sentinel errors (`txenqueue/errors.go`), never the raw
 `internal/store`/PostgreSQL error text — see
 docs/transactional-enqueue.md "Error contract."
 
-## PROPOSED: Database Migrations
+## Database Migrations
 
-- **Current practice (works, but untested under load):** migrations are
-  additive-only so far — every phase from 3 through 9 required zero schema
-  changes, and the one real schema change (`0003`) added new tables rather
-  than altering `jobs`. This has never been stress-tested against a
-  concurrently-running old server version still writing to the old schema
-  shape.
-- **PROPOSED primary model: expand / migrate / contract**, not a universal
-  "every migration must have a working down migration" rule. Concretely:
-  1. **Expand** — ship an additive schema change (new nullable column, new
-     table, new default) that both the old and new binary can coexist
-     with.
+Status: **implemented** as of Phase 14 ([enterprise-roadmap.md](enterprise-roadmap.md),
+[phase-14-plan.md](phase-14-plan.md), [ADR-0010](adr/0010-expand-migrate-contract.md)).
+
+- **Adopted primary model: expand / migrate / contract**, formally, per
+  [ADR-0010](adr/0010-expand-migrate-contract.md) — this **replaces** any
+  universal "every migration must have a working down migration" rule; no
+  such rule is adopted, anywhere, for this project. Concretely:
+  1. **Expand** — ship an additive schema change (new nullable/defaulted
+     column, new table, new index) that both the old and new binary can
+     coexist with.
   2. **Migrate** — backfill/migrate data if required, with old and new
      binaries both still running against the expanded schema.
-  3. **Contract** — only in a later, separate release, once every reader/
-     writer of the old shape has been confirmed stopped, remove/alter the
-     old shape.
-  This is the same rolling-compatible sequencing the two forward-
-  compatibility rules below already imply; expand/migrate/contract names it
-  as the general policy rather than restating it per-rule.
-- PROPOSED rule: every migration must be forward-compatible with the
-  immediately-preceding server version for the duration of a rolling
-  deployment — i.e., a migration that adds a column must give it a
-  default or allow `NULL`, so an old server binary that does not know
-  about the column can still write the row; a migration that removes a
-  column must first ship a server version that stops reading it, deployed
-  and confirmed live, before a later migration drops it (this is exactly
-  the "expand" then "contract" split above).
-- PROPOSED rule: no migration may lock the `jobs` or `job_attempts` tables
-  for a duration incompatible with continuous claim-query traffic (e.g., a
-  full-table `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT` rewrite on a
-  large table). This has not been tested at any table size beyond Phase
-  9's soak run scale (hundreds of rows).
-- PROPOSED rule (replaces a universal down-migration requirement): a
-  **down migration is required only where rollback is genuinely
-  data-safe** — i.e., where reversing it cannot destroy information already
-  written under the new shape (a purely additive column with no writes yet
-  migrated into it, for example). A migration that is not genuinely
-  data-safe to reverse (e.g., one that drops a column, or one where new
-  rows have already been written in a shape the old schema cannot
-  represent) should be **forward-fixed** by a new, later migration rather
-  than reversed — a down migration cannot honestly reconstruct data it
-  never had. CI should run down migrations only for the subset marked
-  data-safe-reversible, and that subset must be explicitly labeled as such
-  in the migration file itself, not assumed. A blanket "every migration
-  must have a tested down migration" rule is actively misleading for
-  destructive changes, because it implies a recoverability property the
-  down migration cannot actually deliver.
+  3. **Contract** — only in a later, separate migration, once every
+     reader/writer of the old shape is confirmed stopped, remove or alter
+     the old shape.
+  Migration ordering is a required deployment sequence: schema migration
+  first (confirmed applied), worker/server binary deployment second —
+  never the reverse, since a new binary's queries may reference
+  columns/tables that do not yet exist under the old schema. This was
+  already informally true (`migrate.Up` runs automatically at process
+  startup in both `cmd/api` and `cmd/worker`); Phase 14's two-binary-version
+  proof (SF-066/067, below) is what makes deviating from it demonstrably
+  unsafe rather than merely assumed so.
+- **Forward-compatibility rule, implemented**: a migration that adds a
+  column gives it a default or allows `NULL`, so an old server binary that
+  does not know about the column can still write the row (proved for real,
+  separately-compiled binaries by SF-066/067); a migration that removes a
+  column ships only after a server version that stops reading it has been
+  deployed and confirmed live.
+- **Lock-safety discipline, implemented and measured, not merely
+  asserted**: no migration in this project's history holds an `ACCESS
+  EXCLUSIVE` lock across a full-table scan or write — see
+  [data-model.md](data-model.md)'s "Phase 12 migration lock profile" and
+  "Phase 13 migration lock profile" sections for the exact, measured lock
+  behavior of every migration to date. This is a documented discipline for
+  every migration going forward, not a one-time audit; a new migration
+  that reintroduces the pattern those sections retracted (an `ACCESS
+  EXCLUSIVE` statement sharing a transaction with a full-table scan) is a
+  regression against this policy.
+- **Down-migration requirement, implemented as a machine-checked
+  classification, not an ad hoc judgment call**: a down migration is
+  required to actually work, and to be exercised in CI, **only** for
+  migrations classified `data-safe-reversible` — those where reversing
+  cannot destroy information already written under the new shape. A
+  migration that is not genuinely safe to reverse is classified
+  `forward-fix-only`: its remediation path is a new, later migration that
+  fixes forward, never a down migration pretending to honestly undo it.
+  Concretely:
+  - Every `.down.sql` file's first line carries a
+    `-- taskforge:down-migration-status: data-safe-reversible` or
+    `forward-fix-only` marker, parsed and validated by
+    `internal/migrate.Migrations()` — a file with neither value, or an
+    unrecognized one, fails the check. All fourteen existing migrations
+    are labeled today: `0001`, `0002`, `0003`, `0005` (whole-table
+    creation — reversing them would destroy all data ever written to that
+    table) are `forward-fix-only`; `0004`, `0006`–`0014` are
+    `data-safe-reversible`.
+  - `internal/migrate.Down(ctx, db, version)` (new, additive) runs one
+    migration's `.down.sql` inside a transaction and removes its
+    `schema_migrations` row on success — symmetric with `applyOne`'s
+    handling of `.up.sql`. `internal/migrate.UpTo(ctx, db, targetVersion)`
+    (new, additive) applies pending migrations up to and including a given
+    version, for tooling that must step through an expand/migrate/contract
+    sequence one migration at a time. Neither is wired into `cmd/api`'s or
+    `cmd/worker`'s own startup path (both call only `migrate.Up`,
+    unchanged) — down migrations remain a manual, deliberate operator
+    action, never auto-run against production.
+  - **CI enforcement**: for every `data-safe-reversible` migration, an
+    up→down→up-again cycle reproduces an identical schema
+    (`TestMigrations_SF060_DataSafeReversibleSubsetRoundTripsCleanly`,
+    `internal/migrate/reversibility_test.go`) — this runs as an ordinary
+    `go test`, which is itself the CI enforcement (no separate script is
+    needed): `.github/workflows/ci.yml`'s existing `go test -p 1 ./...`
+    step already runs it on every push and pull request. Migration
+    `0010`'s "honest, not blanket-safe" case is still classified
+    `data-safe-reversible` under this scheme — CI still runs its down
+    migration; the migration's own SQL, not CI, decides whether that run
+    succeeds against real, possibly-divergent data.
+  - `internal/migrate.Migrations()` failing on any unlabeled or
+    mislabeled file is itself the proof that "every forward-fix-only
+    migration is explicitly labeled" holds
+    (`TestMigrations_SF061_EveryFileCarriesAValidDownMigrationStatusMarker`).
 
-## PROPOSED: Rolling Server Upgrades
+## Rolling Server Upgrades
 
-Not implemented, not tested. TaskForge's stateless-API-server /
-stateless-worker architecture ([architecture.md](architecture.md)) is
-structurally favorable to rolling upgrades (no server-local state to
-migrate), but "structurally favorable" is not the same claim as "proven."
+Status: **implemented** as of Phase 14 ([phase-14-plan.md](phase-14-plan.md)).
+TaskForge's stateless-API-server / stateless-worker architecture
+([architecture.md](architecture.md)) is structurally favorable to rolling
+upgrades (no server-local state to migrate) — this is now a proven claim,
+not merely a structural argument:
 
-- PROPOSED requirement before this can be claimed as a real guarantee: an
-  integration test that runs two different binary versions of `cmd/api`
-  (or `cmd/worker`) concurrently against the same database and asserts
-  correct behavior throughout, for the full duration of the expand/migrate/
-  contract window (not just at the two endpoints of a migration).
-- PROPOSED requirement: a documented, operator-facing graceful-drain
-  procedure (SIGTERM stops accepting new claims/requests, waits for
-  in-flight work up to a timeout) is part of this guarantee, not a separate
-  concern — a rolling upgrade that kills in-flight work mid-deploy is not
-  actually a safe rolling upgrade. This formalizes, at the operator-process
-  level, what Phase 5's `TestStress_WorkerPoolGracefulShutdown_*` already
-  proves at the goroutine level. See
-  [enterprise-roadmap.md](enterprise-roadmap.md) Phase 14, where both the
-  mixed-version proof and this drain procedure are scheduled to land
-  together.
+- **Two-binary-version integration proof, implemented**: a real, pinned
+  `cmd/worker` binary from immediately before Phase 13's schema change
+  (`794abbb57a7e2a965d556700468930a1ebed23e4`, built via a detached `git
+  worktree` — no knowledge of `queue_name` at the Go type level at all)
+  and one from immediately after it
+  (`c17f89c592c803a8f7d2fbd61cde566467ebe062`) run concurrently against
+  one shared, real PostgreSQL database while migrations `0011`→`0014` are
+  applied one at a time (`internal/migrate.UpTo`), with
+  `internal/invariant.Checker` re-run and finding zero violations at every
+  intermediate stage — the full duration of the expand/migrate/contract
+  window, not just its two endpoints. See `test/compat/two_binary_test.go`,
+  `TestCompat_SF066_SF067_TwoBinaryVersionAcrossExpandMigrateContractWindow`.
+- **Graceful-drain procedure, implemented and tested at the real
+  OS-process level**, extending what Phase 5's
+  `TestStress_WorkerPoolGracefulShutdown_*` already proves at the
+  goroutine level:
+  - `cmd/worker`: SIGTERM stops accepting new claims immediately; an
+    already-in-flight job may finish within a configurable grace period
+    (`TASKFORGE_WORKER_DRAIN_TIMEOUT`, default 30s) via the additive,
+    opt-in `Worker.SetDrainTimeout` — `cmd/worker` is the only caller that
+    opts in; every existing caller of `internal/worker.Worker` (including
+    every pre-Phase-14 test) keeps today's immediate-cancellation
+    behavior, unchanged, by not calling it. If the grace period elapses
+    first, no completion of any kind is reported — the job's lease is left
+    to expire and is reclaimed through the existing, unmodified
+    TF-INV-004 path, indistinguishable from an ordinary crash at that
+    instant. See `test/procs/worker_drain_test.go` (SF-064, SF-065,
+    SF-069) and `internal/worker/drain_test.go` (SF-064a, and SF-064b: the
+    pre-existing Phase 5 stress test, re-run unmodified as a mandatory
+    regression check).
+  - `cmd/api`: `http.Server.Shutdown` (deadline `TASKFORGE_API_SHUTDOWN_TIMEOUT`,
+    default 10s, reproducing the pre-Phase-14 hardcoded value) closes
+    listeners immediately and waits for active handlers up to the
+    deadline; once `Shutdown` returns — whether every handler finished or
+    the deadline passed — the process cancels an explicit
+    `http.Server.BaseContext` and force-closes any remaining connection
+    (`srv.Close`), so a handler still running past the deadline is
+    forcibly ended rather than silently abandoned to run to whatever
+    completion it eventually reaches, unobserved. See
+    `test/procs/api_shutdown_test.go` (SF-063, SF-070).
+- A rolling deploy that kills in-flight work mid-deploy is not a safe
+  rolling upgrade; the drain procedure above is part of this guarantee,
+  not a separate concern, exactly as this document previously proposed.
 
-## PROPOSED: Old Worker / New Server and New Worker / Old Server Compatibility
+## Old Worker / New Server and New Worker / Old Server Compatibility
 
-This is presently **untested in both directions**:
+Status: **implemented** as of Phase 14 ([phase-14-plan.md](phase-14-plan.md)):
 
-- **Old worker, new server** (a worker binary lags behind a schema/API
-  change): the worker only ever talks to PostgreSQL directly via
-  `internal/store`, not through the API server — so "new server" mostly
-  means "new schema." An old worker's `Claim`/`Heartbeat`/`Complete*`
-  queries are shaped against a specific set of columns; a new migration
-  that adds a column with a safe default should not break an old worker's
-  queries (PROPOSED rule, not yet tested), but a migration that changes an
-  existing column's type or semantics would.
+- **Old worker, new server** (a worker binary lags behind a schema
+  change): proven directly by the two-binary-version harness above — a
+  real `cmd/worker` binary compiled before `queue_name` existed at the Go
+  type level continues claiming and completing jobs at every intermediate
+  migration stage, with no error and no stall
+  (`TestCompat_SF066_SF067_TwoBinaryVersionAcrossExpandMigrateContractWindow`,
+  SF-067) — a real-binary strengthening of the pre-existing in-process
+  `SF-046` proof.
 - **New worker, old server** (a worker binary is ahead of the deployed
-  schema): a new worker calling a query that references a column that does
-  not exist yet in the currently-deployed schema will fail outright. This
-  is why PROPOSED database-migration ordering (migrate first, deploy worker
-  second) matters and should be documented as the required deployment
-  sequence, not left to operator judgment.
-- No test exercises either direction today. This is the single largest
-  concrete gap this document identifies — it is entirely plausible for a
-  real deployment.
+  schema): a new worker calling a query that references a column not yet
+  present under the currently-deployed schema still fails outright — this
+  is exactly why the migration-ordering rule above (migrate first, deploy
+  worker second) is the required, adopted deployment sequence, not left to
+  operator judgment. No migration in this project's history has shipped a
+  binary ahead of its required schema, so this direction is a documented
+  operational rule rather than a scenario this project has needed to
+  recover from.
+- **Repurposed `job_type` across an incompatible payload shape**: the
+  roadmap's own explicitly named gap — this is not prevented (payload
+  remains opaque `jsonb`, see "PROPOSED: Job Payload/Schema Evolution"
+  below) but the resulting failure mode is now documented and demonstrated:
+  a handler's own validation/unmarshal failure against an incompatibly
+  repurposed payload surfaces as an ordinary classified failure
+  (dead-lettered), never a panic, a silent no-op, or an infinite retry
+  loop. See `test/compat/two_binary_test.go`,
+  `TestCompat_SF068_RepurposedJobTypeAcrossIncompatiblePayloadShape`
+  (SF-068).
 
 ## PROPOSED: Job Payload/Schema Evolution
 
@@ -280,25 +364,57 @@ job handler"). This means:
   have handlers branch on it, exactly the same pattern already recommended
   for idempotency in [idempotency.md](idempotency.md). This is guidance
   for job authors, not a TaskForge-enforced mechanism — consistent with how
-  TaskForge already treats idempotency.
+  TaskForge already treats idempotency. This guidance itself remains
+  PROPOSED (unchanged by Phase 14) — what Phase 14 adds is a demonstrated
+  answer to what happens if it is violated anyway: see SF-068 below.
+- **The failure mode if this guidance is violated is now documented and
+  demonstrated, not silently assumed safe (Phase 14,
+  [phase-14-plan.md](phase-14-plan.md) §14, SF-068)**: a `job_type`
+  string repurposed for an incompatible payload shape mid-deploy (a job
+  queued under the old shape, claimed by a worker running a handler that
+  now expects the new shape) fails as an ordinary classified error —
+  whatever the handler's own unmarshal/validation logic does, surfaced
+  through `internal/handler`'s normal `Retryable`/`Permanent`
+  classification — never a panic, a silent no-op, or an infinite retry
+  loop. See `test/compat/two_binary_test.go`,
+  `TestCompat_SF068_RepurposedJobTypeAcrossIncompatiblePayloadShape`. This
+  documents the failure mode; it does not prevent it — job authors remain
+  responsible for never repurposing a `job_type` string this way.
 
-## PROPOSED: Long-Running Scheduled Jobs Across Deployments
+## Long-Running Scheduled Jobs Across Deployments
+
+Status: **implemented** as of Phase 14 for the unregistered-`job_type`
+sub-claim ([phase-14-plan.md](phase-14-plan.md) §6.3); the `schema_version`-
+in-payload guidance below remains a recommendation, not an enforced
+mechanism.
 
 - A job scheduled far in the future (`scheduled_at`) is durable
   ([scheduling.md](scheduling.md)) and will survive any number of
   deployments between submission and eligibility, by construction — this
   part is already proven (TF-INV-011, SF-013).
-- What is **not** addressed: if the handler for that job's `job_type` is
-  removed or its behavior changes incompatibly between submission and
-  execution, TaskForge has no mechanism to detect or reject this — the
-  job will simply be claimed and handed to whatever handler is currently
-  registered for that `job_type` string, or fail to find one at all
-  (behavior in that case is not documented). PROPOSED: document the
-  expected failure mode when a claimed job's `job_type` has no registered
-  handler, and recommend job authors never repurpose a `job_type` string
-  for an incompatible payload shape.
+- **The unregistered-`job_type` failure mode is now documented and
+  proven, not merely undocumented behavior**: a claimed job whose
+  `job_type` has no registered handler is deterministically dead-lettered
+  via `store.CompleteFailure` with `handler.ErrNoHandler` as the permanent
+  error, logged as `event="permanent_failure"` — this was already
+  implemented as an ordinary part of Phase 3's retry/DLQ machinery and
+  proven by `internal/worker/worker_test.go`'s
+  `TestRunOnce_NoHandlerRegistered`; Phase 14's own contribution is
+  documenting it here and extending the same proof to a workflow node's
+  underlying job (SF-062, below). TaskForge does not otherwise detect a
+  handler's behavior changing *incompatibly* (rather than being removed
+  outright) between submission and execution — this remains the job
+  author's responsibility. Job authors should never repurpose a
+  `job_type` string for an incompatible payload shape; see "Job
+  Payload/Schema Evolution" below for the demonstrated failure mode if
+  this guidance is violated anyway.
 
-## PROPOSED: Workflows Surviving Deployments
+## Workflows Surviving Deployments
+
+Status: **implemented** for the unregistered-`job_type` sub-claim, as of
+Phase 14 ([phase-14-plan.md](phase-14-plan.md) §6.3, SF-062); no
+workflow-definition-versioning system is adopted (unchanged, deliberate
+non-goal).
 
 - A workflow instance's structure (`workflow_instances`/`workflow_nodes`,
   including `depends_on`) is fixed at submission time and is durable
@@ -306,10 +422,19 @@ job handler"). This means:
   known at submission time" — dynamic modification is an explicit
   deferral). This means an in-flight workflow's *shape* cannot be
   affected by a deployment, by construction — a real strength.
-- What is **not** addressed: if a workflow's node `job_type`s are backed by
-  handlers that change behavior (or are removed) between workflow
-  submission and a given node's eventual execution, the same gap as
-  "long-running scheduled jobs" above applies, node-by-node.
+- **A workflow node's job_type with no registered handler now has a
+  proven, defined outcome**: the node's underlying job dead-letters
+  through the identical `ErrNoHandler`/`CompleteFailure` path a plain job
+  uses, and TF-INV-012's completion-propagation cascade correctly fails
+  the enclosing workflow — proven by
+  `TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler`
+  (`internal/worker/worker_test.go`), which confirms this holds even
+  though workflow completion propagation is a different code path than a
+  plain job's terminal transition. If a workflow's node handlers change
+  behavior incompatibly (rather than being removed outright) between
+  submission and a given node's eventual execution, the same
+  payload-shape guidance in "Job Payload/Schema Evolution" applies,
+  node-by-node.
 - No workflow-definition versioning concept exists (there is no
   "workflow template" or named/versioned workflow definition in the schema
   at all — every `POST /workflows` call submits a fully concrete DAG of
@@ -320,9 +445,10 @@ job handler"). This means:
   workflow-definition-versioning system without a demonstrated need for
   one.
 
-## PROPOSED: Backward Compatibility Policy (General Statement)
+## Backward Compatibility Policy (General Statement)
 
-PROPOSED: adopt a policy stating that within a major version, TaskForge:
+Status: **formally adopted** as of Phase 14 ([phase-14-plan.md](phase-14-plan.md)
+§4 item 8). Within a major version, TaskForge:
 
 1. Never removes a documented API field or endpoint without a deprecation
    window (see "API Evolution" above).
@@ -335,40 +461,82 @@ PROPOSED: adopt a policy stating that within a major version, TaskForge:
    silently changing the global default.
 4. Never repurposes an existing metric name for a different meaning
    (only adds new metrics or new labels on existing ones, per
-   [observability.md](observability.md)'s cardinality discipline).
+   [observability.md](observability.md)'s cardinality discipline). Phase
+   14's own two additions (`taskforge_worker_drain_duration_seconds`,
+   `taskforge_worker_drain_timed_out_total`) are the first real test of
+   this rule once adopted: both are new metric names, and no existing
+   Phase 8/12/13 metric's name or meaning changed to add them.
+5. Formally adopts the migrate-first, deploy-second ordering rule (see
+   "Database Migrations" above) as the required deployment sequence, not
+   left to operator judgment.
 
-## PROPOSED: Deprecation Policy
+This is a general statement of intent this project now holds itself to;
+it does not itself invent a semantic-versioning scheme or a tagged-release
+process — see [phase-14-plan.md](phase-14-plan.md) §19 OD-7 for why "one
+minor version of skew" is defined operationally (in terms of adjacent
+phase-boundary commits) rather than in terms of a git tag that does not
+yet exist.
 
-PROPOSED, not yet needed in practice (TaskForge has not yet deprecated
-anything): any deprecation must (a) be announced in `docs/roadmap.md` or a
-successor changelog, (b) remain functional for at least one full
-minor-version cycle, (c) emit a structured log warning (not merely a
-comment) when the deprecated surface is used, so operators can measure
-actual usage before removal, mirroring the existing discipline of never
-silently changing behavior that [invariants.md](invariants.md) already
-embodies for correctness properties.
+## Deprecation Policy
+
+Status: **formally adopted** as of Phase 14
+([phase-14-plan.md](phase-14-plan.md) §4 item 8, §9). Any future
+deprecation must (a) be announced in `docs/roadmap.md` or a successor
+changelog, (b) remain functional for at least one full minor-version
+cycle, (c) emit a structured log warning (not merely a comment) when the
+deprecated surface is used, so operators can measure actual usage before
+removal, mirroring the existing discipline of never silently changing
+behavior that [invariants.md](invariants.md) already embodies for
+correctness properties.
+
+This phase's job is to state, in writing, that this mechanism is now the
+*adopted policy* for any future deprecation — not merely what Phase 11
+happened to build once. The mechanism itself was already implemented in
+Phase 11: the `Deprecation: @1788998400` response header and the
+`deprecated_route_used` structured log line on every legacy-route request
+(see "API Evolution" above). Phase 14 does **not** itself decide to start
+the removal clock for that specific already-in-flight legacy-route
+deprecation — no Sunset date is set here — it only formalizes the policy
+those future decisions must follow.
 
 ## What Is Marked PROPOSED vs. What Actually Exists Today
 
 To be unambiguous, restating what is **not** proposed but already true
-today, because it was built correctly from the start:
+today, because it was built correctly from the start or proven by Phase
+14:
 
 - Schema additions so far have never required breaking an existing server
   version (verified: migrations `0001`→`0004`, and Phases 3/4/6/11 needing
-  zero new migrations).
+  zero new migrations; Phase 14 additionally proves this for real,
+  separately-compiled binaries across the Phase 13 `queue_name` boundary —
+  SF-066/067).
 - Scheduled-job and workflow-structure durability across restarts/deploys
-  is already proven (TF-INV-011, TF-INV-012, SF-013, SF-029).
+  is already proven (TF-INV-011, TF-INV-012, SF-013, SF-029), and the
+  unregistered-`job_type` failure mode for both a plain job and a workflow
+  node is now proven too (SF-062).
 - Job payload opacity is an existing, deliberate architectural property,
-  not a proposal.
+  not a proposal. The failure mode if a `job_type` is repurposed for an
+  incompatible payload shape anyway is now demonstrated, not merely
+  assumed (SF-068) — the guidance to avoid doing so remains PROPOSED
+  guidance, not an enforced mechanism.
 - **As of Phase 11**: the `/v1/` API version prefix, unknown-request-field
   tolerance, the request-body size limit, the `max_attempts`
   no-upper-bound policy decision, and same-PostgreSQL-transaction
   atomicity (`txenqueue`) are all **implemented and proven**, not
   proposed — see the "API Evolution" and "Transactional Enqueue" sections
   above.
+- **As of Phase 14**: expand/migrate/contract (machine-checked, CI-enforced),
+  the two-binary-version rolling-upgrade proof, old/new worker-server
+  compatibility, the migrate-first/deploy-second ordering rule, the
+  graceful worker/API drain contract (real OS-process SIGTERM/SIGKILL
+  tests), the general Backward Compatibility Policy statement, and the
+  Deprecation Policy are all **implemented and proven**, not proposed —
+  see the "Database Migrations", "Rolling Server Upgrades", "Old Worker /
+  New Server and New Worker / Old Server Compatibility", "Backward
+  Compatibility Policy", and "Deprecation Policy" sections above.
 
-Everything else in this document — rolling-upgrade proof, old/new
-worker-server compatibility testing, payload `schema_version` convention,
-and the deprecation window's actual *removal* decision for the legacy
-unprefixed routes — remains **PROPOSED and unimplemented** as of this
-review (targeted at Phase 14, docs/enterprise-roadmap.md).
+Only two items in this document remain **PROPOSED and unimplemented**:
+the job-payload `schema_version` guidance (documentation-only by design,
+not a TaskForge-enforced mechanism), and the actual removal/Sunset date
+for the legacy unprefixed API routes (Phase 14 formalizes the deprecation
+*policy*; it does not itself decide to start that specific clock).

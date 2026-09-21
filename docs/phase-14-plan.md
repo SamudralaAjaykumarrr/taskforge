@@ -1442,38 +1442,61 @@ before it:
 ## 21. Exit criteria
 
 Reproduced from [enterprise-roadmap.md](enterprise-roadmap.md) Phase 14
-"Enterprise exit criteria," annotated with this plan's assessment of
-current status. **None of the checkboxes below are un-checked because a
-decision remains open** — §19 closes every implementation-blocking
-decision this phase had. They are un-checked because the corresponding
-code/test/documentation work has not yet been executed; §20 gives the
-concrete order in which to execute it.
+"Enterprise exit criteria." **Post-implementation update**: every
+criterion below is now implemented and proven; this section originally
+tracked pre-implementation status (see the struck-through per-item notes
+below, kept for the historical record of what this plan estimated before
+implementation started) and is superseded by
+[enterprise-roadmap.md](enterprise-roadmap.md)'s own exit-criteria section,
+now checked off with exact evidence.
 
-- [ ] A two-binary-version (old worker/new server, and new worker/old
+- [x] A two-binary-version (old worker/new server, and new worker/old
       server) integration test exists and passes across a full
-      expand/migrate/contract window. **Not started** — genuinely new
-      infrastructure (§6.2, §8, OD-6, OD-9).
-- [ ] CI runs the down path for every data-safe-reversible migration;
+      expand/migrate/contract window. Implemented:
+      `test/compat/two_binary_test.go`,
+      `TestCompat_SF066_SF067_TwoBinaryVersionAcrossExpandMigrateContractWindow`
+      — real `cmd/worker` binaries pinned to `794abbb...`/`c17f89c...`
+      (§19 OD-6), built via detached `git worktree`s, run concurrently
+      while migrations `0011`→`0014` apply one at a time via
+      `internal/migrate.UpTo`, with `internal/invariant.Checker` clean at
+      every intermediate stage. ~~Not started~~ (was: genuinely new
+      infrastructure, §6.2, §8, OD-6, OD-9).
+- [x] CI runs the down path for every data-safe-reversible migration;
       every forward-fix-only migration is explicitly labeled and CI does
-      not require a down path for it. **Partially present** — every
-      `.down.sql` file already exists and is already prose-labeled
-      (§6.1); the machine-checkable marker, `internal/migrate.Down`, and
-      the CI job itself do not exist yet.
-- [ ] The unregistered-`job_type` failure mode is documented and tested.
-      **Substantially done for plain jobs** (§6.3) — the mechanism and a
-      passing test already exist; remaining work is documentation
-      status flip plus the workflow-node case (SF-062).
-- [ ] A documented, tested graceful-drain (SIGTERM) contract exists for
-      `cmd/worker` and `cmd/api`. **`cmd/api` is largely already
-      correct** and needs documentation + an OS-process-level test
-      (§6.4, SF-063); **`cmd/worker` has a genuine defect** relative to
-      the documented intent and needs an actual code change (§6.4,
-      SF-064) before this criterion can be honestly checked.
-- [ ] [compatibility-policy.md](compatibility-policy.md)'s PROPOSED
+      not require a down path for it. Implemented: the
+      `taskforge:down-migration-status` marker (§8) on all fourteen
+      `.down.sql` files, `internal/migrate.Down`/`UpTo` (new, additive),
+      and `internal/migrate/reversibility_test.go`'s SF-060/061 —
+      enforced by the existing `go test -p 1 ./...` CI step (no separate
+      workflow needed) and, for a fast standalone check, `make
+      migration-audit`. ~~Partially present~~ (was: files existed and
+      were prose-labeled; the marker, `Down`, and CI enforcement did not).
+- [x] The unregistered-`job_type` failure mode is documented and tested.
+      Implemented: `TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler`
+      (`internal/worker/worker_test.go`) extends the pre-existing plain-job
+      proof to a workflow node, and
+      [compatibility-policy.md](compatibility-policy.md)'s status flipped
+      accordingly. ~~Substantially done for plain jobs~~ (was: workflow-node
+      case, SF-062, and the doc status flip remained).
+- [x] A documented, tested graceful-drain (SIGTERM) contract exists for
+      `cmd/worker` and `cmd/api`. Implemented: `Worker.SetDrainTimeout`
+      (opt-in, additive; `cmd/worker`'s sole use,
+      `TASKFORGE_WORKER_DRAIN_TIMEOUT` default 30s) and `cmd/api`'s
+      `BaseContext`/`srv.Close` redesign
+      (`TASKFORGE_API_SHUTDOWN_TIMEOUT` default 10s), proven at the real
+      OS-process level by `test/procs` (SF-063/064/065/069/070) and
+      in-process by `internal/worker/drain_test.go` (SF-064a) plus an
+      unmodified re-run of Phase 5's `TestStress_WorkerPoolGracefulShutdown_*`
+      (SF-064b). ~~`cmd/worker` has a genuine defect~~ (was: the pre-Phase-14
+      immediate-cancellation-on-SIGTERM behavior contradicted the
+      documented drain intent; now corrected, opt-in, and regression-proven).
+- [x] [compatibility-policy.md](compatibility-policy.md)'s PROPOSED
       markers are updated to reflect what is now actually proven vs.
-      still proposed. **Not started** — depends on every other criterion
-      above landing first, since this is the summary status update, not
-      independent work.
+      still proposed. Implemented: every section this phase proves is
+      flipped to "Status: implemented", citing the specific tests above;
+      only the job-payload `schema_version` guidance and the legacy
+      routes' actual removal date remain PROPOSED, by design (§5, §19
+      OD-5).
 
 ## 22. Cross-references
 

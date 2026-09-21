@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Dropping a check constraint is catalog-only and always safe: it removes a
 -- restriction, loses no data, and re-running 0008's up restores it (0009's
 -- up then re-validates it).

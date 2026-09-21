@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Data-safe-reversible (docs/compatibility-policy.md): dropping an
 -- additive column with a fixed default loses no information a rollback
 -- would need to preserve -- every row's queue_name is 'default' or a

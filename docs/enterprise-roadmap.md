@@ -932,17 +932,38 @@ never actually changed would be a hollow proof).
   signal.
 
 ### Enterprise exit criteria
-- [ ] A two-binary-version (old worker/new server, and new worker/old
+- [x] A two-binary-version (old worker/new server, and new worker/old
       server) integration test exists and passes across a full expand/
       migrate/contract window (mirrors
       [enterprise-readiness.md](enterprise-readiness.md)'s own exit criterion).
-- [ ] CI runs the down path for every data-safe-reversible migration; every
+      `test/compat/two_binary_test.go`, SF-066/067: real `cmd/worker`
+      binaries pinned to `794abbb...`/`c17f89c...`, built via detached
+      `git worktree`s, run concurrently while migrations `0011`→`0014`
+      apply one at a time via `internal/migrate.UpTo`.
+- [x] CI runs the down path for every data-safe-reversible migration; every
       forward-fix-only migration is explicitly labeled and CI does not
-      require a down path for it.
-- [ ] The unregistered-`job_type` failure mode is documented and tested.
-- [ ] A documented, tested graceful-drain (SIGTERM) contract exists for
-      `cmd/worker` and `cmd/api`.
-- [ ] [compatibility-policy.md](compatibility-policy.md)'s PROPOSED markers
+      require a down path for it. `internal/migrate/reversibility_test.go`
+      (SF-060/061), enforced by the existing `go test -p 1 ./...` CI step —
+      no separate workflow file needed.
+- [x] The unregistered-`job_type` failure mode is documented and tested.
+      Already-implemented for plain jobs
+      (`TestRunOnce_NoHandlerRegistered`); extended to workflow nodes by
+      SF-062 (`TestRunOnce_SF062_WorkflowNodeWithNoRegisteredHandler`).
+- [x] A documented, tested graceful-drain (SIGTERM) contract exists for
+      `cmd/worker` and `cmd/api`. `cmd/worker`'s opt-in
+      `Worker.SetDrainTimeout` (`TASKFORGE_WORKER_DRAIN_TIMEOUT`, default
+      30s) and `cmd/api`'s `BaseContext`/`srv.Close`
+      (`TASKFORGE_API_SHUTDOWN_TIMEOUT`, default 10s), proven at the real
+      OS-process level by `test/procs` (SF-063/064/065/069/070) and, for
+      the unchanged default contract, `internal/worker/drain_test.go`
+      (SF-064a) plus an unmodified re-run of Phase 5's
+      `TestStress_WorkerPoolGracefulShutdown_*` (SF-064b). **Behavior
+      change an upgrading operator must be aware of**: pre-Phase-14
+      workers cancel in-flight work immediately on SIGTERM;
+      post-Phase-14 workers (`cmd/worker` only — the `Worker` Go type's
+      own default is unchanged) drain it, up to a configurable timeout.
+      This is a desired compatibility improvement, not a regression.
+- [x] [compatibility-policy.md](compatibility-policy.md)'s PROPOSED markers
       are updated to reflect what is now actually proven vs. still proposed.
 
 ---

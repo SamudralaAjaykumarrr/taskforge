@@ -101,6 +101,16 @@ type Worker struct {
 	// non-empty value, set via SetQueues, restricts both a fresh claim and
 	// a reclaim of an expired lease identically (§6b).
 	queues []string
+	// drainTimeout is Phase 14's opt-in graceful-drain grace period
+	// (docs/phase-14-plan.md §6.4, ADR-0010's compatibility-policy
+	// counterpart). Its zero value (every Worker constructed by New,
+	// unless SetDrainTimeout is later called with a positive value) means
+	// "cancel in-flight execution immediately when Run's context is
+	// cancelled" -- byte-for-byte today's pre-Phase-14 behavior. Only a
+	// positive value, set via SetDrainTimeout, opts a *Worker instance
+	// into waiting up to that long for an in-flight job to finish once
+	// Run's context is cancelled, before cancelling it.
+	drainTimeout time.Duration
 }
 
 // New constructs a Worker. id is the lease_owner value recorded on every
@@ -151,6 +161,23 @@ func (w *Worker) SetQueues(queues []string) {
 	}
 	w.queues = queues
 }
+
+// SetDrainTimeout opts this Worker into Phase 14's graceful-drain contract
+// (docs/phase-14-plan.md §6.4): when Run's context is cancelled (e.g.
+// SIGTERM in cmd/worker), a Worker with a positive drain timeout lets
+// whatever job it is currently executing keep running, under an
+// independent context no longer tied to Run's own, for up to d from the
+// moment Run's context is cancelled -- not from claim time -- before that
+// job's execution context is cancelled.
+//
+// The zero value (d <= 0, including never calling this method at all --
+// the state every Worker constructed by New is already in) means "cancel
+// immediately," which is exactly today's pre-Phase-14 behavior for every
+// existing caller: SetDrainTimeout is purely additive to *Worker's public
+// surface, and no existing caller's behavior changes because none of them
+// call it. Only cmd/worker calls this, wiring it to
+// TASKFORGE_WORKER_DRAIN_TIMEOUT (default 30s) -- see cmd/worker/main.go.
+func (w *Worker) SetDrainTimeout(d time.Duration) { w.drainTimeout = d }
 
 // RunOnce attempts to claim and fully execute a single job (which may be a
 // fresh QUEUED/RETRY_WAIT job, or a reclaim of a previously RUNNING job
@@ -212,8 +239,25 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		return true, ferr
 	}
 
+	// workCtx is what runWithHeartbeat's heartbeats and every completion
+	// call below use, instead of ctx directly, whenever this Worker has
+	// opted into Phase 14's drain contract (docs/phase-14-plan.md §6.4).
+	// ctx is the poll-gating context (cancelled the instant SIGTERM
+	// arrives in cmd/worker) -- using it for a completion call made AFTER
+	// that cancellation would fail immediately, defeating the entire
+	// point of draining (finishing the job AND reporting its outcome).
+	// workCtx is deliberately detached from ctx in that case, so a job
+	// that finishes within the configured drain window is reported
+	// exactly as if no shutdown were in progress. When this Worker has
+	// not opted in (the default), workCtx IS ctx -- byte-for-byte
+	// unchanged from pre-Phase-14 behavior.
+	workCtx := ctx
+	if w.drainTimeout > 0 {
+		workCtx = context.Background()
+	}
+
 	log.Info("execution starting", "event", "execution_start")
-	result, execErr, disposition := w.runWithHeartbeat(ctx, log, j, h)
+	result, execErr, disposition := w.runWithHeartbeat(ctx, workCtx, log, j, h)
 
 	switch disposition {
 	case dispositionLeaseLost:
@@ -225,6 +269,18 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		// authoritative owner" behavior docs/worker-protocol.md requires.
 		log.Warn("lease lost during execution; not attempting completion", "event", "lease_lost")
 		return true, nil
+	case dispositionDraining:
+		// Phase 14 (docs/phase-14-plan.md §6.4, §19 OD-3): the configured
+		// drain timeout elapsed before this attempt finished on its own.
+		// No Complete* call is made at all -- the job's row is left
+		// exactly as it was (RUNNING, under this worker's lease), to be
+		// reclaimed through the existing, unmodified TF-INV-004 path, the
+		// identical outcome an ordinary worker crash at this exact
+		// instant would produce. Deliberately never reachable unless
+		// SetDrainTimeout was called with a positive value.
+		log.Warn("drain timeout elapsed before execution finished; leaving lease to expire and be reclaimed",
+			"event", "drain_timeout_exceeded")
+		return true, nil
 	case dispositionCancelled:
 		// A cancellation request was durably observed during execution
 		// (see runWithHeartbeat) -- acknowledge it regardless of what the
@@ -235,20 +291,20 @@ func (w *Worker) RunOnce(ctx context.Context) (claimed bool, err error) {
 		// side effect anyway, that side effect is not undone -- this is
 		// documented, not hidden (see README's cooperative-cancellation
 		// limitation).
-		return true, w.reportCancelled(ctx, log, j)
+		return true, w.reportCancelled(workCtx, log, j)
 	case dispositionTimedOut:
 		// This attempt's execution-timeout deadline fired (see
 		// runWithHeartbeat's execCtx) -- report TIMED_OUT regardless of
 		// what the handler itself ultimately returned, since it did not
 		// confirm an outcome within its configured budget.
-		return true, w.reportTimeout(ctx, log, j)
+		return true, w.reportTimeout(workCtx, log, j)
 	}
 
 	if execErr != nil {
-		return true, w.reportFailure(ctx, log, j, execErr)
+		return true, w.reportFailure(workCtx, log, j, execErr)
 	}
 
-	completed, cerr := w.store.CompleteSuccess(ctx, j.ID, w.ID, j.LeaseGeneration, result.Metadata)
+	completed, cerr := w.store.CompleteSuccess(workCtx, j.ID, w.ID, j.LeaseGeneration, result.Metadata)
 	if errors.Is(cerr, store.ErrStaleTransition) {
 		log.Warn("success report rejected: lease no longer current", "event", "stale_completion_rejected")
 		return true, nil
@@ -409,6 +465,13 @@ const (
 	// handler returned -- report CompleteTimeout, not whatever the
 	// handler returned.
 	dispositionTimedOut
+	// dispositionDraining means this Worker was opted into Phase 14's
+	// drain contract (SetDrainTimeout called with a positive value), the
+	// outer (poll-gating) context was cancelled, and the configured drain
+	// timeout then elapsed before the handler returned -- no completion
+	// call of any kind should be attempted (docs/phase-14-plan.md §6.4).
+	// Never reachable for a Worker that has not opted in.
+	dispositionDraining
 )
 
 // runWithHeartbeat executes h against j, renewing the job's LEASE on a
@@ -443,11 +506,30 @@ const (
 // is documented, not hidden — see README's cooperative-cancellation and
 // timeout limitations.
 //
-// The heartbeat goroutine is guaranteed to have exited before this
-// function returns (via the <-done receive below), so RunOnce never
-// leaks a heartbeat goroutine or ticker across calls, on any exit path
-// (normal completion, lease loss, cancellation, or timeout).
-func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.Job, h handler.Handler) (result handler.Result, execErr error, disposition attemptDisposition) {
+// The heartbeat goroutine (and, when this Worker has opted into Phase
+// 14's drain contract, the drain-timeout watcher goroutine below) is
+// guaranteed to have exited before this function returns (via the <-done
+// and <-drainWatchDone receives), so RunOnce never leaks a heartbeat
+// goroutine, ticker, or drain watcher across calls, on any exit path
+// (normal completion, lease loss, cancellation, timeout, or drain
+// timeout).
+//
+// pollCtx is Run's own context -- cancelled the instant SIGTERM arrives
+// in cmd/worker, and watched here only to detect that cancellation; it is
+// never itself the parent of execCtx or of any heartbeat's context.
+// workCtx is what execCtx and every heartbeat are actually derived from:
+// when this Worker has not opted into the drain contract (the default),
+// RunOnce passes workCtx == pollCtx, so execCtx = context.WithTimeout(pollCtx,
+// executionTimeout) is exactly today's pre-Phase-14 expression, unchanged
+// in any way -- cancelling pollCtx cancels execCtx immediately, with no
+// grace period, byte-for-byte the existing contract. When this Worker has
+// opted in, RunOnce passes a workCtx detached from pollCtx
+// (context.Background()), so execCtx and every heartbeat continue
+// completely undisturbed by pollCtx's cancellation on their own; only the
+// drain-timeout watcher goroutine below, started only in that case, is
+// what eventually cancels execCtx once the configured grace period
+// elapses.
+func (w *Worker) runWithHeartbeat(pollCtx, workCtx context.Context, log *slog.Logger, j *job.Job, h handler.Handler) (result handler.Result, execErr error, disposition attemptDisposition) {
 	executionTimeout := time.Duration(j.ExecutionTimeoutSeconds) * time.Second
 
 	// execCtx's deadline is the execution-timeout mechanism: fixed at
@@ -455,9 +537,9 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 	// context.WithCancel (Phase 1-5's shape) — WithTimeout gives us a
 	// distinguishable execCtx.Err() (context.DeadlineExceeded) when the
 	// budget itself elapses, versus context.Canceled when this function
-	// calls cancelExec() explicitly (lease loss or cancellation
-	// observed, both checked below).
-	execCtx, cancelExec := context.WithTimeout(ctx, executionTimeout)
+	// calls cancelExec() explicitly (lease loss, cancellation observed,
+	// or drain timeout, all checked below).
+	execCtx, cancelExec := context.WithTimeout(workCtx, executionTimeout)
 	defer cancelExec()
 
 	// leaseDuration is both the initial claim's lease window and every
@@ -474,6 +556,7 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 	var mu sync.Mutex
 	leaseLost := false
 	cancelObserved := false
+	drainTimedOut := false
 
 	done := make(chan struct{})
 	go func() {
@@ -485,7 +568,7 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 			case <-execCtx.Done():
 				return
 			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(ctx, interval)
+				hbCtx, hbCancel := context.WithTimeout(workCtx, interval)
 				hbJob, herr := w.store.Heartbeat(hbCtx, j.ID, w.ID, j.LeaseGeneration, leaseDuration)
 				hbCancel()
 				if herr == nil {
@@ -518,10 +601,39 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 		}
 	}()
 
+	// drainWatchDone is closed once the drain-timeout watcher goroutine
+	// below has exited -- or immediately, when this Worker has not
+	// opted into the drain contract at all, since no such goroutine is
+	// started in that case (docs/phase-14-plan.md §6.4: "this goroutine
+	// is never started at all" in the default case).
+	drainWatchDone := make(chan struct{})
+	if w.drainTimeout > 0 {
+		go func() {
+			defer close(drainWatchDone)
+			select {
+			case <-execCtx.Done():
+				return // the attempt finished (or was cancelled for an unrelated reason) before pollCtx was ever cancelled
+			case <-pollCtx.Done():
+			}
+			select {
+			case <-execCtx.Done():
+				return // the attempt finished on its own within the drain window
+			case <-time.After(w.drainTimeout):
+				mu.Lock()
+				drainTimedOut = true
+				mu.Unlock()
+				cancelExec()
+			}
+		}()
+	} else {
+		close(drainWatchDone)
+	}
+
 	result, execErr = h.Execute(execCtx, j)
 	deadlineExceeded := errors.Is(execCtx.Err(), context.DeadlineExceeded)
 	cancelExec()
-	<-done // deterministic cleanup: never return before the heartbeat goroutine has exited
+	<-done           // deterministic cleanup: never return before the heartbeat goroutine has exited
+	<-drainWatchDone // ...nor before the drain-timeout watcher (if any) has exited
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -530,6 +642,8 @@ func (w *Worker) runWithHeartbeat(ctx context.Context, log *slog.Logger, j *job.
 		disposition = dispositionLeaseLost
 	case cancelObserved:
 		disposition = dispositionCancelled
+	case drainTimedOut:
+		disposition = dispositionDraining
 	case deadlineExceeded:
 		disposition = dispositionTimedOut
 	default:

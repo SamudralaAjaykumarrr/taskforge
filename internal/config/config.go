@@ -79,6 +79,31 @@ type Config struct {
 	// TASKFORGE_WORKER_QUEUES unset must reproduce that exact behavior,
 	// not silently narrow to "default" only. See FromEnv's doc comment.
 	WorkerQueues []string
+
+	// WorkerDrainTimeout is Phase 14's graceful-drain grace period
+	// (docs/phase-14-plan.md §6.4/§9, §19 OD-3): the upper bound on how
+	// long cmd/worker waits for an in-flight job to finish after SIGTERM,
+	// independent of that job's own execution_timeout_seconds. Default
+	// 30s, matching Kubernetes' own default terminationGracePeriodSeconds
+	// so an operator deploying under default Kubernetes settings does not
+	// silently race their orchestrator's SIGKILL against this window.
+	// This is a cmd/worker/internal/config default only -- it is wired
+	// into a *worker.Worker via the additive Worker.SetDrainTimeout,
+	// never internal/worker.Worker's own zero value (which remains "cancel
+	// immediately," unchanged, for every caller that does not explicitly
+	// opt in).
+	WorkerDrainTimeout time.Duration
+
+	// APIShutdownTimeout is Phase 14's cmd/api graceful-shutdown budget
+	// (docs/phase-14-plan.md §6.4/§9, §19 OD-4): the deadline passed to
+	// http.Server.Shutdown, and the point at which cmd/api's BaseContext
+	// is explicitly cancelled so any handler still running past the
+	// deadline observes cancellation promptly instead of being silently
+	// abandoned. Default 10s, reproducing cmd/api's pre-Phase-14
+	// hardcoded value exactly -- this phase makes the duration
+	// configurable and adds the explicit-cancellation-at-deadline
+	// behavior, without changing the default duration itself.
+	APIShutdownTimeout time.Duration
 }
 
 // MinAPIKeyPepperLength is the shortest pepper cmd/api will start with.
@@ -112,6 +137,12 @@ const MinAPIKeyPepperLength = 32
 //	TASKFORGE_MAX_INFLIGHT_SUBMISSIONS (Phase 13, docs/phase-13-plan.md
 //	  §8 OD-6; default "0", parsed as an integer). 0 or unset disables the
 //	  system-capacity 503 bound entirely.
+//	TASKFORGE_WORKER_DRAIN_TIMEOUT (Phase 14, docs/phase-14-plan.md
+//	  §6.4/§9; default "30s", parsed by time.ParseDuration). Read by
+//	  cmd/worker only.
+//	TASKFORGE_API_SHUTDOWN_TIMEOUT (Phase 14, docs/phase-14-plan.md
+//	  §6.4/§9; default "10s", parsed by time.ParseDuration). Read by
+//	  cmd/api only.
 //
 // FromEnv itself does NOT require the pepper, because cmd/worker and the
 // chaos harness legitimately have no HTTP surface and no credentials to
@@ -163,6 +194,24 @@ func FromEnv() (Config, error) {
 		maxInflight = n
 	}
 
+	workerDrainTimeout := 30 * time.Second
+	if raw := os.Getenv("TASKFORGE_WORKER_DRAIN_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid TASKFORGE_WORKER_DRAIN_TIMEOUT %q: %w", raw, err)
+		}
+		workerDrainTimeout = d
+	}
+
+	apiShutdownTimeout := 10 * time.Second
+	if raw := os.Getenv("TASKFORGE_API_SHUTDOWN_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid TASKFORGE_API_SHUTDOWN_TIMEOUT %q: %w", raw, err)
+		}
+		apiShutdownTimeout = d
+	}
+
 	return Config{
 		DatabaseURL:            dbURL,
 		HTTPAddr:               addr,
@@ -172,6 +221,8 @@ func FromEnv() (Config, error) {
 		APIKeyPepper:           []byte(os.Getenv(envAPIKeyPepper)),
 		WorkerQueues:           parseWorkerQueues(os.Getenv("TASKFORGE_WORKER_QUEUES")),
 		MaxInflightSubmissions: maxInflight,
+		WorkerDrainTimeout:     workerDrainTimeout,
+		APIShutdownTimeout:     apiShutdownTimeout,
 	}, nil
 }
 

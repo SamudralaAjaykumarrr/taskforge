@@ -32,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -138,10 +139,28 @@ func run(logger *slog.Logger) error {
 		api.WithMetricsEndpoint(promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})),
 	)
 
+	// Phase 14 (docs/phase-14-plan.md §6.4/§9, §19 OD-4): baseCtx is a
+	// single, process-lifetime context handed to every request via
+	// http.Server.BaseContext (never a per-request context -- Go derives
+	// each request's own r.Context() FROM this one, cancelling it too).
+	// Without this, http.Server's default BaseContext is
+	// context.Background() for every request, and a handler still
+	// running once srv.Shutdown's deadline passes is silently abandoned
+	// at process exit -- an inherited stdlib default nobody in this
+	// codebase decided on purpose. This process now decides it
+	// explicitly: baseCtx is cancelled immediately after srv.Shutdown
+	// returns (whether every handler finished on its own or the deadline
+	// passed), so any handler still running at that point observes
+	// cancellation through r.Context() promptly instead of running to
+	// whatever completion it eventually reaches, unobserved.
+	baseCtx, cancelBaseCtx := context.WithCancel(context.Background())
+	defer cancelBaseCtx()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return baseCtx },
 	}
 
 	serveCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -160,9 +179,36 @@ func run(logger *slog.Logger) error {
 		}
 		return nil
 	case <-serveCtx.Done():
-		logger.Info("shutting down api server")
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		logger.Info("api shutdown started", "event", "api_shutdown_started", "shutdown_timeout", cfg.APIShutdownTimeout.String())
+		shutdownStartedAt := time.Now()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.APIShutdownTimeout)
 		defer shutdownCancel()
-		return srv.Shutdown(shutdownCtx)
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		// Cancel baseCtx only AFTER Shutdown returns -- whether every
+		// handler finished on its own or the deadline passed -- so a
+		// still-running handler's r.Context() is cancelled exactly once,
+		// at the moment this process has committed to exiting, never
+		// before an ordinary within-budget request has had its full
+		// configured window to finish.
+		cancelBaseCtx()
+		// srv.Shutdown alone does not forcibly interrupt a handler
+		// blocked on I/O against a connection Shutdown's own deadline
+		// gave up waiting on (e.g. a slow client still streaming a
+		// request body) -- cancelling baseCtx changes what r.Context()
+		// reports, but a blocked net.Conn.Read is not itself watching
+		// context cancellation. srv.Close forcibly closes every
+		// remaining listener and connection, which is what actually
+		// unblocks that read/write and lets the abandoned handler's
+		// goroutine return. Calling it unconditionally is safe: when
+		// Shutdown already finished gracefully, there is nothing left
+		// for Close to do.
+		_ = srv.Close()
+		outcome := "graceful"
+		if errors.Is(shutdownErr, context.DeadlineExceeded) {
+			outcome = "deadline_exceeded"
+		}
+		logger.Info("api shutdown completed", "event", "api_shutdown_completed",
+			"outcome", outcome, "duration_seconds", time.Since(shutdownStartedAt).Seconds())
+		return shutdownErr
 	}
 }

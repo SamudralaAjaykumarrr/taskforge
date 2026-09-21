@@ -1,5 +1,5 @@
 .PHONY: build test test-race vet fmt-check up down test-chaos chaos-stress chaos-soak \
-	vulncheck sbom release-build release-metadata checksums
+	vulncheck sbom release-build release-metadata checksums migration-audit
 
 build:
 	go build ./...
@@ -35,6 +35,17 @@ down:
 # verbose reruns during chaos-harness development.
 test-chaos:
 	go test -p 1 -v ./internal/chaos/...
+
+# Phase 14 ("Upgrade & Compatibility Proof", docs/phase-14-plan.md §8,
+# ADR-0010): the migration-label/reversibility audit -- every migration
+# file must carry a valid taskforge:down-migration-status marker, and
+# every data-safe-reversible migration's down-then-up-again cycle must
+# reproduce an identical schema. This is already part of `test`/`test-race`
+# above (it's an ordinary Go test package, and CI's existing `go test -p 1
+# ./...` step already runs it on every push/PR); this target just isolates
+# it for a fast, standalone check, mirroring test-chaos's precedent.
+migration-audit:
+	go test -p 1 -v -run 'TestMigrations_SF060|TestMigrations_SF061' ./internal/migrate/...
 
 # chaos-stress and chaos-soak are cmd/chaos's manually invoked, heavier
 # counterparts -- see cmd/chaos's package doc comment and README.md's
