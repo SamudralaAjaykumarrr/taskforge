@@ -548,3 +548,134 @@ func TestSlotTable_SF053_PerRowConsistencyUnderSustainedMixedLoad(t *testing.T) 
 	}
 	require.Less(t, rounds, 40, "sustained load did not converge within the round budget")
 }
+
+// TestSlotTable_SF053_SweepDeadlockFreeUnderConcurrentClaims is issue #24's
+// regression proof: it forces MANY jobs to be simultaneously eligible for
+// the Lazy Dead-Letter Sweep (RUNNING, lease expired, attempt budget
+// exhausted) in one queue, then fires many concurrent Claim calls, each of
+// which runs sweepExpiredExhaustedLeases (claim.go) as the very first
+// statement of its own transaction, against that SAME overlapping
+// candidate set, repeated across several rounds.
+//
+// Before the fix, sweepExpiredExhaustedLeases's UPDATE had no ORDER BY, so
+// PostgreSQL gave no guarantee that two concurrent executions of that
+// identical multi-row, blocking (non-SKIP-LOCKED) UPDATE would lock an
+// overlapping row set in the same relative order -- when they didn't, two
+// concurrent sweeps could each hold a lock the other was waiting on: a
+// genuine PostgreSQL deadlock (SQLSTATE 40P01), reported here by
+// require.NoError on s.Claim's returned error exactly as it was reported
+// against the original issue. This test's much larger, fully-overlapping
+// exhausted-and-expired set (every job in the queue, every round) makes
+// that lock-order race far more likely to occur within a single run than
+// TestSlotTable_SF053_PerRowConsistencyUnderSustainedMixedLoad's mixed
+// load, where only a minority of jobs are ever simultaneously
+// sweep-eligible -- see docs/adr/0009-phase-13-concurrency-and-fairness.md
+// and TaskForge issue #24 for the full deadlock detail this reproduced
+// (two processes each "waiting for ShareLock on transaction ... blocked
+// by process ...", both "while locking tuple ... in relation jobs").
+//
+// The fix (claim.go's sweepExpiredExhaustedLeases) sorts every candidate
+// row by its primary key before locking it, in a CTE, so every concurrent
+// sweep locks its overlapping rows in the same ascending-id order --
+// making the cycle this test reproduced impossible without weakening
+// SF-053, changing reclaim semantics, or masking SQLSTATE 40P01 behind a
+// test-level retry.
+func TestSlotTable_SF053_SweepDeadlockFreeUnderConcurrentClaims(t *testing.T) {
+	db := testutil.DB(t)
+	s := store.New(db)
+	ctx := context.Background()
+
+	const numJobsPerRound = 60
+	const numWorkers = 40
+	const rounds = 6
+	// capacity == numJobsPerRound: every job in a round can be claimed at
+	// once, with no slot-capacity bottleneck limiting how many
+	// simultaneously-RUNNING rows this test can force into the
+	// sweep-eligible set together.
+	provisionQueueSlots(t, db, "sweep-deadlock", numJobsPerRound)
+
+	for round := 0; round < rounds; round++ {
+		// maxAttempts = 1: the FIRST claim already exhausts the retry
+		// budget (attempt_count == max_attempts immediately), so
+		// force-expiring the lease right after claiming makes every job
+		// simultaneously sweep-eligible (RUNNING, expired, exhausted)
+		// without needing multiple claim/retry cycles to reach
+		// exhaustion.
+		for i := 0; i < numJobsPerRound; i++ {
+			_, err := s.Insert(ctx, newJobParamsQueueN("test.p13.slot.sweep_deadlock", "sweep-deadlock", 1))
+			require.NoError(t, err)
+		}
+
+		// Seed as many of this round's jobs to RUNNING as the queue's
+		// capacity currently allows, one at a time (deliberately
+		// sequential, and deliberately NOT force-expiring as it goes):
+		// every s.Claim call sweeps first, so force-expiring job N before
+		// claiming job N+1 would let that very next Claim call's own
+		// sweep dead-letter job N before it ever reaches the measured
+		// wave below, silently shrinking the candidate set the wave is
+		// supposed to race over. This does not require claiming exactly
+		// numJobsPerRound: a PRIOR round's own measured wave is not
+		// guaranteed to have swept every one of ITS rows before this
+		// round starts (that is fine -- see the comment below the
+		// measured wave), so some of this round's capacity may still be
+		// legitimately occupied by carryover from the previous round when
+		// seeding starts; this round's very first Claim call sweeps that
+		// carryover away regardless (sweep is unconditional and
+		// unbounded, every call), freeing it for the REST of this
+		// seeding loop. Seeding order/concurrency is irrelevant to the
+		// deadlock this test targets -- only the MEASURED wave needs to
+		// be concurrent -- so all seeding claims finish, un-expired,
+		// before any lease is touched.
+		var seededIDs []uuid.UUID
+		for i := 0; i < numJobsPerRound; i++ {
+			j, ok, err := s.Claim(ctx, fmt.Sprintf("seed-r%d-w%03d", round, i))
+			require.NoError(t, err)
+			if !ok {
+				break
+			}
+			seededIDs = append(seededIDs, j.ID)
+		}
+		require.NotEmpty(t, seededIDs, "seeding must claim at least one job to build a sweep-eligible set for the measured wave")
+		// Now force-expire every seeded job's lease in one pass, with no
+		// further Claim calls interleaved, so every seeded row becomes
+		// RUNNING+expired+exhausted simultaneously and stays that way
+		// until the measured wave below.
+		for _, id := range seededIDs {
+			forceExpireLease(t, db, id)
+		}
+
+		// Now fire a large wave of concurrent Claim calls against that
+		// fully-overlapping sweep-eligible set. Every worker's
+		// transaction runs sweepExpiredExhaustedLeases against the SAME
+		// large candidate set as its very first statement -- exactly the
+		// concurrent-sweep-vs-sweep collision issue #24's deadlock
+		// requires -- regardless of whether any of this round's jobs are
+		// still QUEUED for it to claim afterward.
+		var wg sync.WaitGroup
+		errsCh := make(chan error, numWorkers)
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			workerID := w
+			go func() {
+				defer wg.Done()
+				_, _, err := s.Claim(ctx, fmt.Sprintf("sweep-deadlock-r%d-w%03d", round, workerID))
+				if err != nil {
+					errsCh <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errsCh)
+		for err := range errsCh {
+			require.NoError(t, err, "Claim must never fail with a PostgreSQL deadlock (SQLSTATE 40P01) from the Lazy Dead-Letter Sweep's own row locking")
+		}
+		// Not asserted here: that this one wave swept every row (it need
+		// not -- sweepExpiredExhaustedLeases runs again on every future
+		// Claim call, including next round's seeding, so any row this
+		// particular wave didn't reach is still swept before it could
+		// ever be double-counted or mistaken for a live job; SF-053's
+		// per-row invariant, checked below, holds regardless of how many
+		// of this round's rows this specific wave happened to reach).
+		assertPerRowSlotConsistency(t, db, "sweep-deadlock")
+	}
+}

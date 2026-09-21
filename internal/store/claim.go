@@ -705,7 +705,44 @@ func (s *Store) recordSweptJobs(swept []sweptJob) {
 // method itself performs no observability side effect, since its work is
 // not yet durable until the caller's transaction commits.
 func (s *Store) sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) ([]sweptJob, error) {
+	// SF-053 regression (TaskForge issue #24): this is a multi-row UPDATE
+	// -- unlike every other jobs-table write in this package, it is not
+	// bounded to a single targeted row (WHERE id = $1) or protected by
+	// SKIP LOCKED (the claim pick queries' FOR UPDATE SKIP LOCKED ... LIMIT
+	// 1). It must take a blocking row lock on EVERY currently
+	// expired-and-exhausted row across the whole table, in one statement,
+	// so no candidate can be silently left un-dead-lettered (SKIP LOCKED
+	// would be wrong here: a row this sweep skips stays wrongly RUNNING
+	// until some later Claim call's sweep catches it, which is still
+	// eventually correct but was rejected in favor of matching this
+	// method's existing "resolved by the time this transaction commits"
+	// contract). Without an explicit ORDER BY, PostgreSQL gives no
+	// guarantee that two concurrent executions of this identical statement
+	// lock an overlapping row set in the same relative order (the chosen
+	// scan path, e.g. idx_jobs_reclaimable_by_queue vs. a sequential/
+	// bitmap scan, can differ run to run as the table's size and
+	// statistics change over the table's lifetime) -- when it doesn't,
+	// two concurrent sweeps can each hold a lock the other is waiting on,
+	// a genuine PostgreSQL deadlock (SQLSTATE 40P01), not a serialization
+	// anomaly needing a retry. The CTE below sorts every
+	// candidate row by its primary key BEFORE locking it (confirmed by
+	// EXPLAIN: the LockRows node sits above the Sort node, so FOR UPDATE
+	// acquires locks in that sorted order, not scan order) -- every
+	// concurrent sweep now locks its overlapping rows in the same
+	// ascending-id order, which makes a lock cycle between two sweeps
+	// impossible, exactly the discipline this package's own claim queries
+	// already apply to their own single-row FOR UPDATE picks. See
+	// TestSlotTable_SF053_SweepDeadlockFreeUnderConcurrentClaims.
 	rows, err := tx.QueryContext(ctx, `
+		WITH to_sweep AS (
+			SELECT id
+			FROM jobs
+			WHERE state = 'RUNNING'
+			  AND lease_expires_at < now()
+			  AND attempt_count >= max_attempts
+			ORDER BY id
+			FOR UPDATE
+		)
 		UPDATE jobs
 		SET state = 'DEAD_LETTERED',
 			lease_owner = NULL,
@@ -716,10 +753,9 @@ func (s *Store) sweepExpiredExhaustedLeases(ctx context.Context, tx *sql.Tx) ([]
 			terminal_attempt_count = COALESCE(jobs.terminal_attempt_count, jobs.attempt_count),
 			updated_at = now(),
 			version = version + 1
-		WHERE state = 'RUNNING'
-		  AND lease_expires_at < now()
-		  AND attempt_count >= max_attempts
-		RETURNING id, job_type, attempt_count`)
+		FROM to_sweep
+		WHERE jobs.id = to_sweep.id
+		RETURNING jobs.id, jobs.job_type, jobs.attempt_count`)
 	if err != nil {
 		return nil, fmt.Errorf("sweep expired-exhausted leases: %w", err)
 	}
