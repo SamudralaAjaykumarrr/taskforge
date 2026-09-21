@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Drops what 0009's up built. Always safe: removing indexes loses no data,
 -- and re-running 0009's up rebuilds all three.
 --

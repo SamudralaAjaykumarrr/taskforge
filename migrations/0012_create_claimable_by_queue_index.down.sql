@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Data-safe-reversible: dropping an index loses no data. Re-running the
 -- up migration after this is safe (IF NOT EXISTS).
 

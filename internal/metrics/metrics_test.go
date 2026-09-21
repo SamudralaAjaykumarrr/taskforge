@@ -80,6 +80,10 @@ func TestNew_RegistersExactlyTheDocumentedMetrics(t *testing.T) {
 		// therefore correctly absent here too, by that same rule).
 		"taskforge_retention_sweep_duration_seconds": true,
 		"taskforge_retention_sweep_errors_total":     true,
+		// Phase 14: also unlabeled, also always present once registered,
+		// by the same rule.
+		"taskforge_worker_drain_duration_seconds": true,
+		"taskforge_worker_drain_timed_out_total":  true,
 	}
 	got := make(map[string]bool, len(families))
 	for _, fam := range families {

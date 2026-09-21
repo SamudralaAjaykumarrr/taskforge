@@ -697,6 +697,7 @@ no existing test's assertions weakened.
 | **Race tests** | Deterministic interleavings of cancel-vs-complete, forced via held-open transactions or synchronization points in test code. | SF-012. |
 | **Load tests** | Sustained throughput against realistic job volume, verifying the claim index strategy holds up and metrics remain accurate under load. | Phase 9. |
 | **Chaos tests** | Combinations of the above injected randomly and continuously against a running system, assert invariants hold cumulatively over a long run (not just for a single crafted scenario). | Phase 9. |
+| **Mixed-binary-version / OS-process tests (Phase 14)** | Real, separately-compiled binaries (built via `go build`, one of them from a pinned, immutable historical commit via a detached `git worktree`) run as real OS processes, driven with real signals (SIGTERM/SIGKILL) and real network connections — never an in-process `context.Context` substitute for either a signal or a second binary version. This is a new test category this project had no precedent for before Phase 14: every earlier integration/chaos/stress test exercises Go packages directly, in one process. | `test/procs` (SF-063/064/065/069/070: graceful-drain SIGTERM/SIGKILL contract for `cmd/worker`/`cmd/api`); `test/compat` (SF-066/067/068: the two-binary-version expand/migrate/contract proof). |
 
 ## Invariant-to-Test Matrix
 
@@ -723,14 +724,11 @@ scenario from [scenario-corpus.md](scenario-corpus.md).
 | TF-INV-016 | Schema tests + idempotency tests; transactional-idempotency tests | SF-005, SF-034 |
 | TF-INV-017 | Principal-scoping tests (store-layer zero-row-mutation proofs; HTTP cross-principal indistinguishability tests) | Phase 12 verification points 6-8 ([phase-12-plan.md](phase-12-plan.md) §11); no `scenario-corpus.md` SF number assigned — see [invariants.md](invariants.md) for exact test names |
 | TF-INV-018 | Idempotency tests (tenant-scoped); transactional-idempotency tests | Phase 12 verification point 2 ([phase-12-plan.md](phase-12-plan.md) §11); no `scenario-corpus.md` SF number assigned — see [invariants.md](invariants.md) for exact test names |
-| TF-INV-019 | Concurrency tests (Phase-5-style two-queue stress harness; mechanism TBD by Phase 13 OD-1's ADR) | Not yet implemented — Phase 13 has not been built; see [phase-13-plan.md](phase-13-plan.md) §10 |
+| TF-INV-019 | Concurrency tests (slot-table stress harness); fairness trace tests; sweep/fault-injection tests ([ADR-0009](adr/0009-phase-13-concurrency-and-fairness.md)) | SF-051 through SF-059 |
 
 Every row in this table must remain populated as the project moves into
 implementation; a code change that would leave any invariant without a
 passing test is a regression regardless of what other tests pass.
-TF-INV-019's row is the one documented exception until Phase 13 lands: it
-exists to give the property a stable ID ahead of implementation, per
-[invariants.md](invariants.md)'s Cross-Phase Governance Additions section.
 
 ## What "Proving an Invariant" Means Here
 
@@ -740,6 +738,61 @@ sequence* the invariant's "violating example" describes (see
 when it exercises the happy path and happens not to fail. Coverage
 percentage is not the metric that matters — scenario coverage against the
 corpus in [scenario-corpus.md](scenario-corpus.md) is.
+
+## Phase 14 — Upgrade & Compatibility Proof
+
+Phase 14 (docs/enterprise-roadmap.md) turns [compatibility-policy.md](compatibility-policy.md)'s
+previously-`PROPOSED` rules into proven ones, against real PostgreSQL and
+real compiled binaries, per [ADR-0010](adr/0010-expand-migrate-contract.md)
+and [phase-14-plan.md](phase-14-plan.md). It adds no new `TF-INV-*`
+invariant (see [invariants.md](invariants.md)'s Cross-Phase Governance
+Additions); its proof obligation is that every existing `TF-INV-001`
+through `TF-INV-019` holds throughout a mixed-binary-version window, a
+breadth requirement rather than a new state-machine property. What is now
+proven:
+
+- **Expand/migrate/contract, machine-checked** (SF-060, SF-061): every
+  migration's `.down.sql` file carries a `taskforge:down-migration-status`
+  marker (`data-safe-reversible` or `forward-fix-only`), parsed and
+  enforced by `internal/migrate.Migrations()` — a file with neither value
+  fails the check, not a silent skip. For every `data-safe-reversible`
+  migration, an up→down→up-again cycle (`internal/migrate.Down`/`UpTo`,
+  new, additive) reproduces an identical schema
+  (`internal/migrate/reversibility_test.go`), which is itself the CI
+  enforcement (an ordinary `go test`, not a separate script).
+- **Two-binary-version compatibility, across the full expand/migrate/
+  contract window** (SF-066, SF-067; `test/compat/two_binary_test.go`): a
+  real `cmd/worker` binary pinned to `794abbb...` (pre-Phase-13 schema, no
+  `queue_name` at the Go type level at all) and one pinned to `c17f89c...`
+  (the full Phase 13 delta) run concurrently against one shared database
+  while migrations `0011`→`0014` are applied one at a time via
+  `internal/migrate.UpTo`, with `internal/invariant.Checker` re-run and
+  finding zero violations at every intermediate stage, not merely before
+  `0011` and after `0014`.
+- **Repurposed `job_type` failure mode, documented and demonstrated, not
+  merely assumed safe** (SF-068; `test/compat`): a handler expecting a
+  payload shape a queued job predates fails as an ordinary classified
+  error (dead-lettered), not a panic or a silent no-op.
+- **Graceful worker/API draining, at the real OS-process level** (SF-063,
+  SF-064, SF-065, SF-069, SF-070; `test/procs`), extending what Phase 5's
+  `TestStress_WorkerPoolGracefulShutdown_*` already proved at the
+  goroutine level: `cmd/worker`'s opt-in drain contract
+  (`Worker.SetDrainTimeout`, `TASKFORGE_WORKER_DRAIN_TIMEOUT`, default
+  30s) lets an in-flight job finish before SIGTERM-driven exit, or —
+  should the drain timeout elapse first — leaves the job's lease
+  untouched for ordinary TF-INV-004 reclaim, never a fabricated
+  completion; `cmd/api`'s `BaseContext` cancellation plus `srv.Close`
+  (`TASKFORGE_API_SHUTDOWN_TIMEOUT`, default 10s) forcibly ends a still-
+  running handler at the shutdown deadline instead of abandoning it
+  silently. The *default*, un-opted-in `Worker` contract (immediate
+  cancellation, no grace period) is separately, additionally proven
+  in-process (SF-064a, `internal/worker/drain_test.go`) and by an
+  unmodified re-run of the pre-existing Phase 5 stress test (SF-064b).
+- **Unregistered-`job_type` behavior extended to workflow nodes**
+  (SF-062; `internal/worker/worker_test.go`): a workflow node whose
+  `job_type` has no registered handler dead-letters through the identical
+  `ErrNoHandler`/`CompleteFailure` path a plain job uses, and TF-INV-012's
+  cascade correctly fails the enclosing workflow.
 
 ## Test Environment Expectations
 

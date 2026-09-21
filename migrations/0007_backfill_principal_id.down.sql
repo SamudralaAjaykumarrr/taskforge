@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- The faithful inverse of the backfill: return exactly the rows this
 -- migration attributed to the system principal to NULL.
 --

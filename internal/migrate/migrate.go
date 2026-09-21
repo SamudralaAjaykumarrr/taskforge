@@ -36,9 +36,12 @@ const migrationsDir = "."
 const advisoryLockKey = 0x7461736b666f7267 // "taskforg" as hex, arbitrary but stable
 
 type migration struct {
-	version int64
-	name    string
-	upSQL   string
+	version    int64
+	name       string
+	upSQL      string
+	downName   string
+	downSQL    string
+	downStatus DownMigrationStatus
 }
 
 // execQuerier is satisfied by both *sql.DB and *sql.Conn, letting the
@@ -57,6 +60,24 @@ type execQuerier interface {
 // across concurrently-starting processes via a session-scoped advisory
 // lock (see advisoryLockKey).
 func Up(ctx context.Context, db *sql.DB) error {
+	return upTo(ctx, db, nil)
+}
+
+// UpTo applies every migration whose version is not yet recorded in
+// schema_migrations AND is less than or equal to targetVersion, in
+// ascending version order. It is additive test/tooling infrastructure for
+// Phase 14's mixed-binary-version harness (docs/phase-14-plan.md §8),
+// which needs to step through an expand/migrate/contract sequence one
+// migration at a time while two separately-compiled binaries run
+// concurrently against the database -- something a single call to Up
+// (which applies every pending migration in one pass) cannot do.
+// cmd/api and cmd/worker continue to call Up, unchanged; only test/CI
+// tooling calls UpTo.
+func UpTo(ctx context.Context, db *sql.DB, targetVersion int64) error {
+	return upTo(ctx, db, &targetVersion)
+}
+
+func upTo(ctx context.Context, db *sql.DB, targetVersion *int64) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("migrate: reserve connection: %w", err)
@@ -86,6 +107,9 @@ func Up(ctx context.Context, db *sql.DB) error {
 
 	for _, m := range all {
 		if applied[m.version] {
+			continue
+		}
+		if targetVersion != nil && m.version > *targetVersion {
 			continue
 		}
 		if err := applyOne(ctx, conn, m); err != nil {
@@ -209,7 +233,25 @@ func loadMigrations() ([]migration, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, migration{version: version, name: name, upSQL: string(content)})
+
+		downName := strings.TrimSuffix(name, ".up.sql") + ".down.sql"
+		downContent, err := files.ReadFile(downName)
+		if err != nil {
+			return nil, fmt.Errorf("migration file %q: no matching down file %q: %w", name, downName, err)
+		}
+		downStatus, err := parseDownStatus(string(downContent))
+		if err != nil {
+			return nil, fmt.Errorf("down migration file %q: %w", downName, err)
+		}
+
+		out = append(out, migration{
+			version:    version,
+			name:       name,
+			upSQL:      string(content),
+			downName:   downName,
+			downSQL:    string(downContent),
+			downStatus: downStatus,
+		})
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })

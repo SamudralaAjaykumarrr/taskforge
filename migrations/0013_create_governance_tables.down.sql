@@ -1,3 +1,4 @@
+-- taskforge:down-migration-status: data-safe-reversible
 -- Data-safe-reversible for the same reason as every other purely-additive
 -- Phase 13 table: nothing outside these four tables references them (jobs
 -- and workflow_instances gained only a queue_name TEXT column, never a
