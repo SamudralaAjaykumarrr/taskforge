@@ -49,13 +49,22 @@ func (s *Store) CheckAndConsumeRateLimit(ctx context.Context, scopeKey string, r
 		return false, 0, err
 	}
 
+	// GREATEST(0, ...) floors the elapsed interval at zero: PostgreSQL's
+	// now() is wall-clock time, not monotonic (docs/failure-model.md's
+	// Clock Model), so an NTP or VM-host clock correction can make
+	// now() - last_refill_at briefly negative. Without the floor, that
+	// negative elapsed time gets multiplied by ratePerSec and ADDED
+	// (i.e. subtracts real tokens) below, so a backward clock jump could
+	// erroneously deny a request the bucket already had a token for. A
+	// forward jump needs no equivalent ceiling: LEAST($2, ...) already
+	// caps the refilled amount at burst.
 	var remaining sql.NullFloat64
 	err = s.db.QueryRowContext(ctx, `
 		UPDATE rate_limit_buckets
-		SET tokens = LEAST($2::numeric, tokens + EXTRACT(EPOCH FROM (now() - last_refill_at)) * $3::numeric) - 1,
+		SET tokens = LEAST($2::numeric, tokens + GREATEST(0, EXTRACT(EPOCH FROM (now() - last_refill_at))) * $3::numeric) - 1,
 			last_refill_at = now()
 		WHERE scope_key = $1
-		  AND LEAST($2::numeric, tokens + EXTRACT(EPOCH FROM (now() - last_refill_at)) * $3::numeric) >= 1
+		  AND LEAST($2::numeric, tokens + GREATEST(0, EXTRACT(EPOCH FROM (now() - last_refill_at))) * $3::numeric) >= 1
 		RETURNING tokens`,
 		scopeKey, burst, ratePerSec,
 	).Scan(&remaining)
@@ -65,7 +74,7 @@ func (s *Store) CheckAndConsumeRateLimit(ctx context.Context, scopeKey string, r
 		// rather than guessing.
 		var tokens float64
 		if rerr := s.db.QueryRowContext(ctx, `
-			SELECT LEAST($2::numeric, tokens + EXTRACT(EPOCH FROM (now() - last_refill_at)) * $3::numeric)
+			SELECT LEAST($2::numeric, tokens + GREATEST(0, EXTRACT(EPOCH FROM (now() - last_refill_at))) * $3::numeric)
 			FROM rate_limit_buckets WHERE scope_key = $1`,
 			scopeKey, burst, ratePerSec,
 		).Scan(&tokens); rerr != nil {

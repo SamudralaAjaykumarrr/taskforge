@@ -180,6 +180,49 @@ func TestCheckAndConsumeRateLimit_RefillsOverTime(t *testing.T) {
 	require.True(t, allowed, "a full second at 100/s must refill well past 1 token")
 }
 
+// TestCheckAndConsumeRateLimit_ToleratesBackwardClockJump guards against a
+// regression where a non-monotonic wall clock (an NTP or VM-host clock
+// correction -- PostgreSQL's now() is wall-clock time, not monotonic, per
+// docs/failure-model.md's Clock Model) causes now() - last_refill_at to go
+// briefly negative. Before the fix, that negative elapsed time was
+// multiplied by ratePerSec and added directly into the refill computation
+// -- i.e. it SUBTRACTED tokens -- so a backward jump could spuriously deny
+// a request the bucket already held a token for. This is the suspected
+// root cause of TestCheckAndConsumeRateLimit_RefillsOverTime's single
+// observed flake: that test's own backward-in-time UPDATE only pushes
+// last_refill_at 1 second into the past, and a sufficiently large backward
+// clock jump between that UPDATE and the following check would reproduce
+// exactly this failure without any product code being wrong in the
+// ordinary (monotonic-clock) case.
+func TestCheckAndConsumeRateLimit_ToleratesBackwardClockJump(t *testing.T) {
+	db := testutil.DB(t)
+	g := governance.New(db)
+	ctx := context.Background()
+
+	scopeKey := governance.RateLimitScopeKey("backward-clock-test")
+
+	// Seed the bucket directly with exactly 1 of 10 tokens and
+	// last_refill_at = now(): a state that already qualifies for one more
+	// request with zero additional elapsed time.
+	_, err := db.ExecContext(ctx, `INSERT INTO rate_limit_buckets (scope_key, tokens, last_refill_at) VALUES ($1, 1, now())`, scopeKey)
+	require.NoError(t, err)
+
+	// Simulate the wall clock having gone backward by 100ms since that
+	// write by moving last_refill_at 100ms into the future relative to
+	// now() -- this produces exactly the same now() - last_refill_at < 0
+	// condition a real backward jump would, deterministically and without
+	// a sleep.
+	_, err = db.ExecContext(ctx, `UPDATE rate_limit_buckets SET last_refill_at = last_refill_at + interval '100 milliseconds' WHERE scope_key = $1`, scopeKey)
+	require.NoError(t, err)
+
+	// Real elapsed time is ~0 and the bucket already held exactly 1
+	// token, so this must be allowed regardless of the simulated backward
+	// clock jump: negative elapsed time must never subtract tokens.
+	allowed, _, err := g.CheckAndConsumeRateLimit(ctx, scopeKey, 1, 10)
+	require.NoError(t, err)
+	require.True(t, allowed, "a backward clock jump must not subtract tokens from a bucket that already qualified")
+}
+
 func TestCheckAndConsumeRateLimit_SurvivesAcrossFreshStoreInstance(t *testing.T) {
 	// Durability: rate_limit_buckets is a PostgreSQL table, never
 	// in-memory-only (docs/phase-13-plan.md §7/§13).
