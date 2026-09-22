@@ -54,6 +54,7 @@ TaskForge assumes:
 | F18 | Partial network failure (e.g., worker can reach DB but not the external side-effect target, or vice versa) | Partially | If the worker can reach PostgreSQL, it can report failure/timeout normally and the retry mechanism applies. If the worker *cannot* reach PostgreSQL at all, this degrades to F2 (crash-equivalent — lease expires). The specific case of "side effect succeeded but the worker cannot reach PostgreSQL to report it" degrades to F3 and carries the same limitation. |
 | F19 | Scheduler restart | Yes | There is no separate scheduler process/state in v1 to restart — see [scheduling.md](scheduling.md). Eligibility is a durable column checked by every claim query, so "scheduler restart" is not a distinct failure mode. |
 | F20 | Concurrent workers racing to claim the same job | Yes | Same mechanism as F8. Proven by concurrency tests — see [testing-strategy.md](testing-strategy.md). |
+| F21 | PostgreSQL primary failure with a deployment-layer HA topology (streaming replication + third-party failover orchestration) underneath TaskForge | **Documented and drilled, not TaskForge-built.** TaskForge itself does no failover detection or orchestration (unchanged from F6/ADR-0001). Given a deployment-layer promotion and a connection endpoint that repoints to the new primary (an operator obligation TaskForge cannot verify — analogous to the existing TLS-proxy and `sslmode=verify-full` deployment obligations in [security-model.md](security-model.md)), TaskForge resumes writes within a measured, drilled window (see [disaster-recovery.md](disaster-recovery.md) §5.2/§6), with fencing (TF-INV-002/003/014) intact throughout, proven by the same drill (`test/dr/failover_drill_test.go`). |
 
 ## Explicitly Out of Scope for v1
 
@@ -67,7 +68,12 @@ handle them:
   with its own failover). TaskForge does not implement multi-database
   replication, split-brain detection across database replicas, or
   consensus. If the database is down, TaskForge is down for writes; it does
-  not silently continue with stale or divergent state.
+  not silently continue with stale or divergent state. **This boundary is
+  not reversed by Phase 15** ([disaster-recovery.md](disaster-recovery.md),
+  F21 above) — what Phase 15 adds is that the *duration* and *correctness*
+  of that "down for writes" window, once a deployment layers
+  PostgreSQL-native HA underneath TaskForge, is now a measured, drilled
+  fact instead of an unexamined one.
 - **Large backward clock jumps on the database server.** TaskForge assumes
   PostgreSQL's `now()` does not jump backwards during operation. NTP-slew
   style bounded correction is fine; an operator manually setting the clock

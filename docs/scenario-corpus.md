@@ -1299,6 +1299,118 @@ reconciliation gap rather than leave it for a future pass).
 - **Test**: `TestProc_SF070_APIShutdown_SlowHandlerObservesCancellationAtDeadline`
   (`test/procs/api_shutdown_test.go`).
 
+### SF-071 — Backup-then-restore drill, timed (real, multi-instance PostgreSQL)
+
+- **Initial state**: A real primary (embedded PostgreSQL 16, WAL archiving
+  live) running a reference-volume workload driven directly through
+  `internal/store`.
+- **Actions**: `pg_basebackup` (via `deploy/pg-dr/backup.sh`) taken
+  mid-workload; workload continues past the backup; a
+  `recovery_target_time` is recorded from PostgreSQL's own clock; more
+  workload runs strictly after that timestamp; a fresh restore is driven
+  via `deploy/pg-dr/restore.sh` against a new data directory.
+- **Fault**: None (happy-path drill).
+- **Expected durable state**: The restored instance reaches the target
+  time and promotes to read/write; every job present at or before the
+  target exists, every job inserted strictly after it does not;
+  `internal/invariant.Checker.CheckAll` reports zero violations; the
+  restore's wall-clock time is recorded (measured: 4.06s–8.02s at a
+  150-job reference volume — see
+  [disaster-recovery.md](disaster-recovery.md) §5.2).
+- **Invariants proved**: The full `TF-INV-001`–`TF-INV-019` set, checked
+  against the restored database directly — the roadmap's own literal
+  proof obligation.
+- **Test**: `TestDR_SF071_SF075_BackupRestoreDrill_PITR` (`test/dr/backup_restore_test.go`).
+
+### SF-072 — WAL archive gap fails recovery loudly, not silently
+
+- **Initial state**: Same as SF-071, but the oldest WAL segment archived
+  *after* the base backup (the first one recovery would need to fetch
+  once it exhausts the backup's own streamed WAL) is deliberately deleted
+  from the archive before restore.
+- **Actions**: Restore attempted with the deliberate gap.
+- **Fault**: A required, archived WAL segment is missing.
+- **Expected durable state/behavior**: PostgreSQL's recovery process
+  fails with an explicit, loud error at the missing segment — observed
+  verbatim: `FATAL: recovery ended before configured recovery target was
+  reached`; `pg_ctl start -w` (and `restore.sh`) exits nonzero; the
+  restored instance never promotes and is never reachable. Recovery does
+  not silently skip forward past the gap or silently stop early without
+  saying so.
+- **Invariants proved**: The documented failure mode for a WAL archive
+  gap ([phase-15-plan.md](phase-15-plan.md) §2.5/§11) — not a TaskForge
+  mechanism, but PostgreSQL's own documented behavior, drilled rather
+  than assumed.
+- **Test**: `TestDR_SF072_WALArchiveGap_RecoveryFailsLoudly` (`test/dr/backup_restore_test.go`).
+
+### SF-073 — Controlled standby-promotion/failover drill, live traffic (real, multi-instance PostgreSQL, real OS processes)
+
+- **Initial state**: A real primary + a real streaming standby
+  (`deploy/pg-dr/setup-standby.sh`, confirmed `streaming` via
+  `pg_stat_replication`), with real `cmd/api`/`cmd/worker` binaries
+  driving live HTTP submission and worker claim/execution traffic against
+  the primary.
+- **Actions**: At a recorded instant, the primary is forcibly stopped
+  (`pg_ctl stop -m immediate`); the standby is immediately promoted
+  (`pg_ctl promote`) and repointed onto the primary's own now-vacated
+  port. `TASKFORGE_DATABASE_URL` on the already-running `cmd/api`/
+  `cmd/worker` processes is never changed (§8.2 step 5, OD-4's deliberate
+  simplification).
+- **Fault**: Primary loss.
+- **Expected durable state/behavior**: TaskForge resumes writes within a
+  measured, recorded window, timed separately for each path (measured:
+  API submission 721ms–809ms; worker claim 6.07s–6.10s, from the primary-
+  stop instant — see [disaster-recovery.md](disaster-recovery.md) §5.2 for
+  why the two differ); `internal/invariant.Checker` reports zero
+  violations across the whole drill; no stale pre-promotion write
+  succeeds against the new primary.
+- **Invariants proved**: The full `TF-INV-001`–`TF-INV-019` set, plus
+  fencing (TF-INV-002/003/014) observed intact across a real promotion,
+  not merely argued to be.
+- **Test**: `TestDR_SF073_SF074_FailoverDrill_LiveTraffic` (`test/dr/failover_drill_test.go`).
+
+### SF-074 — In-flight lease survives a promotion mid-execution
+
+- **Initial state**: As SF-073, but a job (`demo.sleep`, a 6-second
+  handler under a 9-second `execution_timeout_seconds`) is claimed and
+  actively `RUNNING` before the primary is stopped.
+- **Actions**: The primary is stopped and the standby promoted while the
+  job is still mid-execution; the worker's subsequent heartbeat/completion
+  attempt lands against the (now-promoted) same endpoint.
+- **Fault**: Primary loss during an open lease.
+- **Expected durable state/behavior**: Either the completion succeeds
+  against the promoted standby (lease/fencing state was replicated) and
+  the job reaches `SUCCEEDED` — the outcome observed in every drilled run
+  — or it fails/times out and the job is later reclaimed via the
+  ordinary, unmodified TF-INV-004 path once `lease_expires_at` passes;
+  never a duplicated or silently lost completion.
+- **Invariants proved**: Fencing (TF-INV-002/003/014) is a property of
+  the *data*, unaffected by which physical PostgreSQL instance enforces
+  it — the promoted standby enforces the identical rule against the
+  identical row.
+- **Test**: `TestDR_SF073_SF074_FailoverDrill_LiveTraffic` (`test/dr/failover_drill_test.go`).
+
+### SF-075 — Backup/restore preserves fencing history, not just current state
+
+- **Initial state**: SF-071's own mechanism, but the workload driver
+  deliberately forces one lease-expiry reclaim (`internal/chaos.ForceExpireLease`)
+  before the backup is taken, so at least one job's `lease_generation`
+  has already advanced past 1.
+- **Actions**: Restore to a target time after the reclaim (SF-071's
+  procedure).
+- **Fault**: None.
+- **Expected durable state**: The restored database's `lease_generation`
+  sequence for the affected job is intact and monotonic — checked both by
+  `internal/invariant.Checker`'s existing `checkLeaseGenerationMonotonicUnique`
+  (part of SF-071's zero-violations assertion) and directly, by asserting
+  `max(lease_generation) >= 2` exists in `job_attempts` post-restore, so
+  the proof does not merely pass trivially because no job had more than
+  one attempt.
+- **Invariants proved**: A restore does not itself introduce a fencing
+  regression — TF-INV-002/014, proved against restored, not merely live,
+  state.
+- **Test**: `TestDR_SF071_SF075_BackupRestoreDrill_PITR` (`test/dr/backup_restore_test.go`).
+
 ## Scenario-to-Invariant Cross-Check
 
 See [testing-strategy.md](testing-strategy.md) for the invariant-to-test

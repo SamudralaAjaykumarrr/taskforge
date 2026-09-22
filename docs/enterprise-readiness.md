@@ -144,11 +144,22 @@ below rather than listed as an unconditional P0.
    an over-eager caller beyond ordinary HTTP error codes if the database
    itself falls over. Phase 5 explicitly disclaims proving "strict FIFO
    fairness across priorities/ages under adversarial scheduling."
-5. **No PostgreSQL HA, backup, PITR, or disaster-recovery evidence.**
+5. ~~**No PostgreSQL HA, backup, PITR, or disaster-recovery evidence.**
    failure-model.md explicitly places "PostgreSQL primary failure/failover"
    out of scope for v1 ("If the database is down, TaskForge is down for
    writes"). There is no documented backup/restore procedure, no tested PITR
-   runbook, and no failover drill anywhere in the repository.
+   runbook, and no failover drill anywhere in the repository.~~ **Resolved
+   by docs/enterprise-roadmap.md Phase 15** — see
+   [docs/disaster-recovery.md](disaster-recovery.md): a documented, drilled
+   backup/PITR-restore procedure with a measured RPO/RTO
+   (`test/dr/backup_restore_test.go`, SF-071/SF-072/SF-075), a documented
+   HA topology recommendation, and a drilled standby-promotion/failover
+   proof with TaskForge's own reconnect behavior and fencing measured
+   (`test/dr/failover_drill_test.go`, SF-073/SF-074). The out-of-scope
+   boundary itself (F6/F21, [failure-model.md](failure-model.md)) is
+   unchanged — TaskForge still builds no failover orchestration of its
+   own — but it is now a measured, drilled fact rather than an unexamined
+   one.
 6. **No supply-chain hardening.** ~~No SBOM, no dependency vulnerability
    scanning (no `govulncheck`, Trivy, Snyk, or CodeQL step), no artifact
    signing/provenance/attestation, no Dockerfile (only a `docker-compose.yml`
@@ -256,12 +267,17 @@ to preserve.
 
 ## 8. Disaster-Recovery Gaps
 
-No backup procedure, no PITR runbook, no tested restore, no documented RPO/
-RTO target, no failover drill. failure-model.md's "Explicitly Out of
-Scope" section is honest about this ("PostgreSQL primary failure/failover"
-is out of scope), but an honest non-goal is still a gap the moment
-enterprise adoption is on the table — every enterprise buyer's security/ops
-review will ask for an RPO/RTO number and a tested restore procedure.
+**Resolved by docs/enterprise-roadmap.md Phase 15** — see
+[docs/disaster-recovery.md](disaster-recovery.md) for the full runbook: a
+documented backup procedure (`pg_basebackup` + continuous WAL archiving),
+a drilled, timed PITR restore, a stated and measured RPO/RTO, a documented
+HA topology recommendation, and a drilled standby-promotion/failover
+proof. failure-model.md's "Explicitly Out of Scope" boundary
+("PostgreSQL primary failure/failover... TaskForge does not implement...
+replication... or consensus") remains unchanged and correct — this phase
+does not reverse it, it measures and documents the operational fact of
+that boundary once a deployment layers PostgreSQL-native HA underneath
+TaskForge (F21, [failure-model.md](failure-model.md)).
 
 ## 9. Supply-Chain Gaps
 
@@ -358,8 +374,11 @@ maps to a specific phase in [enterprise-roadmap.md](enterprise-roadmap.md):
 - [ ] `POST /jobs` over plaintext HTTP is refused (or the deployment is
       documented as requiring a TLS-terminating proxy, with that boundary
       tested).
-- [ ] A documented `pg_basebackup`/WAL-archiving-based backup exists and a
+- [x] A documented `pg_basebackup`/WAL-archiving-based backup exists and a
       restore-from-backup drill has been executed and timed at least once.
+      Implemented Phase 15 — see
+      [docs/disaster-recovery.md](disaster-recovery.md) §2/§3 and
+      `test/dr/backup_restore_test.go` (SF-071).
 - [ ] A two-binary-version (old worker / new server, and new worker / old
       server) integration test exists and passes.
 - [x] `govulncheck` (or equivalent) runs in CI and fails the build on a

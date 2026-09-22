@@ -34,6 +34,18 @@ jobs:
 
     env:
       TASKFORGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/taskforge_test?sslmode=disable
+      # Phase 15 (docs/disaster-recovery.md §12, docs/phase-15-plan.md):
+      # test/dr's SF-071-SF-075 DR proof needs a real pg_basebackup client
+      # binary, which embedded-postgres's own vendored binaries do not
+      # include. TASKFORGE_REQUIRE_DR_TOOLS=1 makes a missing pg_basebackup
+      # a hard test failure (test/dr/harness_test.go's
+      # findSystemPGBaseBackup), not a silent skip, so this proof can never
+      # quietly stop running here just because a runner image changes.
+      # PG_BASEBACKUP_BIN pins the exact PostgreSQL 16 client tooling the
+      # step below installs, matching this project's own
+      # embeddedpostgres.V16 pin (test/dr/harness_test.go's startPrimary).
+      TASKFORGE_REQUIRE_DR_TOOLS: "1"
+      PG_BASEBACKUP_BIN: /usr/lib/postgresql/16/bin
 
     steps:
       # fetch-depth: 0 (full history) is required here, not just a
@@ -58,6 +70,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # Phase 15 (docs/disaster-recovery.md §12): explicitly install the
+      # PostgreSQL 16 client tooling (pg_basebackup) test/dr's SF-071-SF-075
+      # DR proof needs -- this must not depend on ubuntu-latest happening
+      # to ship it already. TASKFORGE_REQUIRE_DR_TOOLS=1 (job env, above)
+      # turns a missing pg_basebackup into a hard failure below, so this
+      # step's own success is what keeps that failure from ever firing.
+      - name: install PostgreSQL 16 client tooling (Phase 15 DR proof)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+          "$PG_BASEBACKUP_BIN/pg_basebackup" --version
 
       - name: gofmt check
         run: |

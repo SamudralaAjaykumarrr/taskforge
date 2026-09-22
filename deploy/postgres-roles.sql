@@ -224,3 +224,37 @@ REVOKE DELETE ON queue_state, queue_limits, queue_slots, rate_limit_buckets
 -- which connect as these roles for real rather than only asking the catalog
 -- what they are allowed to do.
 GRANT SELECT ON schema_migrations TO taskforge_api, taskforge_worker, taskforge_retention;
+
+-- ------------------------------------------------------------
+-- taskforge_replicator: streaming replication (Phase 15,
+-- docs/phase-15-plan.md §16; docs/disaster-recovery.md §4/§6)
+-- ------------------------------------------------------------
+-- Documentation-only convention, not code-enforced here: streaming
+-- replication requires its own PostgreSQL role with the REPLICATION
+-- attribute, distinct from taskforge_api/taskforge_worker/taskforge_retention
+-- above. Following the same least-privilege discipline this file already
+-- establishes for the other three roles: a replication role needs no
+-- access to jobs/job_attempts/principals/api_keys TABLE CONTENTS beyond
+-- what physical (not logical) replication inherently requires, which is
+-- WAL access, not row-level SELECT -- a materially narrower exposure than
+-- a logical-replication role would need. This project's own docs/pg-dr/*.sh
+-- scripts connect as whatever role PGUSER names (operator-provided); this
+-- statement is the recommended shape for that role, not something
+-- TaskForge itself creates or reconciles.
+--
+-- DO NOT uncomment and run this unmodified in production -- set a real
+-- password, exactly like the three roles above.
+--
+-- DO $$
+-- BEGIN
+--     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'taskforge_replicator') THEN
+--         CREATE ROLE taskforge_replicator LOGIN REPLICATION PASSWORD 'CHANGE_ME_replicator';
+--     END IF;
+-- END
+-- $$;
+--
+-- No GRANT statements follow: the REPLICATION attribute itself is what
+-- authorizes a physical streaming-replication connection
+-- (pg_basebackup -R, a standby's primary_conninfo) -- it is orthogonal to,
+-- and does not imply, any ordinary table-level GRANT, and none is needed
+-- or wanted for this role's one job.
