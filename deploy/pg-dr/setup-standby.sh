@@ -60,6 +60,35 @@ echo "setup-standby.sh: seeding standby from $PRIMARY_HOST:$PRIMARY_PORT -> $STA
 	--checkpoint=fast \
 	-P -v
 
+# -R's own primary_conninfo is written by the pg_basebackup CLIENT's libpq
+# (an ordinary OS package -- postgresql-client-<N> -- that may be linked
+# against a newer libpq than the PostgreSQL SERVER this standby actually
+# runs, e.g. when the server comes from a vendored/embedded distribution
+# pinned to an older point release). That libpq dumps every EFFECTIVE
+# connection parameter it used, including client-only options a
+# differently-versioned server-side walreceiver (which links its OWN,
+# separate libpq) does not recognize. Confirmed via a real GitHub Actions
+# run of this exact script:
+#   FATAL:  invalid connection string syntax: invalid connection option "sslnegotiation"
+# "sslnegotiation" is a genuine libpq option (added after PostgreSQL 16),
+# not a typo or a TaskForge-introduced value -- pg_basebackup's own -R
+# wrote it in because ITS libpq supports it, and the standby's walreceiver
+# rejected it because ITS OWN, differently-versioned libpq does not.
+# Trusting -R's auto-generated primary_conninfo verbatim is therefore not
+# safe in general: replace it with an explicit, minimal connection string
+# built from this script's own already-validated inputs (the same
+# host/port/user this invocation just used to actually reach the primary),
+# containing only the handful of core keywords every supported PostgreSQL
+# server version's walreceiver understands.
+AUTO_CONF="$STANDBY_DATA_DIR/postgresql.auto.conf"
+PRIMARY_CONNINFO="host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER} sslmode=disable application_name=taskforge-dr-standby"
+if [ -n "${PGPASSWORD:-}" ]; then
+	PRIMARY_CONNINFO="${PRIMARY_CONNINFO} password=${PGPASSWORD}"
+fi
+grep -v '^primary_conninfo = ' "$AUTO_CONF" >"${AUTO_CONF}.tmp" || true
+printf "primary_conninfo = '%s'\n" "$PRIMARY_CONNINFO" >>"${AUTO_CONF}.tmp"
+mv "${AUTO_CONF}.tmp" "$AUTO_CONF"
+
 echo "setup-standby.sh: standby seeded at $STANDBY_DATA_DIR"
 
 if [ "$START" = "1" ]; then

@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -32,6 +33,62 @@ import (
 // distinct from a .history file or a N.backup label file, both of which
 // also live in the archive directory.
 var walSegmentName = regexp.MustCompile(`^[0-9A-Fa-f]{24}$`)
+
+// pgTimestamptzLayout renders an explicit, PostgreSQL-native timestamptz
+// literal: space-separated date/time, a numeric UTC offset -- never the
+// ISO-8601 "T" date/time separator or "Z" UTC designator time.RFC3339Nano
+// produces. This is not a style preference: a real GitHub Actions
+// PostgreSQL 16.9 run of this exact test rejected an RFC3339Nano value
+// outright --
+//
+//	LOG:  invalid value for parameter "recovery_target_time": "2026-09-23T19:18:33.417116Z"
+//	FATAL:  configuration file ".../postgresql.auto.conf" contains errors
+//
+// -- even though that same string parses without complaint as an ordinary
+// SQL timestamptz literal. recovery_target_time (and PostgreSQL's other
+// recovery-target GUCs) are validated very early during startup, before
+// the backend's full datetime-parsing machinery is available, and that
+// early path does not accept the ISO-8601 form. restore.sh's own usage
+// comment and PostgreSQL's own recovery_target_time documentation both
+// already show this exact space-separated, numeric-offset form (e.g.
+// '2026-09-22 00:00:00+00') -- restore.sh itself was never the bug, only
+// this package's own Go-side formatting of the value handed to it.
+// ".999999" caps fractional seconds at microseconds, matching
+// timestamptz's own storage resolution, so no precision beyond what
+// PostgreSQL can actually represent is ever sent.
+const pgTimestamptzLayout = "2006-01-02 15:04:05.999999-07:00"
+
+// pgTimestamptzLiteral renders t (normalized to UTC first, so the offset
+// is always the explicit, locale-independent "+00:00" -- never a
+// local-zone abbreviation) as a PostgreSQL-native timestamptz literal.
+// See pgTimestamptzLayout's doc comment for why this, and not
+// time.RFC3339Nano, is required for recovery_target_time specifically.
+func pgTimestamptzLiteral(t time.Time) string {
+	return t.UTC().Format(pgTimestamptzLayout)
+}
+
+// recoveryTargetTimeLine matches a written "recovery_target_time = '...'"
+// line in postgresql.auto.conf, capturing its literal value.
+var recoveryTargetTimeLine = regexp.MustCompile(`(?m)^recovery_target_time = '([^']*)'$`)
+
+// requireValidRecoveryTargetTimeConf reads restoreDataDir's own
+// postgresql.auto.conf (written by restore.sh) directly off disk and
+// asserts its recovery_target_time value is exactly the explicit
+// PostgreSQL-timestamptz literal this package writes -- never inferring
+// "the config was fine" merely from whether PostgreSQL later managed to
+// start (see pgTimestamptzLiteral's doc comment for why that inference
+// was wrong before).
+func requireValidRecoveryTargetTimeConf(t *testing.T, restoreDataDir string, want time.Time) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(restoreDataDir, "postgresql.auto.conf"))
+	require.NoError(t, err)
+	m := recoveryTargetTimeLine.FindSubmatch(b)
+	require.NotNil(t, m, "postgresql.auto.conf has no recovery_target_time line:\n%s", b)
+	got := string(m[1])
+	require.NotContains(t, got, "T", "recovery_target_time must not use the ISO-8601 'T' date/time separator -- PostgreSQL's recovery_target_time GUC rejects it: %q", got)
+	require.NotContains(t, got, "Z", "recovery_target_time must not use the ISO-8601 'Z' UTC designator -- PostgreSQL's recovery_target_time GUC rejects it: %q", got)
+	require.Equal(t, pgTimestamptzLiteral(want), got, "recovery_target_time in postgresql.auto.conf")
+}
 
 // TestDR_SF071_SF075_BackupRestoreDrill_PITR is SF-071 and SF-075: a real
 // pg_basebackup taken mid-workload, continued workload generating WAL the
@@ -109,11 +166,12 @@ func TestDR_SF071_SF075_BackupRestoreDrill_PITR(t *testing.T) {
 
 	restoreStart := time.Now()
 	out, err = runScript(t, "restore.sh", []string{
-		"RECOVERY_TARGET_TIME=" + targetTime.Format(time.RFC3339Nano),
+		"RECOVERY_TARGET_TIME=" + pgTimestamptzLiteral(targetTime),
 		"RESTORE_COMMAND=" + restoreCommand,
 		"START=0", // this test starts the restored instance itself, via the same embedded-postgres library the primary used (docs/phase-15-postgres-evidence.md §3.1 item 5)
 	}, backupDir, restoreDir)
 	require.NoError(t, err, "restore.sh (prepare-only) output:\n%s", out)
+	requireValidRecoveryTargetTimeConf(t, restoreDir, targetTime)
 
 	restoredPort := freePort(t)
 	restored := startFromDataDir(t, restoreDir, restoredPort)
@@ -322,12 +380,18 @@ func TestDR_SF072_WALArchiveGap_RecoveryFailsLoudly(t *testing.T) {
 	restorePort := freePort(t)
 
 	out, err = runScript(t, "restore.sh", []string{
-		"RECOVERY_TARGET_TIME=" + targetTime.Format(time.RFC3339Nano),
+		"RECOVERY_TARGET_TIME=" + pgTimestamptzLiteral(targetTime),
 		"RESTORE_COMMAND=" + restoreCommand,
 		"START=1",
 		"PGPORT=" + fmt.Sprint(restorePort),
 		"PG_BIN=" + primary.binDir,
 	}, backupDir, restoreDir)
+	// Verify the config restore.sh actually wrote BEFORE trusting that any
+	// startup failure below is the intended missing-WAL recovery failure
+	// (SF-072's whole point) rather than a config-parse failure that never
+	// even reached recovery -- see requireValidRecoveryTargetTimeConf's
+	// doc comment.
+	requireValidRecoveryTargetTimeConf(t, restoreDir, targetTime)
 
 	// restore.sh's own exit code (via pg_ctl start -w) is NOT used as the
 	// primary pass/fail signal here -- it is logged only as a diagnostic.

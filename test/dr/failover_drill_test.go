@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -127,6 +128,7 @@ func TestDR_SF073_SF074_FailoverDrill_LiveTraffic(t *testing.T) {
 		"PGPORT=" + fmt.Sprint(standbyPort),
 	}, "127.0.0.1", fmt.Sprint(primary.port), standbyDataDir)
 	require.NoError(t, err, "setup-standby.sh output:\n%s", out)
+	requireSanitizedPrimaryConninfo(t, standbyDataDir)
 
 	// t.Cleanup (not a post-waitUntil check): waitUntil itself calls
 	// t.Fatal on timeout, which unwinds this goroutine via runtime.Goexit
@@ -284,6 +286,29 @@ func TestDR_SF073_SF074_FailoverDrill_LiveTraffic(t *testing.T) {
 	violations, err := invariant.New(promotedDB).CheckAll(ctx)
 	require.NoError(t, err, "invariant checker itself failed against the promoted database")
 	require.Empty(t, violations, "invariant violations found after the failover drill: %v", violations)
+}
+
+// requireSanitizedPrimaryConninfo reads the standby's own postgresql.auto.conf
+// directly off disk and asserts its primary_conninfo value is the exact,
+// minimal, core-libpq-keyword connection string setup-standby.sh now
+// writes -- never pg_basebackup -R's own auto-generated one. This directly
+// verifies the fix (rather than merely inferring it worked from whether
+// streaming replication later started): a real GitHub Actions run of the
+// unpatched script produced a primary_conninfo containing "sslnegotiation"
+// (a libpq option pg_basebackup's own, differently-versioned libpq
+// dumped, which the standby's own walreceiver -- linking a different
+// libpq build -- rejected outright with "FATAL: invalid connection
+// string syntax: invalid connection option \"sslnegotiation\""), and
+// streaming replication never started as a result. See
+// setup-standby.sh's own doc comment on its primary_conninfo rewrite for
+// the full mechanism.
+func requireSanitizedPrimaryConninfo(t *testing.T, standbyDataDir string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(standbyDataDir, "postgresql.auto.conf"))
+	require.NoError(t, err)
+	conf := string(b)
+	require.NotContains(t, conf, "sslnegotiation", "primary_conninfo must not contain sslnegotiation -- pg_basebackup -R's own auto-generated value was not sanitized:\n%s", conf)
+	require.Contains(t, conf, "primary_conninfo = 'host=127.0.0.1 port=", "primary_conninfo must be the explicit, minimal connection string setup-standby.sh writes, not pg_basebackup -R's own auto-generated one:\n%s", conf)
 }
 
 // jobState reads a job's current state by its string id (as returned by
