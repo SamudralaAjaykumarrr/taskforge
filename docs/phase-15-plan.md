@@ -1194,47 +1194,44 @@ affect the validity of the `StartParameters` finding itself). Full
 method, exact commands, and raw output:
 [docs/phase-15-postgres-evidence.md](phase-15-postgres-evidence.md) §3.
 
-### OD-3 — Does the backup/restore drill's workload generator drive real
-`cmd/api`/`cmd/worker` binaries, or call `internal/store` directly?
+### OD-3 — CLOSED: direct-`internal/store` for §8.1, real binaries for §8.2, exactly as recommended
 
-**This plan's recommendation, stated as settled but flagged as an open
-decision an implementer could reasonably override**: for §8.1
-specifically (backup/restore), this plan recommends driving workload
-**directly through `internal/store`** (faster, simpler, no `os/exec`
-binary-build overhead) rather than real compiled binaries — because the
-property under test is "does a *database* restore correctly," which does
-not depend on which client process wrote the data. For §8.2
-(failover), real binaries **are** required (settled, not open) because
-the property under test is explicitly "TaskForge's own process-level
-reconnect behavior," which only real `cmd/api`/`cmd/worker` processes can
-demonstrate. This split (direct-store for §8.1, real-binaries for §8.2)
-is this plan's recommendation; an implementer preferring real binaries
-for both, for harness-consistency reasons, is not blocked by anything
-else in this plan.
+**Status: CLOSED, implemented exactly as this plan recommended.**
+`test/dr/backup_restore_test.go`'s `driveReferenceWorkload` drives
+workload directly through `internal/store.Insert`/`Claim`/`CompleteSuccess`
+for the backup/restore drill (SF-071/SF-072/SF-075) — no `os/exec`
+binary-build overhead, and the property under test (does a database
+restore correctly) does not depend on which client process wrote the
+data. `test/dr/failover_drill_test.go` builds and runs real `cmd/api`/
+`cmd/worker` binaries for the failover drill (SF-073/SF-074), since the
+property under test there is explicitly TaskForge's own process-level
+reconnect behavior. No implementer override was needed.
 
-### OD-4 — Is "promote the standby onto the primary's own now-vacated
-port" an adequate proxy for a real deployment's connection-repointing
-mechanism?
+### OD-4 — CLOSED: adequate for TaskForge's own reconnect proof, implemented and stated as such
 
-**Status: open, explicitly flagged in §8.2 step 5 as a deliberate
-simplification, not a claim of equivalence.** This plan's answer: it is
-adequate for proving *TaskForge's own* reconnect behavior (the thing this
-phase's roadmap text actually asks to be measured), but it is **not**
-adequate as a substitute for testing any specific real HA-orchestration
-tool's own promotion/DNS/VIP-repointing latency, which is explicitly out
-of scope (§2.2, "no TaskForge-built failover orchestration" — and, by
-extension, no TaskForge-built *test* of a third-party orchestrator's own
-behavior either). The runbook must state this boundary explicitly so a
-reader does not mistake the drill's measured number for "how fast Patroni
-fails over," which it does not measure.
+**Status: CLOSED, implemented exactly as this plan anticipated.**
+`test/dr/failover_drill_test.go` promotes the standby onto the primary's
+own now-vacated port without changing `TASKFORGE_DATABASE_URL` on the
+already-running `cmd/api`/`cmd/worker` processes, and measures TaskForge's
+own reconnect windows (§5.2/§6 below and
+[disaster-recovery.md](disaster-recovery.md) §5.2/§6.3). The boundary this
+OD flagged is stated explicitly in the runbook (§6.3: "this drill... does
+not test... any specific HA-orchestration tool's own failover detection/
+promotion speed") — a reader is told directly not to read the drilled
+numbers as a claim about Patroni, repmgr, or any specific tool's own
+speed.
 
-### OD-5 — Does `internal/invariant.Checker` need a minimal operator-facing
-CLI wrapper?
+### OD-5 — CLOSED: yes, a minimal CLI wrapper was needed and was built
 
-**Status: open, non-blocking.** §18 recommends documenting a `go
-run`-style invocation first and only building a dedicated CLI if that
-proves too awkward during runbook-writing (§26 item 7). This does not
-block any other item in this plan.
+**Status: CLOSED, decided during runbook-writing exactly as §18/§26 item 7
+anticipated.** Writing the runbook's mandatory-verification-step section
+surfaced the concrete need directly: `internal/invariant` is a library
+package with no `main` package anywhere in it, so a bare `go run` against
+it is not possible without a wrapper. `cmd/taskforge-invariant-check`
+(`cmd/taskforge-invariant-check/main.go`) is that wrapper — `-db-url`
+(or `TASKFORGE_DATABASE_URL`) in, `CheckAll` run, exit 0/1/2 for
+clean/violations-found/could-not-run. See
+[disaster-recovery.md](disaster-recovery.md) §8 for the full reasoning.
 
 ## 28. Genuinely unresolved architectural decisions (summary, per the
 task's own required framing)
@@ -1257,15 +1254,18 @@ set:
    `initdb`/`postgres` fallback is required — decided by direct
    verification and a live drill: **sufficient; no fallback needed**
    (OD-2, [evidence](phase-15-postgres-evidence.md) §3).
-3. Whether the backup/restore drill's workload generator should be
-   direct-`internal/store` or real-binary-based — **this plan recommends
-   direct-store, flagged as overridable** (OD-3).
-4. Whether "same-port promotion" is an adequate proxy for a deployment's
-   real connection-repointing mechanism — **this plan states it is
-   adequate for TaskForge's own reconnect-behavior proof only, explicitly
-   not for testing any specific orchestration tool** (OD-4).
-5. Whether a dedicated invariant-checker CLI is needed — **non-blocking,
-   decided during runbook-writing** (OD-5).
+3. **CLOSED.** Whether the backup/restore drill's workload generator
+   should be direct-`internal/store` or real-binary-based — implemented
+   exactly as recommended: direct-store for §8.1, real binaries for §8.2
+   (OD-3).
+4. **CLOSED.** Whether "same-port promotion" is an adequate proxy for a
+   deployment's real connection-repointing mechanism — implemented and
+   drilled; adequate for, and stated to be scoped to, TaskForge's own
+   reconnect-behavior proof, explicitly not a test of any specific
+   orchestration tool (OD-4).
+5. **CLOSED.** Whether a dedicated invariant-checker CLI is needed —
+   decided during runbook-writing: **yes**, `cmd/taskforge-invariant-check`
+   was built (OD-5).
 6. Whether to name one specific HA-orchestration tool (Patroni/repmgr/a
    managed provider) as *the* recommendation, or stay tool-agnostic —
    **this plan recommends staying tool-agnostic** (§5), consistent with
@@ -1346,29 +1346,47 @@ aspiration that has not yet been tested.
 
 ## 30. Exit criteria
 
-Reproduced from [enterprise-roadmap.md](enterprise-roadmap.md) §2.7,
-annotated with this plan's own mapping to the sections above (not yet
-checked — no implementation has occurred):
+Reproduced from [enterprise-roadmap.md](enterprise-roadmap.md) §2.7.
+**Post-implementation update**: every criterion below is now implemented
+and drilled; see [docs/disaster-recovery.md](disaster-recovery.md) for
+the runbook these link to and the exact measured evidence.
 
-- [ ] A documented `pg_basebackup`/WAL-archiving-based backup exists (with
+- [x] A documented `pg_basebackup`/WAL-archiving-based backup exists (with
       the `pg_backup_start`/`pg_backup_stop` misconception corrected in
       the runbook) and a restore-from-backup drill has been executed and
-      timed at least once. → §10, §11, §8.1, SF-071.
-- [ ] A stated RPO/RTO exists and the drilled restore time is compared
-      against it. → §13.
-- [ ] The restored database passes the existing invariant checker. → §11
-      "Verification step," §21, SF-071/SF-075.
-- [ ] An HA topology recommendation is documented, with its tradeoffs
+      timed at least once. Implemented: `deploy/pg-dr/backup.sh`,
+      [disaster-recovery.md](disaster-recovery.md) §2; drilled and timed
+      by `TestDR_SF071_SF075_BackupRestoreDrill_PITR`
+      (`test/dr/backup_restore_test.go`) — measured 4.06s–8.02s at a
+      150-job reference volume. → §10, §11, §8.1, SF-071.
+- [x] A stated RPO/RTO exists and the drilled restore time is compared
+      against it. Implemented: [disaster-recovery.md](disaster-recovery.md)
+      §5 — RPO measured at 13.6ms–29.8ms (mean 21.1ms) archive lag under a
+      local-filesystem `archive_command`; RTO measured per the row above
+      (disaster-recovery path) and §5.2's failover-path numbers. → §13.
+- [x] The restored database passes the existing invariant checker.
+      Implemented: `internal/invariant.Checker.CheckAll` run directly
+      against the restored database in `TestDR_SF071_SF075_BackupRestoreDrill_PITR`
+      — zero violations, every run. → §11 "Verification step," §21,
+      SF-071/SF-075.
+- [x] An HA topology recommendation is documented, with its tradeoffs
       (sync vs. async replication) stated per PostgreSQL's own guidance.
-      → §12, §5 (tool-agnostic framing).
-- [ ] At least one controlled standby-promotion/failover drill has been
+      Implemented: [disaster-recovery.md](disaster-recovery.md) §4. →
+      §12, §5 (tool-agnostic framing).
+- [x] At least one controlled standby-promotion/failover drill has been
       run, with TaskForge's reconnect/recovery behavior measured and
-      recorded. → §8.2, SF-073/SF-074.
-- [ ] If read replicas are recommended for any read path, the
+      recorded. Implemented: `TestDR_SF073_SF074_FailoverDrill_LiveTraffic`
+      (`test/dr/failover_drill_test.go`) — measured API-submission
+      recovery 721ms–809ms, worker-claim recovery 6.07s–6.10s, from the
+      primary-stop instant; fencing confirmed intact (an in-flight,
+      actively-heartbeating job completed correctly against the promoted
+      standby); zero invariant violations. → §8.2, SF-073/SF-074.
+- [x] If read replicas are recommended for any read path, the
       consistency/read-after-write implications are documented before
-      adoption. → §5 non-goal (this plan does not recommend adoption; the
-      implication is documented conditionally, in the runbook, for a
-      future deployment's own decision).
+      adoption. Implemented (conditionally, as scoped): this phase does
+      not recommend adoption; the read-after-write implication is
+      documented in [disaster-recovery.md](disaster-recovery.md) §9 for a
+      future deployment's own decision. → §5 non-goal.
 
 ## 31. Cross-references
 

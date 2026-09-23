@@ -1083,21 +1083,28 @@ work-stream is available.
   clarity.
 
 ### Enterprise exit criteria
-- [ ] A documented `pg_basebackup`/WAL-archiving-based backup exists (with
+- [x] A documented `pg_basebackup`/WAL-archiving-based backup exists (with
       the `pg_backup_start`/`pg_backup_stop` misconception corrected in the
       runbook) and a restore-from-backup drill has been executed and timed
       at least once (mirrors [enterprise-readiness.md](enterprise-readiness.md)'s
-      own exit criterion).
-- [ ] A stated RPO/RTO exists and the drilled restore time is compared
-      against it.
-- [ ] The restored database passes the existing invariant checker.
-- [ ] An HA topology recommendation is documented, with its tradeoffs
+      own exit criterion). See [disaster-recovery.md](disaster-recovery.md)
+      §2/§3 and `test/dr/backup_restore_test.go` (SF-071).
+- [x] A stated RPO/RTO exists and the drilled restore time is compared
+      against it. See [disaster-recovery.md](disaster-recovery.md) §5.
+- [x] The restored database passes the existing invariant checker. Proven
+      by `TestDR_SF071_SF075_BackupRestoreDrill_PITR`.
+- [x] An HA topology recommendation is documented, with its tradeoffs
       (sync vs. async replication) stated per PostgreSQL's own guidance.
-- [ ] At least one controlled standby-promotion/failover drill has been run,
+      See [disaster-recovery.md](disaster-recovery.md) §4.
+- [x] At least one controlled standby-promotion/failover drill has been run,
       with TaskForge's reconnect/recovery behavior measured and recorded.
-- [ ] If read replicas are recommended for any read path, the
+      See [disaster-recovery.md](disaster-recovery.md) §5.2/§6 and
+      `test/dr/failover_drill_test.go` (SF-073/SF-074).
+- [x] If read replicas are recommended for any read path, the
       consistency/read-after-write implications are documented before
-      adoption.
+      adoption. See [disaster-recovery.md](disaster-recovery.md) §9
+      (documented conditionally; adoption is not recommended by this
+      phase).
 
 ---
 

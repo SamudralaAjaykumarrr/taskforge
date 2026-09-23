@@ -48,7 +48,11 @@ profile, not to a zero-trust worker fleet:
   arbitrary third-party code.
 - **PostgreSQL HA cluster**: the database is deployed with replication/
   failover per [enterprise-roadmap.md](enterprise-roadmap.md) Phase 15, not
-  a single unreplicated instance.
+  a single unreplicated instance. Phase 15 is now implemented and drilled
+  ([disaster-recovery.md](disaster-recovery.md)) — this assumption is a
+  documented, tool-agnostic deployment-layer topology (streaming
+  replication + an operator-chosen orchestration tool), not something
+  TaskForge itself builds or verifies at runtime.
 - **Single-region initially**: no multi-region durability or cross-region
   read-after-write guarantee is claimed.
 - **No hostile third-party worker-code guarantee**: running worker code
@@ -153,6 +157,7 @@ access — and is explicitly **deferred**, not claimed as solved by Phase
 | **Sensitive data in `payload`/`result_metadata`** | `payload` and `result_metadata` are opaque `jsonb` columns TaskForge never inspects or redacts ([data-model.md](data-model.md): "Opaque to TaskForge; interpreted by the job handler"). A caller could store secrets, PII, or credentials in either column with no TaskForge-level warning, masking, or encryption-at-rest beyond whatever PostgreSQL itself provides. | By design — TaskForge deliberately does not interpret payloads. This is architecturally correct (a job engine should not need to understand payload semantics) but means TaskForge currently has **no data-classification or retention policy** for what operators put in it. | P1 — an operational/policy gap, not a code defect |
 | **Sensitive logs** | Structured logging fields are documented in [observability.md](observability.md); the raw `Idempotency-Key` value is explicitly never logged (only `had_idempotency_key`), and job `payload` contents are never logged (confirmed: retry-scheduled/dead-letter log lines carry `error_class`/`error_message`, not payload). | This is a genuine, verified positive: the logging discipline documented in observability.md was cross-checked against actual log call sites during this review and matches. | P3 (well-handled) |
 | **Database credential handling** | Connection configuration is read via `internal/config` (environment variables, per `.env.example`). No secrets-manager integration (Vault, AWS Secrets Manager, etc.) exists or is expected to at this stage. | Standard practice for this project's current scope; a gap only relative to enterprise secret-rotation expectations. | P2 |
+| **Backup/replica artifact confidentiality** (Phase 15) | A `pg_basebackup` output or WAL archive segment contains the **entire** database, including `payload`/`result_metadata` (the opaque, potentially sensitive columns in the row above) and `api_keys.secret_hash` (an HMAC digest, not a raw secret — recoverable only with the out-of-database pepper). | **Extends, does not newly create, the finding above.** A backup artifact or a standby's own data directory requires **at least the same** access-control and encryption-at-rest discipline as the live database itself — this is documentation, not a new control; TaskForge still does not encrypt or classify `payload` at rest, and Phase 15 does not change that. See [disaster-recovery.md](disaster-recovery.md) §10. | P1 — same severity and same reasoning as the row above, now stated explicitly for backups/replicas too |
 
 ## 4. Transport Security
 

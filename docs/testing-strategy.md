@@ -698,6 +698,7 @@ no existing test's assertions weakened.
 | **Load tests** | Sustained throughput against realistic job volume, verifying the claim index strategy holds up and metrics remain accurate under load. | Phase 9. |
 | **Chaos tests** | Combinations of the above injected randomly and continuously against a running system, assert invariants hold cumulatively over a long run (not just for a single crafted scenario). | Phase 9. |
 | **Mixed-binary-version / OS-process tests (Phase 14)** | Real, separately-compiled binaries (built via `go build`, one of them from a pinned, immutable historical commit via a detached `git worktree`) run as real OS processes, driven with real signals (SIGTERM/SIGKILL) and real network connections — never an in-process `context.Context` substitute for either a signal or a second binary version. This is a new test category this project had no precedent for before Phase 14: every earlier integration/chaos/stress test exercises Go packages directly, in one process. | `test/procs` (SF-063/064/065/069/070: graceful-drain SIGTERM/SIGKILL contract for `cmd/worker`/`cmd/api`); `test/compat` (SF-066/067/068: the two-binary-version expand/migrate/contract proof). |
+| **Multi-instance PostgreSQL tests (Phase 15)** | Two or more real, independently-running PostgreSQL server processes (a primary and a standby/restore target), coordinated via real `pg_basebackup`/streaming-replication/promotion commands run through `os/exec` — never a single shared instance standing in for both roles, and never a simulated promotion. This is a new test category because every earlier PostgreSQL-touching test in this project's history (Phase 1 through 14) uses exactly one PostgreSQL instance. | `test/dr` (SF-071 through SF-075: backup/restore PITR, WAL-archive-gap failure, standby-promotion/failover drill, in-flight-lease-survives-promotion, restore-preserves-fencing-history). |
 
 ## Invariant-to-Test Matrix
 
@@ -793,6 +794,52 @@ proven:
   `job_type` has no registered handler dead-letters through the identical
   `ErrNoHandler`/`CompleteFailure` path a plain job uses, and TF-INV-012's
   cascade correctly fails the enclosing workflow.
+
+## Phase 15 — PostgreSQL HA / Backup / DR Proof
+
+Phase 15 ([enterprise-roadmap.md](enterprise-roadmap.md)) turns
+[failure-model.md](failure-model.md)'s honest, previously-undrilled
+"PostgreSQL primary failure/failover is out of scope for v1" boundary into
+a measured, documented, drilled operational fact, per
+[ADR-0011](adr/0011-postgresql-native-ha-backup-dr.md) and
+[phase-15-plan.md](phase-15-plan.md). It adds no new `TF-INV-*` invariant
+(see [invariants.md](invariants.md)'s "Phase 15 reviewed" note); its proof
+obligation is that every existing `TF-INV-001` through `TF-INV-019` holds
+against (a) a database restored via point-in-time recovery and (b) a
+database that has just undergone a live standby-promotion failover — a
+breadth requirement across a new adversarial *condition* (a database
+instance change), not a new state-machine property. What is now proven,
+using the new "Multi-instance PostgreSQL tests" category above:
+
+- **Backup-then-restore drill, timed, invariant-checked** (SF-071;
+  `test/dr/backup_restore_test.go`): a real `pg_basebackup` taken
+  mid-workload, continued workload the backup itself does not cover, a
+  `recovery_target_time` recorded from PostgreSQL's own clock, and a real
+  PITR restore via `deploy/pg-dr/restore.sh` — `internal/invariant.Checker.CheckAll`
+  finds zero violations against the restored database, and the restore's
+  wall-clock time is recorded ([disaster-recovery.md](disaster-recovery.md)
+  §5.2).
+- **WAL archive gap fails recovery loudly, not silently** (SF-072; same
+  file): a WAL segment the restore genuinely needs is deliberately deleted
+  from the archive before restore — PostgreSQL's own recovery process
+  fails with an explicit `FATAL: recovery ended before configured
+  recovery target was reached`, never a silent skip-forward past the gap.
+- **Controlled standby-promotion/failover drill, live traffic**
+  (SF-073/SF-074; `test/dr/failover_drill_test.go`): a real primary +
+  streaming standby, real `cmd/api`/`cmd/worker` binaries driving live
+  traffic, the primary forcibly stopped
+  (`pg_ctl stop -m immediate`) and the standby promoted onto its
+  now-vacated port without changing `TASKFORGE_DATABASE_URL` on the
+  already-running processes (docs/phase-15-plan.md §8.2 step 5, OD-4) —
+  both the API-submission and worker-claim recovery windows are measured
+  independently, and a job claimed and actively in-flight (heartbeating)
+  at the instant the primary died is confirmed to complete correctly
+  against the promoted standby, with zero invariant violations throughout.
+- **Restore preserves fencing history, not just current state**
+  (SF-075; `test/dr/backup_restore_test.go`, riding on SF-071's own
+  mechanism): a backup taken after at least one lease-generation advance
+  (a reclaim already occurred pre-backup) restores with that
+  `job_attempts.lease_generation` sequence intact and monotonic.
 
 ## Test Environment Expectations
 

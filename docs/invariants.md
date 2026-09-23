@@ -771,6 +771,27 @@ state-machine property. Candidates considered and their disposition:
 | `cmd/api` `BaseContext`/`srv.Close` shutdown-deadline behavior | **Not an invariant.** Process-lifecycle/operational contract. | Governs when a process stops serving a request, not a durable state-machine transition. |
 | Old-worker/new-server (and vice versa) schema compatibility | **Not a new invariant.** Proof obligation across every existing `TF-INV-*`. | This is exactly the breadth requirement this section already describes — the two-binary harness is a stronger *test* of existing invariants under a new condition, not a new invariant in its own right. |
 
+### Phase 15 reviewed: no new invariant added
+
+Phase 15 (PostgreSQL HA / Backup / DR Proof, [phase-15-plan.md](phase-15-plan.md)
+§21) was reviewed against this same method and adds **no new numbered
+invariant**. Its proof obligation is the existing set, `TF-INV-001`
+through `TF-INV-019`, holding across (a) a database restored via
+point-in-time recovery (`test/dr/backup_restore_test.go`, SF-071/SF-075)
+and (b) a database that has just undergone a live standby-promotion
+failover drill (`test/dr/failover_drill_test.go`, SF-073/SF-074) — a
+breadth requirement across a new adversarial condition (a *database
+instance* change, not merely a code-version change), exactly the same
+category this section already used to close out Phase 14. Candidates
+considered and their disposition:
+
+| Candidate | Disposition | Why |
+|---|---|---|
+| "A restore reproduces a database where every existing `TF-INV-*` holds" | **Not a new invariant.** Proof obligation against the existing set. | Breadth requirement — every existing invariant, proven against a new database instance rather than a new adversarial code path. Drilled: `TestDR_SF071_SF075_BackupRestoreDrill_PITR` runs `internal/invariant.Checker.CheckAll` against the restored database directly; zero violations. |
+| "Fencing (TF-INV-002/003/014) holds across a standby promotion" | **Not a new invariant.** Proof obligation against TF-INV-002/003/014 specifically. | Fencing is a property of the data (`lease_owner`/`lease_generation` and the conditional-`UPDATE` mechanism that reads/writes them), which a promoted standby serves identically — proven, not merely argued: `TestDR_SF073_SF074_FailoverDrill_LiveTraffic` puts a job actively in-flight at the instant the primary is stopped and observes it complete correctly against the promoted standby, with zero invariant violations across the drill. |
+| "TaskForge resumes writes within a measured, bounded window after promotion" | **Not an invariant.** Operational/SLO-shaped expectation, timing-only. | No durable row-level state property is being asserted — a stopwatch measurement, recorded in [disaster-recovery.md](disaster-recovery.md) §5.2, not a state-machine property. |
+| "A WAL archive gap fails recovery loudly rather than silently skipping" | **Not an invariant.** PostgreSQL's own documented behavior, not a TaskForge-enforced property. | TaskForge builds no code path here — `TestDR_SF072_WALArchiveGap_RecoveryFailsLoudly` observes PostgreSQL's own `FATAL: recovery ended before configured recovery target was reached`, nothing `internal/invariant.Checker` (or any TaskForge mechanism) checks. |
+
 ---
 
 ## Summary Table
