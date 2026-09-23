@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -127,6 +128,23 @@ func TestDR_SF073_SF074_FailoverDrill_LiveTraffic(t *testing.T) {
 	}, "127.0.0.1", fmt.Sprint(primary.port), standbyDataDir)
 	require.NoError(t, err, "setup-standby.sh output:\n%s", out)
 
+	// t.Cleanup (not a post-waitUntil check): waitUntil itself calls
+	// t.Fatal on timeout, which unwinds this goroutine via runtime.Goexit
+	// before any code after it would run -- only a registered cleanup
+	// still executes after that, so it is registered here, before the
+	// wait it is meant to diagnose.
+	standbyLogPath := standbyDataDir + ".log"
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		primary.logOutput(t)
+		if b, err := os.ReadFile(standbyLogPath); err == nil {
+			t.Logf("standby postgres log (%s):\n%s", standbyLogPath, string(b))
+		} else {
+			t.Logf("could not read standby postgres log %s: %v", standbyLogPath, err)
+		}
+	})
 	waitUntil(t, 15*time.Second, 100*time.Millisecond, "standby never reached streaming state in pg_stat_replication", func() bool {
 		var state string
 		err := primaryDB.QueryRowContext(ctx, `SELECT state FROM pg_stat_replication LIMIT 1`).Scan(&state)

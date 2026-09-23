@@ -111,9 +111,22 @@ type pgInstance struct {
 	binDir  string
 	port    uint32
 	dsn     string
+	pgLog   *safeBuffer
 
 	mu      sync.Mutex
 	stopped bool
+}
+
+// logOutput dumps this instance's own PostgreSQL server log (stdout/stderr
+// as captured by embedded-postgres's Logger) via t.Logf -- for diagnostic
+// use on test failure, mirroring procHandle.logOutput's identical pattern
+// for the cmd/api and cmd/worker child processes below.
+func (p *pgInstance) logOutput(t *testing.T) {
+	t.Helper()
+	if p.pgLog == nil {
+		return
+	}
+	t.Logf("postgres log (data dir %s):\n%s", p.dataDir, p.pgLog.String())
 }
 
 // dsnFor renders a DSN for an arbitrary port against the standard
@@ -137,6 +150,7 @@ func startPrimary(t *testing.T, archiveDir string) *pgInstance {
 	require.NoError(t, err)
 	port := freePort(t)
 
+	pgLog := &safeBuffer{}
 	cfg := embeddedpostgres.DefaultConfig().
 		Version(embeddedpostgres.V16).
 		Port(port).
@@ -145,7 +159,7 @@ func startPrimary(t *testing.T, archiveDir string) *pgInstance {
 		Username("postgres").
 		Password("postgres").
 		Database("taskforge").
-		Logger(nil).
+		Logger(pgLog).
 		StartParameters(map[string]string{
 			"wal_level":       "replica",
 			"archive_mode":    "on",
@@ -155,7 +169,9 @@ func startPrimary(t *testing.T, archiveDir string) *pgInstance {
 		})
 
 	ep := embeddedpostgres.NewDatabase(cfg)
-	require.NoError(t, ep.Start(), "start embedded PostgreSQL primary")
+	if err := ep.Start(); err != nil {
+		t.Fatalf("start embedded PostgreSQL primary: %v\npostgres log:\n%s", err, pgLog.String())
+	}
 
 	inst := &pgInstance{
 		ep:      ep,
@@ -163,6 +179,7 @@ func startPrimary(t *testing.T, archiveDir string) *pgInstance {
 		binDir:  filepath.Join(root, "runtime", "bin"),
 		port:    port,
 		dsn:     dsnFor(port),
+		pgLog:   pgLog,
 	}
 	t.Cleanup(func() { inst.stopViaLibrary(t) })
 	return inst
@@ -182,6 +199,7 @@ func startFromDataDir(t *testing.T, dataDir string, port uint32) *pgInstance {
 	runtimeDir, err := os.MkdirTemp("", "taskforge-dr-existing-runtime-*")
 	require.NoError(t, err)
 
+	pgLog := &safeBuffer{}
 	cfg := embeddedpostgres.DefaultConfig().
 		Version(embeddedpostgres.V16).
 		Port(port).
@@ -190,17 +208,26 @@ func startFromDataDir(t *testing.T, dataDir string, port uint32) *pgInstance {
 		Username("postgres").
 		Password("postgres").
 		Database("taskforge").
-		Logger(nil)
+		Logger(pgLog)
 
 	ep := embeddedpostgres.NewDatabase(cfg)
 	if err := ep.Start(); err != nil {
-		return nil // caller (SF-072) asserts on this failure itself
+		// The caller asserts on this nil return itself (e.g. SF-071's
+		// require.NotNil); log the real postgres log content here, not
+		// there, since this is the only place that still has it -- a nil
+		// *pgInstance carries no log, and embedded-postgres's own error
+		// here is frequently just "timed out waiting for database to
+		// become available" with no indication of what postgres itself
+		// actually logged.
+		t.Logf("startFromDataDir(%s): embedded PostgreSQL failed to start: %v\npostgres log:\n%s", dataDir, err, pgLog.String())
+		return nil
 	}
 
 	inst := &pgInstance{
 		ep:      ep,
 		dataDir: dataDir,
 		binDir:  filepath.Join(runtimeDir, "bin"),
+		pgLog:   pgLog,
 		port:    port,
 		dsn:     dsnFor(port),
 	}
