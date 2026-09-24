@@ -23,3 +23,7 @@ tmp/
 .vscode/
 .idea/
 .DS_Store
+
+# taskforge-autopilot's local, resumable run state and captured logs (see
+# docs/autopilot.md) -- machine/run-local, never committed.
+.taskforge-autopilot/
