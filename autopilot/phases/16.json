@@ -1,0 +1,13 @@
+{
+  "phase": 16,
+  "plan_path": "docs/phase-16-plan.md",
+  "plan_sha256": "828e761c4e9acb49819c7c03c1ba28537cbaa2c8213e89034e821e2cf3a8d346",
+  "proofs": [
+    {
+      "name": "tracing-overhead-benchmark",
+      "type": "human",
+      "required": true,
+      "description": "docs/phase-16-plan.md §19/§22: a `go test -bench` comparing RunOnce throughput with tracing disabled vs. enabled against a real, locally-run OTLP collector, committed as evidence per this project's 'measure before documenting' discipline. This requires an external OTLP collector process Autopilot's local-gates runner does not stand up automatically, and the benchmark's exact package/name do not exist prior to this phase's own implementation -- so it cannot be registered as a pinned, pre-existing command proof. A human must run it and confirm the committed benchmark evidence exists and reflects the tracing-enabled vs. disabled comparison the plan requires before approving this obligation."
+    }
+  ]
+}

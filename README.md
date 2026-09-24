@@ -3016,6 +3016,7 @@ Stated as decisions with reasons, not omissions:
 | [docs/compatibility-policy.md](docs/compatibility-policy.md) | API/schema evolution rules — API versioning, unknown-field tolerance, and body-size limits implemented (Phase 11); rolling-upgrade proof still proposed (Phase 14) |
 | [docs/security-model.md](docs/security-model.md) | Threat model by category — authentication, ownership authorization, tenant-scoped idempotency, metrics auth and the audit trail implemented (Phase 12); rate limiting/quota (Phase 13) and an incident runbook still absent |
 | [docs/phase-12-plan.md](docs/phase-12-plan.md) | Phase 12: the principal/API-key design, the store-layer authorization decision and the architecture blocker it resolves, the migration sequence, and the full proof matrix |
+| [docs/autopilot.md](docs/autopilot.md) | `cmd/taskforge-autopilot`: bounded, resume-safe repository tooling that carries a roadmap phase through this project's real planning/implementation/review/CI/merge workflow — not a roadmap phase itself |
 
 ## Technology Direction
 
