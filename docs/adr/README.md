@@ -20,6 +20,7 @@ consequences (including negative ones) accepted as a result.
 | [0009](0009-phase-13-concurrency-and-fairness.md) | Phase 13 concurrency limiting and fairness (OD-1) | Accepted |
 | [0010](0010-expand-migrate-contract.md) | Expand/migrate/contract as the primary schema-compatibility model (Phase 14 OD-1) | Accepted |
 | [0011](0011-postgresql-native-ha-backup-dr.md) | PostgreSQL-native HA/backup/DR primitives, not TaskForge-built machinery (Phase 15) | Accepted |
+| [0012](0012-distributed-tracing-and-durable-trace-context.md) | Distributed tracing and durable trace-context propagation, OpenTelemetry with span links (Phase 16 OD-A) | Accepted |
 
 ## Conventions
 
